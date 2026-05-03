@@ -1,33 +1,29 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.com/schemas/wall.schema.json",
+  "$id": "https://wall-whisperers.local/schemas/wall.schema.json",
   "title": "Climbing Wall",
-  "description": "Schema for a climbing wall definition and its holds.",
+  "description": "Schema for a climbing wall definition and its holds (Beta Engine MVP).",
   "type": "object",
   "additionalProperties": false,
   "required": ["wall_id", "holds"],
   "properties": {
     "wall_id": {
       "type": "string",
-      "description": "Unique identifier for the wall."
+      "pattern": "^[A-Za-z0-9_\\-]{1,64}$",
+      "description": "Unique identifier; letters, digits, '-' or '_'."
     },
-    "name": {
-      "type": "string",
-      "description": "Optional human-readable wall name."
-    },
-    "dimensions": {
+    "name": { "type": "string" },
+    "grid": {
       "type": "object",
-      "description": "Optional wall dimensions.",
       "additionalProperties": false,
+      "required": ["cols", "rows"],
       "properties": {
-        "width": { "type": "number", "minimum": 0 },
-        "height": { "type": "number", "minimum": 0 },
-        "units": { "type": "string", "enum": ["m", "cm", "ft", "in"] }
+        "cols": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "rows": { "type": "integer", "minimum": 1, "maximum": 200 }
       }
     },
     "holds": {
       "type": "array",
-      "minItems": 1,
       "items": { "$ref": "#/$defs/hold" }
     }
   },
@@ -47,9 +43,9 @@
         "is_finish"
       ],
       "properties": {
-        "hold_id": { "type": "string" },
-        "grid_x": { "type": "integer" },
-        "grid_y": { "type": "integer" },
+        "hold_id": { "type": "string", "minLength": 1 },
+        "grid_x": { "type": "integer", "minimum": 0 },
+        "grid_y": { "type": "integer", "minimum": 0, "description": "0 = bottom of wall (climbing convention)." },
         "hold_type": {
           "type": "string",
           "enum": ["jug", "crimp", "sloper", "pinch", "foothold"]
@@ -57,22 +53,14 @@
         "orientation_deg": {
           "type": "number",
           "minimum": 0,
-          "maximum": 360,
-          "description": "Orientation in degrees; commonly 0 to 360."
+          "exclusiveMaximum": 360,
+          "description": "0 = up, increases clockwise; indicates the direction of pull/grip."
         },
-        "size": {
-          "type": "string",
-          "enum": ["small", "medium", "large"]
-        },
+        "size": { "type": "string", "enum": ["small", "medium", "large"] },
         "color": {
-          "description": "Hold color as a standard value or free-form string.",
-          "oneOf": [
-            {
-              "type": "string",
-              "enum": ["red", "blue", "green", "yellow", "black", "white", "orange", "purple", "pink", "gray", "brown"]
-            },
-            { "type": "string", "minLength": 1 }
-          ]
+          "type": "string",
+          "minLength": 1,
+          "description": "Hex code (#RRGGBB) or any free-form color name."
         },
         "is_start": { "type": "boolean" },
         "is_finish": { "type": "boolean" }

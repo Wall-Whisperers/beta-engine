@@ -1,226 +1,232 @@
-# Beta Engine – MVP Collaboration Guide
+# Beta Engine — MVP Wall Grid Editor
 
-This repo contains a lightweight Flask app and step-by-step team workflow documentation for the **Beta Engine MVP**, written to be beginner-friendly for first-time Docker users.
+A small web tool for defining climbing walls on a grid. Click cells to place
+holds, set type / orientation / size / color / start-finish flags, then save
+the wall as JSON. Saved walls live as plain `*.json` files under
+`data/walls/` so collaborators can read, edit, and version them.
 
----
-
-## 1) MVP scope and non-goals
-
-### MVP scope
-The MVP is intentionally narrow and focused on proving end-to-end team flow:
-
-- Upload an image through the web UI.
-- Convert the uploaded image into a black-and-white output image.
-- Persist wall/hold metadata as JSON records on disk.
-- Reload previously saved wall records from local storage.
-- Support local development and Docker-based collaboration.
-
-### Non-goals (for MVP)
-The following are explicitly out of scope for this phase:
-
-- Multi-tenant authentication/authorization.
-- Cloud database infrastructure.
-- Real-time collaborative editing.
-- Production-grade observability/alerting.
-- Mobile-native app clients.
-- ML-based automatic hold detection.
+This is a Phase 1 MVP — narrow, opinionated, and meant to lock down the JSON
+schema everything downstream depends on.
 
 ---
 
-## 2) JSON schema overview (holds)
+## What's in the box
 
-The wall model is file-based and JSON-first. Each wall record should contain:
+- **Backend** — Flask (Python 3.12). Validates wall JSON, persists to `/data/walls/`.
+- **Frontend** — single-page editor (vanilla JS, no build step).
+- **Schema** — `schemas/wall.schema.json` (JSON Schema 2020-12, source of truth).
+- **Example wall** — `data/examples/example-v2-boulder.json` auto-seeds on first
+  start so you see a real boulder problem immediately.
+- **Docker** — single container with bind-mounted `./data` so wall files appear
+  on your host filesystem.
 
-- `wall_id` (string, unique identifier)
-- `name` (string)
-- `created_at` (ISO-8601 UTC timestamp)
-- `updated_at` (ISO-8601 UTC timestamp)
-- `reference_image` (object)
-- `holds` (array of hold objects)
+---
 
-### Hold object fields
-
-- `id` (string)
-- `label` (string)
-- `color` (string, e.g. `"blue"`)
-- `difficulty` (string enum suggestion: `"easy" | "moderate" | "hard"`)
-- `x` (number, normalized coordinate `0.0..1.0`)
-- `y` (number, normalized coordinate `0.0..1.0`)
-- `notes` (string, optional)
-
-### Sample wall record
+## Hold JSON schema
 
 ```json
 {
-  "wall_id": "wall-demo-001",
-  "name": "Training Wall A",
-  "created_at": "2026-05-03T10:00:00Z",
-  "updated_at": "2026-05-03T10:05:00Z",
-  "reference_image": {
-    "filename": "training-wall-a.jpg",
-    "width": 1080,
-    "height": 1440
-  },
-  "holds": [
-    {
-      "id": "H1",
-      "label": "start-left",
-      "color": "blue",
-      "difficulty": "easy",
-      "x": 0.22,
-      "y": 0.81,
-      "notes": "Large jug"
-    },
-    {
-      "id": "H2",
-      "label": "mid-crimp",
-      "color": "black",
-      "difficulty": "moderate",
-      "x": 0.48,
-      "y": 0.52,
-      "notes": "Small crimp"
-    }
-  ]
+  "hold_id": "h_001",
+  "grid_x": 12,
+  "grid_y": 24,
+  "hold_type": "crimp",
+  "orientation_deg": 47.5,
+  "size": "small",
+  "color": "#ef4444",
+  "is_start": false,
+  "is_finish": false
 }
 ```
 
+| Field             | Type                                                           | Notes |
+|-------------------|----------------------------------------------------------------|-------|
+| `hold_id`         | string                                                         | Unique within the wall. Editor auto-assigns `h_001`, `h_002`, … |
+| `grid_x`          | integer ≥ 0                                                    | Column. 0 = left edge of wall. |
+| `grid_y`          | integer ≥ 0                                                    | Row. **0 = bottom of wall** (climbing convention). |
+| `hold_type`       | `jug` \| `crimp` \| `sloper` \| `pinch` \| `foothold`           | Color-coded in the UI. |
+| `orientation_deg` | number in `[0, 360)`                                           | 0° = up; clockwise. Indicates pull / pinch-axis direction. |
+| `size`            | `small` \| `medium` \| `large`                                  | |
+| `color`           | string                                                         | Hex `#RRGGBB` or any color name (route color or physical hold color). |
+| `is_start`        | boolean                                                        | Marked with a green ring. |
+| `is_finish`       | boolean                                                        | Marked with a red ring. |
+
+A full wall file looks like:
+
+```json
+{
+  "wall_id": "my-wall",
+  "name": "optional name",
+  "grid": { "cols": 10, "rows": 14 },
+  "holds": [ /* one or more hold objects */ ]
+}
+```
+
+`wall_id` must match `^[A-Za-z0-9_\-]{1,64}$` (it's used as a filename).
+
 ---
 
-## 3) Local run instructions and `docker-compose` flow (team of 3)
+## Quickstart with Docker
 
-## Local run (without Docker)
-
-```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python app.py
-```
-
-Open: http://localhost:8000
-
-## Docker run (single container)
+You need Docker Desktop (or Docker Engine + Compose v2). Verify with:
 
 ```bash
-docker build -t beta-engine:demo .
-docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+docker --version
+docker compose version
 ```
 
-Open: http://localhost:8000
-
-## `docker-compose` team flow (3 collaborators)
-
-Use one shared branch and consistent runtime commands per developer.
-
-1. Developer A/B/C each pull latest `dev`.
-2. Each developer runs the same compose flow locally on their own machine:
+### 1) Initial setup (clone + build)
 
 ```bash
-docker compose up --build
+git clone https://github.com/Wall-Whisperers/beta-engine.git beta-engine
+cd beta-engine
+docker compose build
 ```
 
-3. Open the app at `http://localhost:8000`.
-4. Stop and remove containers:
+### 2) Start running
+
+```bash
+docker compose up -d
+```
+
+Open <http://localhost:8000>. You should land in the editor with the example
+V2 boulder loaded.
+
+Tail logs while it runs:
+
+```bash
+docker compose logs -f
+```
+
+### 3) Close it down (keep the data)
 
 ```bash
 docker compose down
 ```
 
-> Note: if `docker-compose.yml` is not yet present, add it before using the compose workflow above.
+Your saved walls persist in `./data/walls/` on your host — reopen the app any
+time and they're still there.
+
+### 4) Clean up (full reset)
+
+Remove the container, its image, and any wall files you've saved:
+
+```bash
+docker compose down --rmi all
+rm -rf data/walls
+```
+
+The seeded example will be re-copied into `data/walls/` the next time the app
+starts.
+
+### 5) Re-run
+
+```bash
+docker compose up -d
+```
+
+### 6) Stop again
+
+```bash
+docker compose down
+```
 
 ---
 
-## 4) Save/load behavior and `/data/walls/` storage rules
+## Running without Docker
 
-Wall persistence is file-based for MVP.
+```bash
+python -m venv .venv
+source .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+DATA_DIR=./data python app.py # uses ./data instead of /data
+```
 
-### Save behavior
-
-- On save, write one JSON file per wall to `/data/walls/`.
-- File naming convention: `<wall_id>.json` (example: `wall-demo-001.json`).
-- Save operations should be idempotent: same `wall_id` overwrites prior record.
-- Always update `updated_at` on write.
-
-### Load behavior
-
-- Load by `wall_id` from `/data/walls/<wall_id>.json`.
-- Return a not-found response when file is missing.
-- Validate JSON shape before returning data to clients.
-
-### Storage rules
-
-- `/data/walls/` is the canonical directory for wall metadata.
-- Keep files UTF-8 encoded JSON.
-- Do not store binaries in `/data/walls/` (images belong in a separate image directory/object store).
-- Treat `/data/walls/` as durable volume-mounted storage when running in Docker.
+> Note: the app hard-codes `/data/walls/` to match the Docker path. For a
+> local run, either run inside Docker (recommended) or temporarily edit
+> `DATA_DIR` at the top of `app.py`.
 
 ---
 
-## 5) Branch strategy and PR expectations
+## Using the editor
 
-We use a simple three-lane branching model:
+| Action                         | How |
+|--------------------------------|-----|
+| Place a hold                   | Click an empty cell — uses the current palette settings |
+| Select a hold                  | Click an occupied cell |
+| Edit a selected hold           | Change the palette, then click **Apply to selected** |
+| Remove a hold                  | Select it → **Remove selected** (or press <kbd>Del</kbd>) |
+| Rotate selected by +15°        | Press <kbd>R</kbd> (or right-click any hold) |
+| Move selection                 | Arrow keys |
+| Clone a hold                   | Select it, then shift-click an empty cell |
+| Resize the grid                | Set cols/rows → **Resize** (out-of-bounds holds are dropped) |
+| Save / Load / Delete           | Top bar (`Save` writes `data/walls/<wall_id>.json`) |
+| Hand-edit JSON                 | Right panel — edit, then **Apply JSON** |
+| Export / Import a `.json` file | **Download .json** / **Upload** |
 
-- `main`: production-ready history only.
-- `dev`: integration branch for approved features.
-- `feature/*`: short-lived branches for task-level work (e.g., `feature/save-wall-json`).
+### Climbing notes baked into the editor
 
-### Standard flow
-
-1. Branch from `dev`.
-2. Implement in `feature/*`.
-3. Open PR into `dev`.
-4. After validation and review, merge `dev` into `main` on release.
-
-### PR expectations
-
-Every PR should include:
-
-- Clear scope summary (what changed, what did not).
-- Linked issue/task reference.
-- Manual validation notes (commands + observed results).
-- Screenshots for UI-visible changes.
-- Confirmation that persistence rules (`/data/walls/`) were preserved where relevant.
+- Grid origin (0, 0) is **bottom-left** so increasing `grid_y` goes up the wall.
+- Orientation 0° points up. For a sidepull crimp pulling down-right, use ~315°.
+  For a horizontal pinch, use 90°.
+- Start holds get a green ring; finish holds get a red ring; both = both rings.
+- Hold-type colors used by default:
+  - jug 🟢 · crimp 🔴 · sloper 🟠 · pinch 🔵 · foothold 🟣
 
 ---
 
-## 6) Quick manual validation checklist
+## API
 
-Use this checklist before opening a PR.
+| Method | Path                       | Purpose |
+|--------|----------------------------|---------|
+| GET    | `/`                        | Editor UI |
+| GET    | `/api/walls`               | List saved wall IDs |
+| GET    | `/api/walls/<wall_id>`     | Load one wall |
+| PUT    | `/api/walls/<wall_id>`     | Save (creates or overwrites). Body must validate. |
+| DELETE | `/api/walls/<wall_id>`     | Delete |
+| GET    | `/api/schema`              | Returns `wall.schema.json` |
+| GET    | `/healthz`                 | `{ "ok": true }` (used by Docker healthcheck) |
 
-1. Start app locally or in Docker.
-2. Upload a reference wall photo.
-3. Confirm black-and-white conversion returns a downloadable PNG.
-4. Create/recreate a sample wall record from the reference photo:
-   - define 5–10 holds,
-   - set normalized `x/y` coordinates,
-   - save JSON under `/data/walls/<wall_id>.json`.
-5. Reload that wall by `wall_id` and verify hold positions/metadata match saved values.
-6. Restart app and verify saved wall still loads.
-7. Run a second save with same `wall_id` and confirm update/overwrite behavior is correct.
+Quick `curl` smoke test (with the app running):
+
+```bash
+curl -s http://localhost:8000/api/walls
+curl -s http://localhost:8000/api/walls/example-v2-boulder | head
+```
+
+---
+
+## Manual validation checklist
+
+Use before opening a PR.
+
+1. `docker compose up -d` and open <http://localhost:8000>.
+2. The example V2 boulder loads automatically.
+3. Place 2-3 new holds, set start/finish, change orientation.
+4. Type a new `Wall ID` and click **Save**.
+5. Confirm the new file appears at `data/walls/<wall_id>.json`.
+6. Click **New**, then pick the saved wall from the dropdown and **Load**.
+7. `docker compose down` and `docker compose up -d` again — the wall still loads.
+8. Re-save with the same `wall_id`; confirm it overwrites cleanly.
+
+---
+
+## Branching & PRs
+
+- `main` — production-ready history.
+- `dev` — integration branch.
+- `feature/<short-name>` — branch from `dev` for each task; PR back to `dev`.
+
+PR description should include: scope summary, screenshots for any UI change,
+and the manual validation checklist above with results.
 
 ---
 
 ## Helpful Docker commands
 
 ```bash
-docker ps
-docker ps -a
-docker images
-docker logs -f beta-engine-demo
-docker system prune
+docker compose ps             # running containers for this project
+docker compose logs -f        # follow logs
+docker compose restart        # restart without rebuilding
+docker compose build --no-cache  # force a clean rebuild
+docker system prune           # reclaim disk (safe on a dev machine)
 ```
-
-Then open `http://localhost:8000`.
-
----
-
-## Wall data schema (source of truth)
-
-For climbing wall and hold payloads, the canonical schema is:
-
-- `schemas/wall.schema.json`
-
-Team examples that should validate against this schema:
-
-- `data/examples/wall.example.minimal.json`
-- `data/examples/wall.example.with-metadata.json`

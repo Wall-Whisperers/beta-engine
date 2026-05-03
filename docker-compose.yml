@@ -1,10 +1,12 @@
 services:
   beta-engine:
     build: .
+    image: beta-engine:dev
+    container_name: beta-engine
     ports:
       - "8000:8000"
+    # Bind-mount ./data so your saved walls live next to the repo —
+    # collaborators can inspect / commit them as plain JSON files.
     volumes:
-      - shared_data:/data
-
-volumes:
-  shared_data:
+      - ./data:/data
+    restart: unless-stopped

@@ -3,103 +3,118 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Wall Route Editor</title>
-    <style>
-      body { font-family: Arial, sans-serif; margin: 16px; }
-      .layout { display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
-      .panel { border: 1px solid #ddd; padding: 12px; border-radius: 8px; }
-      .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-      label { font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
-      input, select, button, textarea { padding: 6px; font-size: 14px; }
-      #wall {
-        display: grid;
-        gap: 2px;
-        background: #ccc;
-        border: 2px solid #666;
-        width: fit-content;
-      }
-      .cell {
-        width: 42px;
-        height: 42px;
-        border: 0;
-        cursor: pointer;
-        background: #f9f9f9;
-        position: relative;
-      }
-      .cell.selected { outline: 3px solid #111; }
-      .marker {
-        position: absolute;
-        inset: 6px;
-        border-radius: 6px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: #111;
-        font-size: 10px;
-        font-weight: bold;
-      }
-      .legend { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; }
-      .chip { display: inline-flex; align-items: center; gap: 4px; }
-      .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
-      textarea { width: 100%; min-height: 180px; }
-    </style>
+    <title>Beta Engine — Wall Editor</title>
+    <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <h1>Climbing Wall Editor</h1>
-    <div class="layout">
-      <div class="panel">
-        <h3>Grid</h3>
-        <div class="controls">
-          <label>Rows <input id="rows" type="number" min="1" value="10" /></label>
-          <label>Cols <input id="cols" type="number" min="1" value="8" /></label>
-        </div>
-        <button id="resize">Apply Grid Size</button>
-
-        <h3>Selected Hold</h3>
-        <p id="selection">None</p>
-        <div class="controls">
-          <label>Type
-            <select id="holdType">
-              <option value="jug">jug</option>
-              <option value="crimp">crimp</option>
-              <option value="sloper">sloper</option>
-              <option value="pinch">pinch</option>
-              <option value="foothold">foothold</option>
-            </select>
-          </label>
-          <label>Orientation
-            <select id="orientation">
-              <option value="up">up</option>
-              <option value="right">right</option>
-              <option value="down">down</option>
-              <option value="left">left</option>
-            </select>
-          </label>
-          <label>Size
-            <select id="size">
-              <option value="s">small</option>
-              <option value="m">medium</option>
-              <option value="l">large</option>
-            </select>
-          </label>
-          <label>Color <input id="holdColor" type="color" value="#4f46e5" /></label>
-          <label><input id="isStart" type="checkbox" /> Start</label>
-          <label><input id="isFinish" type="checkbox" /> Finish</label>
-        </div>
-        <button id="saveHold">Save / Update Hold</button>
-        <button id="removeHold">Remove Hold</button>
-
-        <h3>Export</h3>
-        <button id="exportJson">Export JSON</button>
-        <textarea id="jsonOutput" readonly></textarea>
+    <header class="topbar">
+      <h1>Beta Engine <span class="muted">/ wall editor</span></h1>
+      <div class="topbar-actions">
+        <label>Wall ID
+          <input id="wallId" type="text" value="my-wall" maxlength="64"
+            pattern="[A-Za-z0-9_\-]+" title="letters, digits, '-' or '_'" />
+        </label>
+        <select id="wallList" title="Saved walls"></select>
+        <button id="btnLoad">Load</button>
+        <button id="btnSave" class="primary">Save</button>
+        <button id="btnNew">New</button>
+        <button id="btnDelete" class="danger">Delete</button>
       </div>
+    </header>
 
-      <div class="panel">
-        <h3>Wall</h3>
-        <div id="wall"></div>
-        <div class="legend" id="legend"></div>
-      </div>
-    </div>
+    <main class="layout">
+      <aside class="panel">
+        <section>
+          <h2>Grid</h2>
+          <div class="row">
+            <label>Cols <input id="cols" type="number" min="1" max="40" value="10" /></label>
+            <label>Rows <input id="rows" type="number" min="1" max="40" value="14" /></label>
+            <button id="btnResize">Resize</button>
+          </div>
+          <p class="hint">Grid origin (0,0) is bottom-left — climbing convention.</p>
+        </section>
+
+        <section>
+          <h2>Hold palette</h2>
+          <p class="hint">These settings apply to the next placed hold, or to the selected hold.</p>
+          <div class="grid2">
+            <label>Type
+              <select id="holdType">
+                <option value="jug">Jug</option>
+                <option value="crimp">Crimp</option>
+                <option value="sloper">Sloper</option>
+                <option value="pinch">Pinch</option>
+                <option value="foothold">Foothold</option>
+              </select>
+            </label>
+            <label>Size
+              <select id="size">
+                <option value="small">Small</option>
+                <option value="medium" selected>Medium</option>
+                <option value="large">Large</option>
+              </select>
+            </label>
+            <label>Color
+              <input id="color" type="color" value="#22c55e" />
+            </label>
+            <label>Orientation
+              <span class="orient">
+                <input id="orient" type="range" min="0" max="359" value="0" />
+                <span id="orientVal" class="mono">0°</span>
+              </span>
+            </label>
+          </div>
+          <div class="row">
+            <label class="check"><input id="isStart" type="checkbox" /> Start</label>
+            <label class="check"><input id="isFinish" type="checkbox" /> Finish</label>
+          </div>
+          <div class="row">
+            <button id="btnApply">Apply to selected</button>
+            <button id="btnRemove" class="danger">Remove selected</button>
+          </div>
+          <p class="hint">
+            Tips: click an empty cell to place • click a hold to select • shift-click an empty cell
+            to clone the selected hold • <kbd>R</kbd> rotates +15° • <kbd>Del</kbd> removes •
+            arrow keys move the selection.
+          </p>
+        </section>
+
+        <section>
+          <h2>Legend</h2>
+          <div id="legend" class="legend"></div>
+        </section>
+
+        <section>
+          <h2>Status</h2>
+          <div id="status" class="status">Ready.</div>
+          <div id="counts" class="counts"></div>
+        </section>
+      </aside>
+
+      <section class="panel grid-panel">
+        <div class="grid-header">
+          <span id="cellInfo" class="mono">no selection</span>
+        </div>
+        <div id="gridWrap" class="grid-wrap">
+          <div id="grid" class="grid" role="grid" aria-label="climbing wall grid"></div>
+        </div>
+      </section>
+
+      <aside class="panel json-panel">
+        <h2>JSON</h2>
+        <p class="hint">Edit and click <em>Apply JSON</em> to load it into the editor.</p>
+        <textarea id="json" spellcheck="false"></textarea>
+        <div class="row">
+          <button id="btnApplyJson">Apply JSON</button>
+          <button id="btnFormat">Format</button>
+          <button id="btnDownload">Download .json</button>
+          <label class="file">
+            Upload
+            <input id="fileUpload" type="file" accept="application/json,.json" />
+          </label>
+        </div>
+      </aside>
+    </main>
 
     <script src="/static/app.js"></script>
   </body>
