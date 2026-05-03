@@ -191,3 +191,16 @@ python app.py
 ```
 
 Then open `http://localhost:8000`.
+
+---
+
+## Wall data schema (source of truth)
+
+For climbing wall and hold payloads, the canonical schema is:
+
+- `schemas/wall.schema.json`
+
+Team examples that should validate against this schema:
+
+- `data/examples/wall.example.minimal.json`
+- `data/examples/wall.example.with-metadata.json`
