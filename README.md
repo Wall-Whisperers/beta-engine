@@ -77,7 +77,7 @@ docker compose version
 ### 1) Initial setup (clone + build)
 
 ```bash
-git clone <repo-url> beta-engine
+git clone https://github.com/Wall-Whisperers/beta-engine.git beta-engine
 cd beta-engine
 docker compose build
 ```
