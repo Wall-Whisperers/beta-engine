@@ -1,187 +1,94 @@
-# Beta Engine – Docker Demo (Image to Black-and-White)
+# Beta Engine – MVP Collaboration Guide
 
-This repository is designed as a **clear Docker demo** for collaborators across macOS, Windows, and Linux.
-
-The demo app:
-- runs a small Flask web server,
-- accepts image uploads,
-- converts images to black-and-white using Pillow,
-- returns a downloadable PNG.
+This repo contains a lightweight Flask app and step-by-step team workflow documentation for the **Beta Engine MVP**, written to be beginner-friendly for first-time Docker users.
 
 ---
 
-## Why Docker helps this team
+## 1) MVP scope and non-goals
 
-Docker gives everyone the same runtime and dependency environment regardless of machine:
-- same Python version,
-- same system libraries,
-- same package versions,
-- fewer setup issues between collaborators.
+### MVP scope
+The MVP is intentionally narrow and focused on proving end-to-end team flow:
 
-This is a **demo/test app** intended to teach workflow and portability, not production hardening.
+- Upload an image through the web UI.
+- Convert the uploaded image into a black-and-white output image.
+- Persist wall/hold metadata as JSON records on disk.
+- Reload previously saved wall records from local storage.
+- Support local development and Docker-based collaboration.
 
----
+### Non-goals (for MVP)
+The following are explicitly out of scope for this phase:
 
-## Prerequisites
-
-Install Docker first:
-- **macOS**: Docker Desktop
-- **Windows**: Docker Desktop (enable WSL2 integration)
-- **Linux**: Docker Engine + Docker CLI
-
-Verify install:
-
-```bash
-docker --version
-```
+- Multi-tenant authentication/authorization.
+- Cloud database infrastructure.
+- Real-time collaborative editing.
+- Production-grade observability/alerting.
+- Mobile-native app clients.
+- ML-based automatic hold detection.
 
 ---
 
-## Full Docker workflow (recommended for first-time users)
+## 2) JSON schema overview (holds)
 
-### 1) Initial setup using Docker
+The wall model is file-based and JSON-first. Each wall record should contain:
 
-From the repository root, build the image:
+- `wall_id` (string, unique identifier)
+- `name` (string)
+- `created_at` (ISO-8601 UTC timestamp)
+- `updated_at` (ISO-8601 UTC timestamp)
+- `reference_image` (object)
+- `holds` (array of hold objects)
 
-```bash
-docker build -t beta-engine:demo .
-```
+### Hold object fields
 
-What this does:
-- reads the `Dockerfile`,
-- installs dependencies from `requirements.txt`,
-- creates a reusable image named `beta-engine:demo`.
+- `id` (string)
+- `label` (string)
+- `color` (string, e.g. `"blue"`)
+- `difficulty` (string enum suggestion: `"easy" | "moderate" | "hard"`)
+- `x` (number, normalized coordinate `0.0..1.0`)
+- `y` (number, normalized coordinate `0.0..1.0`)
+- `notes` (string, optional)
 
-### 2) Running the app
+### Sample wall record
 
-Start a container from the image:
-
-```bash
-docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
-```
-
-Then open:
-- http://localhost:8000
-
-Upload an image and the app returns a black-and-white PNG.
-
-### 3) Closing the app
-
-In the terminal running the container, press `Ctrl + C`.
-
-Because we used `--rm`, the stopped container is removed automatically.
-
-### 4) Cleaning
-
-Optional cleanup commands:
-
-```bash
-docker ps -a
-docker images
-```
-
-Remove the demo image if you want a completely clean state:
-
-```bash
-docker rmi beta-engine:demo
-```
-
-Optional system cleanup (removes unused Docker data):
-
-```bash
-docker system prune
-```
-
-### 5) Re-running the app
-
-If the image still exists:
-
-```bash
-docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
-```
-
-If you removed the image in cleanup, rebuild first:
-
-```bash
-docker build -t beta-engine:demo .
-docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
-```
-
-### 6) Closing again
-
-Press `Ctrl + C` in the running container terminal.
-
----
-
-## Helpful commands
-
-View running containers:
-
-```bash
-docker ps
-```
-
-View all containers (including stopped):
-
-```bash
-docker ps -a
-```
-
-View images:
-
-```bash
-docker images
-```
-
-Follow container logs (if running detached):
-
-```bash
-docker logs -f beta-engine-demo
-```
-
-Run in background (detached mode):
-
-```bash
-docker run -d --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
-```
-
-Stop detached container:
-
-```bash
-docker stop beta-engine-demo
+```json
+{
+  "wall_id": "wall-demo-001",
+  "name": "Training Wall A",
+  "created_at": "2026-05-03T10:00:00Z",
+  "updated_at": "2026-05-03T10:05:00Z",
+  "reference_image": {
+    "filename": "training-wall-a.jpg",
+    "width": 1080,
+    "height": 1440
+  },
+  "holds": [
+    {
+      "id": "H1",
+      "label": "start-left",
+      "color": "blue",
+      "difficulty": "easy",
+      "x": 0.22,
+      "y": 0.81,
+      "notes": "Large jug"
+    },
+    {
+      "id": "H2",
+      "label": "mid-crimp",
+      "color": "black",
+      "difficulty": "moderate",
+      "x": 0.48,
+      "y": 0.52,
+      "notes": "Small crimp"
+    }
+  ]
+}
 ```
 
 ---
 
-## OS-specific notes
+## 3) Local run instructions and `docker-compose` flow (team of 3)
 
-### macOS
-- If port 8000 is busy, use another local port:
-  ```bash
-  docker run --rm -p 8080:8000 --name beta-engine-demo beta-engine:demo
-  ```
-  Then open `http://localhost:8080`.
-
-### Windows (PowerShell)
-- Use the same commands in PowerShell.
-- If Docker asks for file-sharing permissions, allow access to the project directory.
-- Alternate port example:
-  ```powershell
-  docker run --rm -p 8080:8000 --name beta-engine-demo beta-engine:demo
-  ```
-
-### Linux
-- If your Docker install requires sudo:
-  ```bash
-  sudo docker build -t beta-engine:demo .
-  sudo docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
-  ```
-
----
-
-## Optional local run (without Docker)
-
-If you want to compare local setup vs Docker setup:
+## Local run (without Docker)
 
 ```bash
 python -m venv .venv
@@ -190,4 +97,130 @@ pip install -r requirements.txt
 python app.py
 ```
 
+Open: http://localhost:8000
+
+## Docker run (single container)
+
+```bash
+docker build -t beta-engine:demo .
+docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+Open: http://localhost:8000
+
+## `docker-compose` team flow (3 collaborators)
+
+Use one shared branch and consistent runtime commands per developer.
+
+1. Developer A/B/C each pull latest `dev`.
+2. Each developer runs the same compose flow locally on their own machine:
+
+```bash
+docker compose up --build
+```
+
+3. Open the app at `http://localhost:8000`.
+4. Stop and remove containers:
+
+```bash
+docker compose down
+```
+
+> Note: if `docker-compose.yml` is not yet present, add it before using the compose workflow above.
+
+---
+
+## 4) Save/load behavior and `/data/walls/` storage rules
+
+Wall persistence is file-based for MVP.
+
+### Save behavior
+
+- On save, write one JSON file per wall to `/data/walls/`.
+- File naming convention: `<wall_id>.json` (example: `wall-demo-001.json`).
+- Save operations should be idempotent: same `wall_id` overwrites prior record.
+- Always update `updated_at` on write.
+
+### Load behavior
+
+- Load by `wall_id` from `/data/walls/<wall_id>.json`.
+- Return a not-found response when file is missing.
+- Validate JSON shape before returning data to clients.
+
+### Storage rules
+
+- `/data/walls/` is the canonical directory for wall metadata.
+- Keep files UTF-8 encoded JSON.
+- Do not store binaries in `/data/walls/` (images belong in a separate image directory/object store).
+- Treat `/data/walls/` as durable volume-mounted storage when running in Docker.
+
+---
+
+## 5) Branch strategy and PR expectations
+
+We use a simple three-lane branching model:
+
+- `main`: production-ready history only.
+- `dev`: integration branch for approved features.
+- `feature/*`: short-lived branches for task-level work (e.g., `feature/save-wall-json`).
+
+### Standard flow
+
+1. Branch from `dev`.
+2. Implement in `feature/*`.
+3. Open PR into `dev`.
+4. After validation and review, merge `dev` into `main` on release.
+
+### PR expectations
+
+Every PR should include:
+
+- Clear scope summary (what changed, what did not).
+- Linked issue/task reference.
+- Manual validation notes (commands + observed results).
+- Screenshots for UI-visible changes.
+- Confirmation that persistence rules (`/data/walls/`) were preserved where relevant.
+
+---
+
+## 6) Quick manual validation checklist
+
+Use this checklist before opening a PR.
+
+1. Start app locally or in Docker.
+2. Upload a reference wall photo.
+3. Confirm black-and-white conversion returns a downloadable PNG.
+4. Create/recreate a sample wall record from the reference photo:
+   - define 5–10 holds,
+   - set normalized `x/y` coordinates,
+   - save JSON under `/data/walls/<wall_id>.json`.
+5. Reload that wall by `wall_id` and verify hold positions/metadata match saved values.
+6. Restart app and verify saved wall still loads.
+7. Run a second save with same `wall_id` and confirm update/overwrite behavior is correct.
+
+---
+
+## Helpful Docker commands
+
+```bash
+docker ps
+docker ps -a
+docker images
+docker logs -f beta-engine-demo
+docker system prune
+```
+
 Then open `http://localhost:8000`.
+
+---
+
+## Wall data schema (source of truth)
+
+For climbing wall and hold payloads, the canonical schema is:
+
+- `schemas/wall.schema.json`
+
+Team examples that should validate against this schema:
+
+- `data/examples/wall.example.minimal.json`
+- `data/examples/wall.example.with-metadata.json`

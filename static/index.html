@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wall Route Editor</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 16px; }
+      .layout { display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
+      .panel { border: 1px solid #ddd; padding: 12px; border-radius: 8px; }
+      .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      label { font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+      input, select, button, textarea { padding: 6px; font-size: 14px; }
+      #wall {
+        display: grid;
+        gap: 2px;
+        background: #ccc;
+        border: 2px solid #666;
+        width: fit-content;
+      }
+      .cell {
+        width: 42px;
+        height: 42px;
+        border: 0;
+        cursor: pointer;
+        background: #f9f9f9;
+        position: relative;
+      }
+      .cell.selected { outline: 3px solid #111; }
+      .marker {
+        position: absolute;
+        inset: 6px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #111;
+        font-size: 10px;
+        font-weight: bold;
+      }
+      .legend { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; }
+      .chip { display: inline-flex; align-items: center; gap: 4px; }
+      .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+      textarea { width: 100%; min-height: 180px; }
+    </style>
+  </head>
+  <body>
+    <h1>Climbing Wall Editor</h1>
+    <div class="layout">
+      <div class="panel">
+        <h3>Grid</h3>
+        <div class="controls">
+          <label>Rows <input id="rows" type="number" min="1" value="10" /></label>
+          <label>Cols <input id="cols" type="number" min="1" value="8" /></label>
+        </div>
+        <button id="resize">Apply Grid Size</button>
+
+        <h3>Selected Hold</h3>
+        <p id="selection">None</p>
+        <div class="controls">
+          <label>Type
+            <select id="holdType">
+              <option value="jug">jug</option>
+              <option value="crimp">crimp</option>
+              <option value="sloper">sloper</option>
+              <option value="pinch">pinch</option>
+              <option value="foothold">foothold</option>
+            </select>
+          </label>
+          <label>Orientation
+            <select id="orientation">
+              <option value="up">up</option>
+              <option value="right">right</option>
+              <option value="down">down</option>
+              <option value="left">left</option>
+            </select>
+          </label>
+          <label>Size
+            <select id="size">
+              <option value="s">small</option>
+              <option value="m">medium</option>
+              <option value="l">large</option>
+            </select>
+          </label>
+          <label>Color <input id="holdColor" type="color" value="#4f46e5" /></label>
+          <label><input id="isStart" type="checkbox" /> Start</label>
+          <label><input id="isFinish" type="checkbox" /> Finish</label>
+        </div>
+        <button id="saveHold">Save / Update Hold</button>
+        <button id="removeHold">Remove Hold</button>
+
+        <h3>Export</h3>
+        <button id="exportJson">Export JSON</button>
+        <textarea id="jsonOutput" readonly></textarea>
+      </div>
+
+      <div class="panel">
+        <h3>Wall</h3>
+        <div id="wall"></div>
+        <div class="legend" id="legend"></div>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/wall.schema.json",
+  "title": "Climbing Wall",
+  "description": "Schema for a climbing wall definition and its holds.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["wall_id", "holds"],
+  "properties": {
+    "wall_id": {
+      "type": "string",
+      "description": "Unique identifier for the wall."
+    },
+    "name": {
+      "type": "string",
+      "description": "Optional human-readable wall name."
+    },
+    "dimensions": {
+      "type": "object",
+      "description": "Optional wall dimensions.",
+      "additionalProperties": false,
+      "properties": {
+        "width": { "type": "number", "minimum": 0 },
+        "height": { "type": "number", "minimum": 0 },
+        "units": { "type": "string", "enum": ["m", "cm", "ft", "in"] }
+      }
+    },
+    "holds": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/hold" }
+    }
+  },
+  "$defs": {
+    "hold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hold_id",
+        "grid_x",
+        "grid_y",
+        "hold_type",
+        "orientation_deg",
+        "size",
+        "color",
+        "is_start",
+        "is_finish"
+      ],
+      "properties": {
+        "hold_id": { "type": "string" },
+        "grid_x": { "type": "integer" },
+        "grid_y": { "type": "integer" },
+        "hold_type": {
+          "type": "string",
+          "enum": ["jug", "crimp", "sloper", "pinch", "foothold"]
+        },
+        "orientation_deg": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 360,
+          "description": "Orientation in degrees; commonly 0 to 360."
+        },
+        "size": {
+          "type": "string",
+          "enum": ["small", "medium", "large"]
+        },
+        "color": {
+          "description": "Hold color as a standard value or free-form string.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": ["red", "blue", "green", "yellow", "black", "white", "orange", "purple", "pink", "gray", "brown"]
+            },
+            { "type": "string", "minLength": 1 }
+          ]
+        },
+        "is_start": { "type": "boolean" },
+        "is_finish": { "type": "boolean" }
+      }
+    }
+  }
+}
