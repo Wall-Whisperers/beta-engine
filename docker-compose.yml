@@ -1,0 +1,10 @@
+services:
+  beta-engine:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - shared_data:/data
+
+volumes:
+  shared_data:
