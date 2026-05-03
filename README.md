@@ -1,47 +1,193 @@
-# Beta Engine – Python + Docker Starter
+# Beta Engine – Docker Demo (Image to Black-and-White)
 
-This repository is a minimal Python starter that is ready for local development, Docker builds, and GitHub Actions CI.
+This repository is designed as a **clear Docker demo** for collaborators across macOS, Windows, and Linux.
 
-## What's included
+The demo app:
+- runs a small Flask web server,
+- accepts image uploads,
+- converts images to black-and-white using Pillow,
+- returns a downloadable PNG.
 
-- `app.py`: tiny runtime script that uses one dependency (`requests`) so we can validate dependency install.
-- `test_everything_working.py`: smoke test for import + simple HTTP behavior.
-- `requirements.txt`: locked top-level dependency list.
-- `Dockerfile`: production-lean container build.
-- `.dockerignore`: keeps Docker build context small.
-- `.github/workflows/ci.yml`: CI for tests + Docker image build on push/PR.
+---
 
-## Quick start (local)
+## Why Docker helps this team
+
+Docker gives everyone the same runtime and dependency environment regardless of machine:
+- same Python version,
+- same system libraries,
+- same package versions,
+- fewer setup issues between collaborators.
+
+This is a **demo/test app** intended to teach workflow and portability, not production hardening.
+
+---
+
+## Prerequisites
+
+Install Docker first:
+- **macOS**: Docker Desktop
+- **Windows**: Docker Desktop (enable WSL2 integration)
+- **Linux**: Docker Engine + Docker CLI
+
+Verify install:
+
+```bash
+docker --version
+```
+
+---
+
+## Full Docker workflow (recommended for first-time users)
+
+### 1) Initial setup using Docker
+
+From the repository root, build the image:
+
+```bash
+docker build -t beta-engine:demo .
+```
+
+What this does:
+- reads the `Dockerfile`,
+- installs dependencies from `requirements.txt`,
+- creates a reusable image named `beta-engine:demo`.
+
+### 2) Running the app
+
+Start a container from the image:
+
+```bash
+docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+Then open:
+- http://localhost:8000
+
+Upload an image and the app returns a black-and-white PNG.
+
+### 3) Closing the app
+
+In the terminal running the container, press `Ctrl + C`.
+
+Because we used `--rm`, the stopped container is removed automatically.
+
+### 4) Cleaning
+
+Optional cleanup commands:
+
+```bash
+docker ps -a
+docker images
+```
+
+Remove the demo image if you want a completely clean state:
+
+```bash
+docker rmi beta-engine:demo
+```
+
+Optional system cleanup (removes unused Docker data):
+
+```bash
+docker system prune
+```
+
+### 5) Re-running the app
+
+If the image still exists:
+
+```bash
+docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+If you removed the image in cleanup, rebuild first:
+
+```bash
+docker build -t beta-engine:demo .
+docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+### 6) Closing again
+
+Press `Ctrl + C` in the running container terminal.
+
+---
+
+## Helpful commands
+
+View running containers:
+
+```bash
+docker ps
+```
+
+View all containers (including stopped):
+
+```bash
+docker ps -a
+```
+
+View images:
+
+```bash
+docker images
+```
+
+Follow container logs (if running detached):
+
+```bash
+docker logs -f beta-engine-demo
+```
+
+Run in background (detached mode):
+
+```bash
+docker run -d --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+Stop detached container:
+
+```bash
+docker stop beta-engine-demo
+```
+
+---
+
+## OS-specific notes
+
+### macOS
+- If port 8000 is busy, use another local port:
+  ```bash
+  docker run --rm -p 8080:8000 --name beta-engine-demo beta-engine:demo
+  ```
+  Then open `http://localhost:8080`.
+
+### Windows (PowerShell)
+- Use the same commands in PowerShell.
+- If Docker asks for file-sharing permissions, allow access to the project directory.
+- Alternate port example:
+  ```powershell
+  docker run --rm -p 8080:8000 --name beta-engine-demo beta-engine:demo
+  ```
+
+### Linux
+- If your Docker install requires sudo:
+  ```bash
+  sudo docker build -t beta-engine:demo .
+  sudo docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+  ```
+
+---
+
+## Optional local run (without Docker)
+
+If you want to compare local setup vs Docker setup:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python app.py
-pytest -q
 ```
 
-## Docker quick start
-
-```bash
-docker build -t beta-engine:dev .
-docker run --rm beta-engine:dev
-```
-
-## 2026 setup notes (Docker + GitHub)
-
-These project defaults follow current official guidance as of **April 2026**:
-
-1. Use modern Dockerfile syntax header and keep Dockerfiles readable and explicit.
-2. Prefer small, trusted base images and pin to stable version tags.
-3. Use `.dockerignore` to reduce build context size and improve build speed.
-4. Keep containers non-root where practical.
-5. Build and test images in CI on every PR/push.
-6. In GitHub Actions for Python, use `actions/setup-python` and dependency caching.
-
-References:
-- Docker build best practices: https://docs.docker.com/build/building/best-practices/
-- Dockerfile concepts: https://docs.docker.com/build/concepts/dockerfile/
-- GitHub Actions workflow syntax: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
-- GitHub guide for building/testing Python: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
-
+Then open `http://localhost:8000`.
