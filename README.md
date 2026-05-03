@@ -1,49 +1,35 @@
 # Beta Engine – Docker Demo (Image to Black-and-White)
 
-This repository is designed as a **clear Docker demo** for collaborators using different operating systems.
+This repository is designed as a **clear Docker demo** for collaborators across macOS, Windows, and Linux.
 
-The app is intentionally simple but dependency-heavy enough to demonstrate Docker value:
-- Web server: Flask
-- Image processing: Pillow
-
-You upload an image, and the app returns a black-and-white PNG.
-
----
-
-## Why this is useful for teams
-
-When everyone runs the app in Docker:
-- macOS, Windows, and Linux users run the same environment.
-- No “it works on my machine” package/version mismatch.
-- No need to manually troubleshoot local Python/Pillow setup differences.
+The demo app:
+- runs a small Flask web server,
+- accepts image uploads,
+- converts images to black-and-white using Pillow,
+- returns a downloadable PNG.
 
 ---
 
-## What this app is (and is not)
+## Why Docker helps this team
 
-- ✅ A **demo/test app** to show Docker workflow and portability.
-- ✅ Good for onboarding teammates who are new to containers.
-- ❌ Not production-hardened (no auth, no persistent storage, minimal validation).
+Docker gives everyone the same runtime and dependency environment regardless of machine:
+- same Python version,
+- same system libraries,
+- same package versions,
+- fewer setup issues between collaborators.
 
-The explanation above is also documented in `app.py` itself.
-
----
-
-## Project files
-
-- `app.py` — demo Flask server with image upload + black-and-white conversion.
-- `requirements.txt` — Python dependencies.
-- `Dockerfile` — image build instructions.
+This is a **demo/test app** intended to teach workflow and portability, not production hardening.
 
 ---
 
-## Prerequisite: install Docker Desktop / Docker Engine
+## Prerequisites
 
-- **macOS**: install Docker Desktop, open it once, wait until Docker is running.
-- **Windows**: install Docker Desktop, enable WSL2 integration when prompted, then start Docker Desktop.
-- **Linux**: install Docker Engine + Docker CLI for your distro and ensure the Docker daemon is running.
+Install Docker first:
+- **macOS**: Docker Desktop
+- **Windows**: Docker Desktop (enable WSL2 integration)
+- **Linux**: Docker Engine + Docker CLI
 
-To verify Docker is available, run:
+Verify install:
 
 ```bash
 docker --version
@@ -51,62 +37,151 @@ docker --version
 
 ---
 
-## Quick start (same commands on macOS, Windows PowerShell, and Linux)
+## Full Docker workflow (recommended for first-time users)
 
-From the repository root:
+### 1) Initial setup using Docker
+
+From the repository root, build the image:
 
 ```bash
 docker build -t beta-engine:demo .
-docker run --rm -p 8000:8000 beta-engine:demo
 ```
 
-Now open:
+What this does:
+- reads the `Dockerfile`,
+- installs dependencies from `requirements.txt`,
+- creates a reusable image named `beta-engine:demo`.
 
+### 2) Running the app
+
+Start a container from the image:
+
+```bash
+docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+Then open:
 - http://localhost:8000
 
-Upload an image and download the converted black-and-white output.
+Upload an image and the app returns a black-and-white PNG.
+
+### 3) Closing the app
+
+In the terminal running the container, press `Ctrl + C`.
+
+Because we used `--rm`, the stopped container is removed automatically.
+
+### 4) Cleaning
+
+Optional cleanup commands:
+
+```bash
+docker ps -a
+docker images
+```
+
+Remove the demo image if you want a completely clean state:
+
+```bash
+docker rmi beta-engine:demo
+```
+
+Optional system cleanup (removes unused Docker data):
+
+```bash
+docker system prune
+```
+
+### 5) Re-running the app
+
+If the image still exists:
+
+```bash
+docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+If you removed the image in cleanup, rebuild first:
+
+```bash
+docker build -t beta-engine:demo .
+docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+### 6) Closing again
+
+Press `Ctrl + C` in the running container terminal.
+
+---
+
+## Helpful commands
+
+View running containers:
+
+```bash
+docker ps
+```
+
+View all containers (including stopped):
+
+```bash
+docker ps -a
+```
+
+View images:
+
+```bash
+docker images
+```
+
+Follow container logs (if running detached):
+
+```bash
+docker logs -f beta-engine-demo
+```
+
+Run in background (detached mode):
+
+```bash
+docker run -d --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
+```
+
+Stop detached container:
+
+```bash
+docker stop beta-engine-demo
+```
 
 ---
 
 ## OS-specific notes
 
 ### macOS
-
-- If port `8000` is busy, change to another local port:
+- If port 8000 is busy, use another local port:
   ```bash
-  docker run --rm -p 8080:8000 beta-engine:demo
+  docker run --rm -p 8080:8000 --name beta-engine-demo beta-engine:demo
   ```
   Then open `http://localhost:8080`.
 
 ### Windows (PowerShell)
-
-- Use the same commands as above in PowerShell.
-- If you see a file-sharing warning in Docker Desktop, allow access to your project folder.
-- If port `8000` is busy:
+- Use the same commands in PowerShell.
+- If Docker asks for file-sharing permissions, allow access to the project directory.
+- Alternate port example:
   ```powershell
-  docker run --rm -p 8080:8000 beta-engine:demo
+  docker run --rm -p 8080:8000 --name beta-engine-demo beta-engine:demo
   ```
 
 ### Linux
-
-- If `docker` needs sudo on your machine:
+- If your Docker install requires sudo:
   ```bash
   sudo docker build -t beta-engine:demo .
-  sudo docker run --rm -p 8000:8000 beta-engine:demo
+  sudo docker run --rm -p 8000:8000 --name beta-engine-demo beta-engine:demo
   ```
-- Optional: configure your user for non-sudo Docker usage.
 
 ---
 
-## Stop the app
+## Optional local run (without Docker)
 
-In the terminal running the container, press `Ctrl + C`.
-
----
-
-## Optional local (non-Docker) run
-
-If you want to compare Docker vs local Python setup:
+If you want to compare local setup vs Docker setup:
 
 ```bash
 python -m venv .venv
@@ -115,4 +190,4 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Then visit `http://localhost:8000`.
+Then open `http://localhost:8000`.
