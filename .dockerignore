@@ -6,3 +6,7 @@ __pycache__
 *.pyd
 .pytest_cache
 .venv
+.idea
+.vscode
+node_modules
+data/walls

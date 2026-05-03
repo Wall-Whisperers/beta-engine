@@ -1,0 +1,20 @@
+{
+  "wall_id": "example-v2-boulder",
+  "name": "Demo · V2 Boulder",
+  "grid": { "cols": 10, "rows": 14 },
+  "holds": [
+    { "hold_id": "h_001", "grid_x": 2, "grid_y": 0, "hold_type": "foothold", "orientation_deg": 0,   "size": "small",  "color": "#a855f7", "is_start": false, "is_finish": false },
+    { "hold_id": "h_002", "grid_x": 7, "grid_y": 0, "hold_type": "foothold", "orientation_deg": 0,   "size": "small",  "color": "#a855f7", "is_start": false, "is_finish": false },
+    { "hold_id": "h_003", "grid_x": 3, "grid_y": 1, "hold_type": "jug",      "orientation_deg": 0,   "size": "large",  "color": "#22c55e", "is_start": true,  "is_finish": false },
+    { "hold_id": "h_004", "grid_x": 6, "grid_y": 1, "hold_type": "jug",      "orientation_deg": 0,   "size": "large",  "color": "#22c55e", "is_start": true,  "is_finish": false },
+    { "hold_id": "h_005", "grid_x": 5, "grid_y": 2, "hold_type": "foothold", "orientation_deg": 0,   "size": "small",  "color": "#a855f7", "is_start": false, "is_finish": false },
+    { "hold_id": "h_006", "grid_x": 4, "grid_y": 4, "hold_type": "jug",      "orientation_deg": 0,   "size": "medium", "color": "#22c55e", "is_start": false, "is_finish": false },
+    { "hold_id": "h_007", "grid_x": 3, "grid_y": 5, "hold_type": "foothold", "orientation_deg": 0,   "size": "small",  "color": "#a855f7", "is_start": false, "is_finish": false },
+    { "hold_id": "h_008", "grid_x": 7, "grid_y": 5, "hold_type": "crimp",    "orientation_deg": 315, "size": "medium", "color": "#ef4444", "is_start": false, "is_finish": false },
+    { "hold_id": "h_009", "grid_x": 6, "grid_y": 6, "hold_type": "foothold", "orientation_deg": 0,   "size": "small",  "color": "#a855f7", "is_start": false, "is_finish": false },
+    { "hold_id": "h_010", "grid_x": 4, "grid_y": 7, "hold_type": "sloper",   "orientation_deg": 0,   "size": "large",  "color": "#f59e0b", "is_start": false, "is_finish": false },
+    { "hold_id": "h_011", "grid_x": 5, "grid_y": 8, "hold_type": "foothold", "orientation_deg": 0,   "size": "small",  "color": "#a855f7", "is_start": false, "is_finish": false },
+    { "hold_id": "h_012", "grid_x": 6, "grid_y": 9, "hold_type": "pinch",    "orientation_deg": 90,  "size": "medium", "color": "#3b82f6", "is_start": false, "is_finish": false },
+    { "hold_id": "h_013", "grid_x": 5, "grid_y": 11, "hold_type": "jug",     "orientation_deg": 0,   "size": "large",  "color": "#22c55e", "is_start": false, "is_finish": true }
+  ]
+}

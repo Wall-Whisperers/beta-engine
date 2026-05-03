@@ -1,3 +1,9 @@
-idea
-bob
-.idea
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# User-saved walls (the seeded examples live in data/examples/ and ARE tracked).
+data/walls/

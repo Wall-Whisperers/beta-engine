@@ -1,166 +1,197 @@
+"""Beta Engine MVP — climbing wall grid editor backend.
+
+Serves the static editor UI and provides a small JSON API for listing,
+loading, saving, and deleting wall files under /data/walls/.
+"""
 from __future__ import annotations
 
 import json
+import re
+import shutil
 from pathlib import Path
+from typing import Any
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
-app = Flask(__name__)
 DATA_DIR = Path("/data/walls")
+ROOT = Path(__file__).parent
+STATIC_DIR = ROOT / "static"
+SCHEMA_PATH = ROOT / "schemas" / "wall.schema.json"
+SEED_DIR = ROOT / "data" / "examples"
 
-WALL_EDITOR_HTML = """<!doctype html>
-"""Demo-only image conversion service.
+HOLD_TYPES = {"jug", "crimp", "sloper", "pinch", "foothold"}
+SIZES = {"small", "medium", "large"}
+WALL_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
-This file is intentionally a little more involved than a hello-world script so
-new Docker users can quickly see the value of packaging dependencies in one
-portable container.
-
-What this demo does:
-- starts a small Flask web server,
-- accepts an uploaded image,
-- converts it to black-and-white with Pillow,
-- returns the converted image for download,
-- provides simple wall JSON save/load endpoints backed by /data/walls.
-
-This is not intended as production-ready code. It is a teaching/demo app.
-"""
-
-from __future__ import annotations
-
-import json
-from io import BytesIO
-from pathlib import Path
-
-from flask import Flask, Response, request, send_from_directory
-from PIL import Image, UnidentifiedImageError
-
-app = Flask(__name__)
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
-WALLS_DIR = Path("/data/walls")
-
-@app.get('/')
-def home() -> Response:
-    return send_from_directory('static', 'index.html')
-HTML_FORM = """<!doctype html>
-<html lang=\"en\">
-  <head>
-    <meta charset=\"utf-8\" />
-    <title>Wall Editor</title>
-  </head>
-  <body>
-    <h1>Wall Editor</h1>
-    <p>Wall editor UI placeholder for MVP backend integration.</p>
-  </body>
-</html>
-"""
-
-REQUIRED_HOLD_FIELDS = {
-    "hold_id": str,
-    "grid_x": int,
-    "grid_y": int,
-    "hold_type": str,
-    "orientation_deg": (int, float),
-    "size": (int, float),
-    "color": str,
-    "is_start": bool,
-    "is_finish": bool,
-}
+app = Flask(__name__, static_folder=None)
 
 
-def _wall_file(wall_id: str) -> Path:
-    safe_id = wall_id.strip()
-    if not safe_id or "/" in safe_id or "\\" in safe_id:
-        raise ValueError("Invalid wall_id")
-
-    WALLS_DIR.mkdir(parents=True, exist_ok=True)
-    return WALLS_DIR / f"{safe_id}.json"
+def _wall_path(wall_id: str) -> Path:
+    if not WALL_ID_RE.match(wall_id or ""):
+        raise ValueError("wall_id must be 1–64 chars: letters, digits, '-' or '_'.")
+    return DATA_DIR / f"{wall_id}.json"
 
 
-@app.get("/")
-def home() -> str:
-    return WALL_EDITOR_HTML
+def _validate_wall(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return "Wall must be a JSON object."
+    if not WALL_ID_RE.match(str(payload.get("wall_id", ""))):
+        return "wall_id must be 1–64 chars of letters, digits, '-' or '_'."
+    holds = payload.get("holds")
+    if not isinstance(holds, list):
+        return "holds must be an array."
 
-
-def _validate_hold(hold: object, index: int) -> str | None:
-    if not isinstance(hold, dict):
-        return f"Hold at index {index} must be an object."
-
-    for field, expected_type in REQUIRED_HOLD_FIELDS.items():
-        if field not in hold:
-            return f"Hold at index {index} is missing required field '{field}'."
-        if not isinstance(hold[field], expected_type):
-            return f"Hold at index {index} field '{field}' has invalid type."
-
+    seen_ids: set[str] = set()
+    seen_cells: set[tuple[int, int]] = set()
+    for i, h in enumerate(holds):
+        err = _validate_hold(h, i, seen_ids, seen_cells)
+        if err:
+            return err
     return None
 
 
-@app.post("/api/walls")
-def save_wall() -> Response:
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"error": "Request body must be a JSON object."}), 400
+def _is_bool(v: Any) -> bool:
+    return isinstance(v, bool)
 
-    wall_id = payload.get("wall_id")
-    holds = payload.get("holds")
 
-    if not isinstance(wall_id, str) or not wall_id.strip():
-        return jsonify({"error": "'wall_id' is required and must be a non-empty string."}), 400
-    if not isinstance(holds, list):
-        return jsonify({"error": "'holds' is required and must be an array."}), 400
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
 
-    for index, hold in enumerate(holds):
-        error = _validate_hold(hold, index)
-        if error:
-            return jsonify({"error": error}), 400
 
+def _is_number(v: Any) -> bool:
+    return (isinstance(v, int) or isinstance(v, float)) and not isinstance(v, bool)
+
+
+def _validate_hold(
+    h: Any, i: int, seen_ids: set[str], seen_cells: set[tuple[int, int]]
+) -> str | None:
+    if not isinstance(h, dict):
+        return f"holds[{i}] must be an object."
+
+    checks = {
+        "hold_id": (isinstance(h.get("hold_id"), str), "string"),
+        "grid_x": (_is_int(h.get("grid_x")), "integer"),
+        "grid_y": (_is_int(h.get("grid_y")), "integer"),
+        "hold_type": (isinstance(h.get("hold_type"), str), "string"),
+        "orientation_deg": (_is_number(h.get("orientation_deg")), "number"),
+        "size": (isinstance(h.get("size"), str), "string"),
+        "color": (isinstance(h.get("color"), str), "string"),
+        "is_start": (_is_bool(h.get("is_start")), "boolean"),
+        "is_finish": (_is_bool(h.get("is_finish")), "boolean"),
+    }
+    for field, (ok, kind) in checks.items():
+        if field not in h:
+            return f"holds[{i}] missing '{field}'."
+        if not ok:
+            return f"holds[{i}].{field} must be {kind}."
+
+    if h["hold_type"] not in HOLD_TYPES:
+        return f"holds[{i}].hold_type must be one of {sorted(HOLD_TYPES)}."
+    if h["size"] not in SIZES:
+        return f"holds[{i}].size must be one of {sorted(SIZES)}."
+    if not 0 <= float(h["orientation_deg"]) < 360:
+        return f"holds[{i}].orientation_deg must be in [0, 360)."
+    if h["grid_x"] < 0 or h["grid_y"] < 0:
+        return f"holds[{i}] grid coords must be non-negative."
+
+    if h["hold_id"] in seen_ids:
+        return f"holds[{i}].hold_id '{h['hold_id']}' is duplicated."
+    seen_ids.add(h["hold_id"])
+
+    cell = (h["grid_x"], h["grid_y"])
+    if cell in seen_cells:
+        return f"holds[{i}] cell {cell} already occupied."
+    seen_cells.add(cell)
+    return None
+
+
+@app.get("/")
+def index() -> Any:
+    return send_from_directory(STATIC_DIR, "index.html")
+
+
+@app.get("/static/<path:filename>")
+def static_files(filename: str) -> Any:
+    return send_from_directory(STATIC_DIR, filename)
+
+
+@app.get("/api/schema")
+def get_schema() -> Any:
+    if SCHEMA_PATH.exists():
+        return send_from_directory(SCHEMA_PATH.parent, SCHEMA_PATH.name)
+    return jsonify({"error": "schema not found"}), 404
+
+
+@app.get("/api/walls")
+def list_walls() -> Any:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    wall_path = DATA_DIR / f"{wall_id}.json"
-
-    with wall_path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
-
-    return jsonify({"wall_id": wall_id, "saved": True})
+    ids = sorted(p.stem for p in DATA_DIR.glob("*.json"))
+    return jsonify({"walls": ids})
 
 
 @app.get("/api/walls/<wall_id>")
-def load_wall(wall_id: str) -> Response:
-    wall_path = DATA_DIR / f"{wall_id}.json"
-    if not wall_path.exists():
-        return jsonify({"error": "Wall not found."}), 404
+def load_wall(wall_id: str) -> Any:
+    try:
+        path = _wall_path(wall_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not path.exists():
+        return jsonify({"error": "wall not found"}), 404
+    return jsonify(json.loads(path.read_text(encoding="utf-8")))
 
-    with wall_path.open("r", encoding="utf-8") as fp:
-        wall_data = json.load(fp)
 
-    return jsonify(wall_data)
-
-
-@app.put("/walls/<wall_id>")
-def save_wall(wall_id: str) -> Response:
+@app.put("/api/walls/<wall_id>")
+def save_wall(wall_id: str) -> Any:
     payload = request.get_json(silent=True)
-    if payload is None:
-        return Response("Request body must be valid JSON.\n", status=400, mimetype="text/plain")
+    if not isinstance(payload, dict):
+        return jsonify({"error": "request body must be a JSON object"}), 400
+
+    payload.setdefault("wall_id", wall_id)
+    if payload.get("wall_id") != wall_id:
+        return jsonify({"error": "wall_id in URL and body must match"}), 400
+
+    err = _validate_wall(payload)
+    if err:
+        return jsonify({"error": err}), 400
 
     try:
-        wall_file = _wall_file(wall_id)
-    except ValueError:
-        return Response("Invalid wall_id.\n", status=400, mimetype="text/plain")
+        path = _wall_path(wall_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
-    wall_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return Response(status=204)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return jsonify({"wall_id": wall_id, "saved": True})
 
 
-@app.get("/walls/<wall_id>")
-def load_wall(wall_id: str) -> Response:
+@app.delete("/api/walls/<wall_id>")
+def delete_wall(wall_id: str) -> Any:
     try:
-        wall_file = _wall_file(wall_id)
-    except ValueError:
-        return Response("Invalid wall_id.\n", status=400, mimetype="text/plain")
+        path = _wall_path(wall_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not path.exists():
+        return jsonify({"error": "wall not found"}), 404
+    path.unlink()
+    return jsonify({"wall_id": wall_id, "deleted": True})
 
-    if not wall_file.exists():
-        return Response("Wall not found.\n", status=404, mimetype="text/plain")
 
-    return Response(wall_file.read_text(encoding="utf-8"), mimetype="application/json")
+@app.get("/healthz")
+def healthz() -> Any:
+    return jsonify({"ok": True})
+
+
+def _seed_examples() -> None:
+    """Copy bundled example walls into /data/walls/ if missing."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not SEED_DIR.exists():
+        return
+    for src in SEED_DIR.glob("*.json"):
+        dst = DATA_DIR / src.name
+        if not dst.exists():
+            shutil.copy(src, dst)
 
 
 if __name__ == "__main__":
+    _seed_examples()
     app.run(host="0.0.0.0", port=8000, debug=False)
