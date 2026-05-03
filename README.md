@@ -1,6 +1,6 @@
 # Beta Engine – MVP Collaboration Guide
 
-This repo contains a lightweight Flask app and team workflow documentation for the **Beta Engine MVP**.
+This repo contains a lightweight Flask app and step-by-step team workflow documentation for the **Beta Engine MVP**, written to be beginner-friendly for first-time Docker users.
 
 ---
 
@@ -110,23 +110,16 @@ Open: http://localhost:8000
 
 ## `docker-compose` team flow (3 collaborators)
 
-Use one shared branch and isolated runtime names/ports per developer.
+Use one shared branch and consistent runtime commands per developer.
 
 1. Developer A/B/C each pull latest `dev`.
-2. Each developer starts their own stack using a unique compose project name:
+2. Each developer runs the same compose flow locally on their own machine:
 
 ```bash
-# Developer A
-COMPOSE_PROJECT_NAME=beta_a docker compose up --build
-
-# Developer B
-COMPOSE_PROJECT_NAME=beta_b docker compose up --build
-
-# Developer C
-COMPOSE_PROJECT_NAME=beta_c docker compose up --build
+docker compose up --build
 ```
 
-3. If ports conflict, override host mapping in compose overrides (for example: `8001:8000`, `8002:8000`).
+3. Open the app at `http://localhost:8000`.
 4. Stop and remove containers:
 
 ```bash
