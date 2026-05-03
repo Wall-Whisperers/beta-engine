@@ -20,13 +20,16 @@ import json
 from io import BytesIO
 from pathlib import Path
 
-from flask import Flask, Response, request
+from flask import Flask, Response, request, send_from_directory
 from PIL import Image, UnidentifiedImageError
 
 app = Flask(__name__)
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 WALLS_DIR = Path("/data/walls")
 
+@app.get('/')
+def home() -> Response:
+    return send_from_directory('static', 'index.html')
 HTML_FORM = """<!doctype html>
 <html lang=\"en\">
   <head>
