@@ -1,80 +1,70 @@
-# Beta Engine — MVP Wall Grid Editor
+# Beta Engine
 
-A small web tool for defining climbing walls on a grid. Click cells to place
-holds, set type / orientation / size / color / start-finish flags, then save
-the wall as JSON. Saved walls live as plain `*.json` files under
-`data/walls/` so collaborators can read, edit, and version them.
+A two-part climbing-wall MVP:
 
-This is a Phase 1 MVP — narrow, opinionated, and meant to lock down the JSON
-schema everything downstream depends on.
+| Part | Folder | What it does |
+|------|--------|--------------|
+| **Grid editor** | `grid_editor/` | Web tool for placing holds on a grid and saving walls as JSON |
+| **Solver** | `solver/` | **2D-only** IK + A\*/RL solver that reads those JSON files and outputs a move sequence |
+
+The editor locks the JSON schema everything downstream depends on. The solver
+is a first pass at the body-model → reachability → search → visualizer pipeline,
+intended to work on hand-built walls before we layer on computer vision, physics,
+or a full PPO agent.
+
+> **Scope of the solver:** strictly 2D. Pose, IK, reachability, and stability
+> are all evaluated in the wall plane (x = horizontal, y = vertical). No body
+> twist, no out-of-plane drop-knee, no friction model. Anatomical constraints
+> (hand cross-body limit, foot-can't-go-above-shoulder, etc.) are approximated
+> with tunable joint-angle envelopes — see [`solver/README.md`](solver/README.md)
+> for the constants and how to tweak them.
+
+For deeper detail on each part see:
+- [`grid_editor/README.md`](grid_editor/README.md)
+- [`solver/README.md`](solver/README.md)
+- [`planning-gabe.md`](planning-gabe.md) — long-term architecture + decisions log
+- [`CLAUDE.md`](CLAUDE.md) — team context + build phases
 
 ---
 
-## What's in the box
+## Project layout
 
-- **Backend** — Flask (Python 3.12). Validates wall JSON, persists to `/data/walls/`.
-- **Frontend** — single-page editor (vanilla JS, no build step).
-- **Schema** — `schemas/wall.schema.json` (JSON Schema 2020-12, source of truth).
-- **Example wall** — `data/examples/example-v2-boulder.json` auto-seeds on first
-  start so you see a real boulder problem immediately.
-- **Docker** — single container with bind-mounted `./data` so wall files appear
-  on your host filesystem.
-
----
-
-## Hold JSON schema
-
-```json
-{
-  "hold_id": "h_001",
-  "grid_x": 12,
-  "grid_y": 24,
-  "hold_type": "crimp",
-  "orientation_deg": 47.5,
-  "size": "small",
-  "color": "#ef4444",
-  "is_start": false,
-  "is_finish": false
-}
 ```
-
-| Field             | Type                                                           | Notes |
-|-------------------|----------------------------------------------------------------|-------|
-| `hold_id`         | string                                                         | Unique within the wall. Editor auto-assigns `h_001`, `h_002`, … |
-| `grid_x`          | integer ≥ 0                                                    | Column. 0 = left edge of wall. |
-| `grid_y`          | integer ≥ 0                                                    | Row. **0 = bottom of wall** (climbing convention). |
-| `hold_type`       | `jug` \| `crimp` \| `sloper` \| `pinch` \| `foothold`           | Color-coded in the UI. |
-| `orientation_deg` | number in `[0, 360)`                                           | 0° = up; clockwise. Indicates pull / pinch-axis direction. |
-| `size`            | `small` \| `medium` \| `large`                                  | |
-| `color`           | string                                                         | Hex `#RRGGBB` or any color name (route color or physical hold color). |
-| `is_start`        | boolean                                                        | Marked with a green ring. |
-| `is_finish`       | boolean                                                        | Marked with a red ring. |
-
-A full wall file looks like:
-
-```json
-{
-  "wall_id": "my-wall",
-  "name": "optional name",
-  "grid": { "cols": 10, "rows": 14 },
-  "holds": [ /* one or more hold objects */ ]
-}
+beta-engine/
+├── grid_editor/       # Flask backend + static frontend for the wall editor
+│   ├── server.py      #   REST API + static file serving
+│   └── README.md      #   schema reference, API docs, editor controls
+├── solver/            # 2D IK + A* + Q-learning solver
+│   ├── wall.py        #   JSON loader + grid → cm conversion
+│   ├── body.py        #   5-point stick figure + 2-link IK
+│   ├── reachability.py#   Pose, reach + stability
+│   ├── astar.py       #   A* baseline
+│   ├── rl_qlearn.py   #   tabular Q-learning
+│   ├── visualize.py   #   matplotlib PNG/GIF renderer
+│   ├── __main__.py    #   CLI entry point
+│   └── README.md      #   solver quickstart + flags + architecture
+├── static/            # Vanilla-JS editor frontend (no build step)
+├── schemas/           # wall.schema.json — JSON Schema 2020-12 source of truth
+├── data/
+│   ├── examples/      # Seeded example walls (tracked in git)
+│   ├── walls/         # User-saved walls (gitignored)
+│   └── runs/          # Solver PNG/GIF outputs (gitignored)
+├── planning-gabe.md   # Long-term architecture notes
+└── CLAUDE.md          # Team context + multi-phase build plan
 ```
-
-`wall_id` must match `^[A-Za-z0-9_\-]{1,64}$` (it's used as a filename).
 
 ---
 
 ## Quickstart with Docker
 
-You need Docker Desktop (or Docker Engine + Compose v2). Verify with:
+You need Docker Desktop (or Docker Engine + Compose v2):
 
 ```bash
 docker --version
 docker compose version
 ```
 
-### 1) Initial setup (clone + build)
+### 1) Clone + build
 
 ```bash
 git clone https://github.com/Wall-Whisperers/beta-engine.git beta-engine
@@ -82,53 +72,49 @@ cd beta-engine
 docker compose build
 ```
 
-### 2) Start running
+### 2) Start
 
 ```bash
 docker compose up -d
 ```
 
-Open <http://localhost:8000>. You should land in the editor with the example
-V2 boulder loaded.
+Open <http://localhost:8000>. The example V2 boulder loads automatically.
 
-Tail logs while it runs:
-
-```bash
-docker compose logs -f
-```
-
-### 3) Close it down (keep the data)
+### 3) Stop (keep your walls)
 
 ```bash
 docker compose down
 ```
 
-Your saved walls persist in `./data/walls/` on your host — reopen the app any
-time and they're still there.
+Walls persist in `./data/walls/` on your host.
 
-### 4) Clean up (full reset)
-
-Remove the container, its image, and any wall files you've saved:
+### 4) Full reset
 
 ```bash
 docker compose down --rmi all
 rm -rf data/walls
 ```
 
-The seeded example will be re-copied into `data/walls/` the next time the app
-starts.
-
-### 5) Re-run
+### 5) Run the solver (container must be running)
 
 ```bash
-docker compose up -d
+# A* — fast, mathematically shortest path
+docker compose exec beta-engine python -m solver --wall example-v2-boulder
+
+# Q-learning RL
+docker compose exec beta-engine python -m solver --wall example-v2-boulder --method qlearn
+
+# Both + animated GIFs saved to ./data/runs/
+docker compose exec beta-engine python -m solver --wall example-v2-boulder --method both --gif
+
+# Different climber — height/wingspan literally change which betas exist
+docker compose exec beta-engine python -m solver --wall example-v2-boulder \
+  --height-cm 190 --wingspan-cm 185 --gif
 ```
 
-### 6) Stop again
-
-```bash
-docker compose down
-```
+See [`solver/README.md`](solver/README.md) for all CLI flags, the per-module
+reasoning, and the table of tweakable constants (joint envelopes, reward
+weights, A\* heuristic, etc.).
 
 ---
 
@@ -136,97 +122,39 @@ docker compose down
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
+source .venv/bin/activate       # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-DATA_DIR=./data python app.py # uses ./data instead of /data
+
+# Grid editor (serves on :8000)
+python -m grid_editor.server
+
+# Solver
+python -m solver --wall example-v2-boulder --method both --gif
 ```
 
-> Note: the app hard-codes `/data/walls/` to match the Docker path. For a
-> local run, either run inside Docker (recommended) or temporarily edit
-> `DATA_DIR` at the top of `app.py`.
-
----
-
-## Using the editor
-
-| Action                         | How |
-|--------------------------------|-----|
-| Place a hold                   | Click an empty cell — uses the current palette settings |
-| Select a hold                  | Click an occupied cell |
-| Edit a selected hold           | Change the palette, then click **Apply to selected** |
-| Remove a hold                  | Select it → **Remove selected** (or press <kbd>Del</kbd>) |
-| Rotate selected by +15°        | Press <kbd>R</kbd> (or right-click any hold) |
-| Move selection                 | Arrow keys |
-| Clone a hold                   | Select it, then shift-click an empty cell |
-| Resize the grid                | Set cols/rows → **Resize** (out-of-bounds holds are dropped) |
-| Save / Load / Delete           | Top bar (`Save` writes `data/walls/<wall_id>.json`) |
-| Hand-edit JSON                 | Right panel — edit, then **Apply JSON** |
-| Export / Import a `.json` file | **Download .json** / **Upload** |
-
-### Climbing notes baked into the editor
-
-- Grid origin (0, 0) is **bottom-left** so increasing `grid_y` goes up the wall.
-- Orientation 0° points up. For a sidepull crimp pulling down-right, use ~315°.
-  For a horizontal pinch, use 90°.
-- Start holds get a green ring; finish holds get a red ring; both = both rings.
-- Hold-type colors used by default:
-  - jug 🟢 · crimp 🔴 · sloper 🟠 · pinch 🔵 · foothold 🟣
-
----
-
-## API
-
-| Method | Path                       | Purpose |
-|--------|----------------------------|---------|
-| GET    | `/`                        | Editor UI |
-| GET    | `/api/walls`               | List saved wall IDs |
-| GET    | `/api/walls/<wall_id>`     | Load one wall |
-| PUT    | `/api/walls/<wall_id>`     | Save (creates or overwrites). Body must validate. |
-| DELETE | `/api/walls/<wall_id>`     | Delete |
-| GET    | `/api/schema`              | Returns `wall.schema.json` |
-| GET    | `/healthz`                 | `{ "ok": true }` (used by Docker healthcheck) |
-
-Quick `curl` smoke test (with the app running):
-
-```bash
-curl -s http://localhost:8000/api/walls
-curl -s http://localhost:8000/api/walls/example-v2-boulder | head
-```
-
----
-
-## Manual validation checklist
-
-Use before opening a PR.
-
-1. `docker compose up -d` and open <http://localhost:8000>.
-2. The example V2 boulder loads automatically.
-3. Place 2-3 new holds, set start/finish, change orientation.
-4. Type a new `Wall ID` and click **Save**.
-5. Confirm the new file appears at `data/walls/<wall_id>.json`.
-6. Click **New**, then pick the saved wall from the dropdown and **Load**.
-7. `docker compose down` and `docker compose up -d` again — the wall still loads.
-8. Re-save with the same `wall_id`; confirm it overwrites cleanly.
+> The editor hard-codes `/data/walls/` to match the Docker path. For a
+> local run, edit `DATA_DIR` at the top of `grid_editor/server.py`.
 
 ---
 
 ## Branching & PRs
 
-- `main` — production-ready history.
-- `dev` — integration branch.
-- `feature/<short-name>` — branch from `dev` for each task; PR back to `dev`.
+- `main` — protected, always working
+- `dev` — integration branch
+- `feature/<short-name>` — branch from `dev`, PR back to `dev`
 
-PR description should include: scope summary, screenshots for any UI change,
-and the manual validation checklist above with results.
+PR descriptions should include: scope summary, screenshots for any UI
+change, and the manual validation checklist from
+[`grid_editor/README.md`](grid_editor/README.md#manual-validation-checklist).
 
 ---
 
 ## Helpful Docker commands
 
 ```bash
-docker compose ps             # running containers for this project
-docker compose logs -f        # follow logs
-docker compose restart        # restart without rebuilding
-docker compose build --no-cache  # force a clean rebuild
-docker system prune           # reclaim disk (safe on a dev machine)
+docker compose ps                # running containers
+docker compose logs -f           # follow logs
+docker compose restart           # restart without rebuild
+docker compose build --no-cache  # force clean rebuild
+docker system prune              # reclaim disk
 ```

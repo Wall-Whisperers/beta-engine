@@ -1,7 +1,10 @@
-"""Beta Engine MVP — climbing wall grid editor backend.
+"""Beta Engine — climbing wall grid editor backend.
 
 Serves the static editor UI and provides a small JSON API for listing,
 loading, saving, and deleting wall files under /data/walls/.
+
+Run directly:    python -m grid_editor.server
+Run via Docker:  docker compose up
 """
 from __future__ import annotations
 
@@ -14,10 +17,10 @@ from typing import Any
 from flask import Flask, jsonify, request, send_from_directory
 
 DATA_DIR = Path("/data/walls")
-ROOT = Path(__file__).parent
-STATIC_DIR = ROOT / "static"
-SCHEMA_PATH = ROOT / "schemas" / "wall.schema.json"
-SEED_DIR = ROOT / "data" / "examples"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+STATIC_DIR = PROJECT_ROOT / "static"
+SCHEMA_PATH = PROJECT_ROOT / "schemas" / "wall.schema.json"
+SEED_DIR = PROJECT_ROOT / "data" / "examples"
 
 HOLD_TYPES = {"jug", "crimp", "sloper", "pinch", "foothold"}
 SIZES = {"small", "medium", "large"}
@@ -192,6 +195,10 @@ def _seed_examples() -> None:
             shutil.copy(src, dst)
 
 
-if __name__ == "__main__":
+def main() -> None:
     _seed_examples()
     app.run(host="0.0.0.0", port=8000, debug=False)
+
+
+if __name__ == "__main__":
+    main()
