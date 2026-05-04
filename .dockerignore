@@ -10,3 +10,4 @@ __pycache__
 .vscode
 node_modules
 data/walls
+data/runs

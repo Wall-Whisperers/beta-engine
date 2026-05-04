@@ -7,3 +7,6 @@ __pycache__/
 
 # User-saved walls (the seeded examples live in data/examples/ and ARE tracked).
 data/walls/
+
+# Solver outputs (PNG/GIF beta visualizations).
+data/runs/
