@@ -157,3 +157,152 @@ we use a kinematic-only simulator).
   Surfaces a warning. Schema unchanged pending team discussion.
 - **2026-05-04** — Renamed `app.py` → `grid_editor/server.py` so the
   package boundary between *editor* and *solver* is explicit.
+
+
+---
+
+## Anatomy + constraints (added 2026-05-04)
+
+### What we built
+
+Each limb now has a **2D envelope box** (axis-aligned, body-local frame)
+that the end-effector must sit inside. Two layers:
+
+1. **Per-limb envelope** — 8 `*_FRAC` constants in `solver/body.py`.
+2. **Pose-level checks** — crossover limits in cm, end-effector
+   minimum separation, hard foot-above-shoulder ceiling.
+
+A `can_reach` call is now a three-stage test: distance → envelope → IK.
+
+### Key calibration lesson
+
+The initial `HAND_CROSS_BODY_FRAC = 0.40` rejected a real cross-under
+move that the average-climber beta requires (LH crossing ~54 cm right of
+shoulder to grab a hold that was previously held by RH). Bumped to
+`0.75`. The lesson: **keep the per-limb envelope loose and let the
+pose-level `HAND_CROSSOVER_LIMIT_CM` do the heavy lifting for "fully
+swapped hands" catches.** The envelope is for impossible reaches; the
+pose-level check is for improbable body shapes.
+
+### The foot-above-shoulder rule
+
+Both checks enforce this:
+- `FOOT_MAX_ABOVE_HIP_FRAC = 0.30` — the hip-relative ceiling
+  (approx knee-to-chest range).
+- `body.foot_world_ceiling(com)` — absolute world-y ceiling at
+  `COM + shoulder_height − 5 cm`. This is a hard block regardless of
+  how loose the frac gets. Raised as a separate check because the
+  frac is expressed relative to a hip that can itself be quite high
+  when hands are high.
+
+### The "personalized beta" result is real
+
+With the anatomy constraints in place, different body models produce
+different betas:
+
+| Climber | Height / Wingspan | Result |
+|---------|------------------|--------|
+| Average | 175 / 175 cm | 6-move beta |
+| Tall    | 190 / 195 cm | 5-move beta (long arms skip a move) |
+| Short   | 160 / 158 cm | No solution found |
+
+The short-climber no-solution is a feature, not a bug — it's the exact
+value prop ("understand why a route is hard for your body"). When we add
+a real cell_size_cm and test on a physical wall, this will surface real
+height-specific crux sequences.
+
+### Stability model limitation worth flagging
+
+The 3-point intermediate stability check (while one limb is in flight)
+uses `STABILITY_TOLERANCE_CM = 5 cm`. The foot-move at step 5 of the
+average-climber beta works by just barely passing this check (COM is
+4.5 cm from the remaining foot). That's fine for a static model, but
+once we add momentum (Phase 3 physics), a 4.5 cm COM-to-foot margin
+with a swinging leg would realistically cause a fall. **Flag for Phase
+3: the static stability check should become a dynamic balance check
+that accounts for the mass of the moving limb.**
+
+---
+
+## IK implementation notes (added 2026-05-04)
+
+### Elbow/knee direction
+
+- `elbow_up = True` for arms — joint above the anchor→target line.
+  Natural for reaches (elbow up and out). Getting this wrong makes
+  elbows point down, which looks wrong in the visualizer.
+- `elbow_up = False` for legs — joint bends forward and down (knee
+  in front of the body on a vertical wall). Getting this wrong makes
+  knees point backward.
+
+The `elbow_up` flag flips the sign of the angle offset in the IK:
+`theta = atan2(dy, dx) ± arccos(cos_angle)`.
+
+### The "too close" degeneracy
+
+The IK rejects `dist < |upper_len - lower_len|` — this is when the
+target is so close to the anchor that the limb has to fold past itself.
+For equal-length upper and lower segments (`upper = lower = arm / 2`)
+this triggers at `dist < 0`, i.e., never — equal segments can always
+reach targets from 0 to `arm_length`. Watch out if you ever make the
+segments unequal (e.g., forearm longer than upper arm in a 3D model).
+
+### COM estimate is a simplification
+
+`estimate_com = 0.45 × hand_midpoint + 0.55 × foot_midpoint`. Real
+climbers' COM (pelvis) is closer to the feet (hips ≈ 55% of height).
+This is directionally correct but ignores mass distribution during
+dynamic moves. Fine for static beta generation; Phase 3 should use
+the actual body-segment COM sum.
+
+---
+
+## Open decisions for team discussion
+
+These aren't blocking anything right now but will matter soon.
+
+### `cell_size_cm` — the biggest near-term schema change
+
+The solver defaults to 20 cm per cell with a warning. Before Phase 3
+(reachability on a real wall), we need to lock this in. Options:
+
+1. Add `cell_size_cm` directly to the `grid` object in the existing schema
+   alongside `cols` / `rows`. Easiest, backward-compatible if `null` is
+   allowed.
+2. Add a top-level `wall_metadata` object (as in Gabe's original plan)
+   and put `grid_unit_cm` + `angle_deg` there. Cleaner structure but
+   more schema migration.
+
+Recommend **option 1** for the next schema PR.
+
+### `angle_deg` (slab / overhang)
+
+Not in the schema or solver at all yet. On a slab, the stability rule
+changes: the climber leans away from the wall and COM-over-feet becomes
+meaningless — friction and smearing matter instead. This is a Phase 3
+problem but worth flagging now so the schema PR for `cell_size_cm` can
+reserve a slot for it.
+
+### Per-hold `positivity_score`
+
+The solver uses per-type defaults (jug=0.95, sloper=0.40 etc.). Once
+CV is running, each detected hold will have a measured positivity. The
+schema slot should probably live in the `hold` object alongside
+`hold_type`. Note: this will subtly change A\* solutions because
+positivity feeds into move cost.
+
+### When to upgrade tabular Q-learning to PPO
+
+Rule of thumb based on the state space: `N⁴` poses where N = number
+of holds. At 13 holds ≈ 28k states — tabular is fine. At 20 holds ≈
+160k — still manageable. At 30 holds ≈ 810k — switch to PPO.
+Practical trigger: if training takes more than ~30 seconds or the
+convergence curve flattens, reach for Stable Baselines3.
+
+The env class (`ClimbingEnv`) already has `reset()`/`step()` shaped
+like Gymnasium. Upgrade path:
+1. `pip install gymnasium stable-baselines3`
+2. Subclass `gym.Env`, map `ClimbingEnv.actions()` to a `Discrete`
+   action space, return `Pose.as_tuple()` (one-hot encoded) as obs.
+3. `PPO("MlpPolicy", env).learn(total_timesteps=...)`.
+4. Remove `solve_qlearn`, keep `ClimbingEnv`.
