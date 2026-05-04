@@ -5,12 +5,19 @@ A two-part climbing-wall MVP:
 | Part | Folder | What it does |
 |------|--------|--------------|
 | **Grid editor** | `grid_editor/` | Web tool for placing holds on a grid and saving walls as JSON |
-| **Solver** | `solver/` | 2D IK + A\*/RL solver that reads those JSON files and outputs a move sequence |
+| **Solver** | `solver/` | **2D-only** IK + A\*/RL solver that reads those JSON files and outputs a move sequence |
 
 The editor locks the JSON schema everything downstream depends on. The solver
 is a first pass at the body-model → reachability → search → visualizer pipeline,
 intended to work on hand-built walls before we layer on computer vision, physics,
 or a full PPO agent.
+
+> **Scope of the solver:** strictly 2D. Pose, IK, reachability, and stability
+> are all evaluated in the wall plane (x = horizontal, y = vertical). No body
+> twist, no out-of-plane drop-knee, no friction model. Anatomical constraints
+> (hand cross-body limit, foot-can't-go-above-shoulder, etc.) are approximated
+> with tunable joint-angle envelopes — see [`solver/README.md`](solver/README.md)
+> for the constants and how to tweak them.
 
 For deeper detail on each part see:
 - [`grid_editor/README.md`](grid_editor/README.md)
@@ -99,9 +106,15 @@ docker compose exec beta-engine python -m solver --wall example-v2-boulder --met
 
 # Both + animated GIFs saved to ./data/runs/
 docker compose exec beta-engine python -m solver --wall example-v2-boulder --method both --gif
+
+# Different climber — height/wingspan literally change which betas exist
+docker compose exec beta-engine python -m solver --wall example-v2-boulder \
+  --height-cm 190 --wingspan-cm 185 --gif
 ```
 
-See [`solver/README.md`](solver/README.md) for all CLI flags and details.
+See [`solver/README.md`](solver/README.md) for all CLI flags, the per-module
+reasoning, and the table of tweakable constants (joint envelopes, reward
+weights, A\* heuristic, etc.).
 
 ---
 

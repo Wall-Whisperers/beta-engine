@@ -3,13 +3,29 @@
 A `Pose` is which hold each limb is currently on (or `None` if a limb is
 mid-flight — only used during a one-limb-at-a-time move).
 
-Reachability is a circle test from each limb's body anchor to the
-candidate hold's centre. We back off slightly from `max_reach` to avoid
-fully-extended-limb poses, which are physiologically unstable.
+Reachability is now a *three-stage* test from each limb's body anchor to
+the candidate hold's centre:
+
+    1. Distance test  — target within REACH_SAFETY × max_reach
+    2. Envelope test  — target inside the limb's anatomical box
+                        (see `BodyModel.envelope_box`)
+    3. IK test        — closed-form 2-link IK actually solves
+                        (catches "almost in reach but folds the limb")
 
 Stability (vertical-wall MVP): the COM x-coord must lie within the
 horizontal span between the two feet. With only one foot, the COM x-coord
 must lie within `STABILITY_TOLERANCE_CM` of that foot.
+
+Pose-level anatomy: hands/feet can cross body but only by limited
+amounts; no two end-effectors share the same patch of wall; feet stay
+below the shoulders. See `pose_anatomy_ok`.
+
+═══════════════════════════════════════════════════════════════════════════
+  Everything here is 2D. There is no body twist, no out-of-plane drop-knee,
+  no friction model. The constants below are knobs — bias them looser for
+  more aggressive (acrobatic) betas, tighter for safer/more conservative
+  betas.
+═══════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
@@ -18,7 +34,17 @@ from typing import Iterable, Optional
 
 import numpy as np
 
-from solver.body import BodyModel, FOOT_LIMBS, HAND_LIMBS, LIMBS, Limb
+from solver.body import (
+    BodyModel,
+    END_EFFECTOR_MIN_SEPARATION_CM,
+    FOOT_CROSSOVER_LIMIT_CM,
+    FOOT_LIMBS,
+    HAND_CROSSOVER_LIMIT_CM,
+    HAND_LIMBS,
+    LIMBS,
+    Limb,
+    solve_2link_ik,
+)
 from solver.wall import Hold, Wall
 
 REACH_SAFETY = 0.92  # use ≤92 % of max reach for "comfortable" reachability
@@ -98,11 +124,66 @@ def can_reach(
     limb: Limb,
     target: Hold,
 ) -> bool:
-    """True if the target is within `REACH_SAFETY × max_reach` of the
-    limb's body anchor for the given COM position."""
+    """Three-stage reachability test:
+
+    1. Distance: target within `REACH_SAFETY × max_reach` of the anchor.
+       Fully extended limbs can technically reach further, but it's
+       physiologically miserable (no margin for adjustment, joint locked
+       out).
+    2. Envelope: target sits inside the limb's anatomical box — captures
+       'foot can't go above shoulder', cross-body limits, etc. See
+       `BodyModel.envelope_box`.
+    3. IK: closed-form 2-link IK actually solves. Catches near-anchor
+       targets where the limb would have to fold past itself.
+    """
     anchor = com + body.anchor_offset(limb)
-    dist = float(np.linalg.norm(anchor - np.array([target.x_cm, target.y_cm])))
-    return dist <= REACH_SAFETY * body.reach_radius(limb)
+    target_pt = np.array([target.x_cm, target.y_cm])
+
+    dist = float(np.linalg.norm(anchor - target_pt))
+    if dist > REACH_SAFETY * body.reach_radius(limb):
+        return False
+
+    if not body.in_envelope(limb, anchor, target_pt):
+        return False
+
+    # Hard rule: foot can never be above shoulder height in world space.
+    if limb in FOOT_LIMBS and target_pt[1] > body.foot_world_ceiling(com):
+        return False
+
+    if limb in HAND_LIMBS:
+        upper, lower = body.upper_arm(), body.lower_arm()
+        elbow_up = True
+    else:
+        upper, lower = body.upper_leg(), body.lower_leg()
+        elbow_up = False
+    if solve_2link_ik(anchor, target_pt, upper, lower, elbow_up=elbow_up) is None:
+        return False
+
+    return True
+
+
+def pose_anatomy_ok(wall: Wall, pose: Pose) -> bool:
+    """Pose-level anatomy: limb crossover limits + minimum separation
+    between any two end-effectors. Single-limb envelope checks live in
+    `can_reach`; this catches the multi-limb cases."""
+    pts = {
+        l: _pt(wall, pose.get(l)) for l in LIMBS
+    }
+    # Hand crossover: LH should not be far to the right of RH.
+    if pts["LH"] is not None and pts["RH"] is not None:
+        if pts["LH"][0] - pts["RH"][0] > HAND_CROSSOVER_LIMIT_CM:
+            return False
+    # Foot crossover: LF should not be far to the right of RF.
+    if pts["LF"] is not None and pts["RF"] is not None:
+        if pts["LF"][0] - pts["RF"][0] > FOOT_CROSSOVER_LIMIT_CM:
+            return False
+    # No two end-effectors at the exact same patch of wall.
+    placed = [(l, p) for l, p in pts.items() if p is not None]
+    for i, (_, a) in enumerate(placed):
+        for _, b in placed[i + 1:]:
+            if float(np.linalg.norm(a - b)) < END_EFFECTOR_MIN_SEPARATION_CM:
+                return False
+    return True
 
 
 def reachable_holds(
@@ -136,15 +217,18 @@ def reachable_moves(
     pose: Pose,
 ) -> list[tuple[Limb, str]]:
     """Every legal one-limb move from the current pose. A move is legal
-    when both the *moving* state (limb in flight, three points of contact)
-    and the *resulting* state are stable."""
+    when:
+      - the *moving* state (limb in flight, 3 points of contact) is stable,
+      - the *target* hold is reachable + inside the limb's envelope + IK-solvable,
+      - the *resulting* 4-limb pose is stable AND anatomically OK.
+    """
     moves: list[tuple[Limb, str]] = []
     for limb in LIMBS:
         if not _three_points_stable(wall, pose, limb):
             continue
         for target in reachable_holds(body, wall, pose, limb):
             new_pose = pose.with_limb(limb, target.hold_id)
-            if is_stable(wall, new_pose):
+            if is_stable(wall, new_pose) and pose_anatomy_ok(wall, new_pose):
                 moves.append((limb, target.hold_id))
     return moves
 
