@@ -71,7 +71,7 @@ def _draw_holds(ax, wall: Wall) -> None:
 
 
 def _draw_skeleton(ax, wall: Wall, body: BodyModel, pose: Pose) -> None:
-    com = estimate_com(wall, pose)
+    com = estimate_com(wall, pose, body)
     if not np.any(com):
         return
 

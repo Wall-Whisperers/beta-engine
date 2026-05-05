@@ -47,9 +47,9 @@ from solver.body import (
 )
 from solver.wall import Hold, Wall
 
-REACH_SAFETY = 0.92  # use ≤92 % of max reach for "comfortable" reachability
+REACH_SAFETY = 0.75       # use ≤75 % of max reach — comfortable, non-extended moves only
 STABILITY_TOLERANCE_CM = 5.0
-COM_HEIGHT_BIAS = 0.55  # COM sits 55 % of the way from feet to hands
+COM_HIP_HEIGHT_FRAC = 0.45  # pelvis sits at 45 % of leg length above the feet (≈ hip height)
 
 
 @dataclass(frozen=True)
@@ -77,23 +77,38 @@ class Pose:
         return (self.LH, self.RH, self.LF, self.RF)
 
 
-def estimate_com(wall: Wall, pose: Pose) -> np.ndarray:
-    """Approximate COM for a pose: midpoint of hands and feet, biased
-    upward toward the hands (climbers' COM sits at the pelvis).
+def estimate_com(wall: Wall, pose: Pose, body: "BodyModel | None" = None) -> np.ndarray:
+    """Estimate pelvis/COM position for a pose.
+
+    Anchored to the feet: COM sits at hip height (half leg length) above the
+    foot midpoint. Hand position only nudges the x-coordinate slightly so the
+    body leans toward the hands — it does not move the COM vertically.
+    This keeps the shoulder/hip anchors stable between steps so the IK pole
+    vectors don't flip as hands move to different holds.
     """
+    from solver.body import BodyModel  # local import avoids circular dep
+    if body is None:
+        body = BodyModel()
+
     hand_pts = [_pt(wall, pose.get(l)) for l in HAND_LIMBS]
     foot_pts = [_pt(wall, pose.get(l)) for l in FOOT_LIMBS]
     hand_pts = [p for p in hand_pts if p is not None]
     foot_pts = [p for p in foot_pts if p is not None]
 
-    if hand_pts and foot_pts:
-        hand_mid = np.mean(hand_pts, axis=0)
+    if foot_pts:
         foot_mid = np.mean(foot_pts, axis=0)
-        return (1 - COM_HEIGHT_BIAS) * hand_mid + COM_HEIGHT_BIAS * foot_mid
+        com_y = foot_mid[1] + body.leg_length * COM_HIP_HEIGHT_FRAC
+        if hand_pts:
+            hand_mid = np.mean(hand_pts, axis=0)
+            # Small horizontal lean toward hands (20 % weight) — keeps COM over feet.
+            com_x = 0.8 * foot_mid[0] + 0.2 * hand_mid[0]
+        else:
+            com_x = foot_mid[0]
+        return np.array([com_x, com_y])
+
+    # No feet on wall — fall back to hand midpoint (e.g. starting position lookup).
     if hand_pts:
         return np.mean(hand_pts, axis=0)
-    if foot_pts:
-        return np.mean(foot_pts, axis=0)
     return np.array([0.0, 0.0])
 
 
@@ -150,13 +165,12 @@ def can_reach(
     if limb in FOOT_LIMBS and target_pt[1] > body.foot_world_ceiling(com):
         return False
 
-    if limb in HAND_LIMBS:
-        upper, lower = body.upper_arm(), body.lower_arm()
-        elbow_up = True
-    else:
-        upper, lower = body.upper_leg(), body.lower_leg()
-        elbow_up = False
-    if solve_2link_ik(anchor, target_pt, upper, lower, elbow_up=elbow_up) is None:
+    is_leg = limb in FOOT_LIMBS
+    upper, lower = (body.upper_leg(), body.lower_leg()) if is_leg else (body.upper_arm(), body.lower_arm())
+    # Either IK branch being solvable is enough for reachability — pole selection
+    # only affects which branch visualize.py draws, not whether the move is legal.
+    if solve_2link_ik(anchor, target_pt, upper, lower, elbow_up=True) is None and \
+       solve_2link_ik(anchor, target_pt, upper, lower, elbow_up=False) is None:
         return False
 
     return True

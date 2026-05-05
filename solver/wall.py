@@ -29,8 +29,9 @@ POSITIVITY_BY_TYPE: dict[str, float] = {
 }
 
 # Foothold-only holds can't be used by the hands in our simple model.
-HAND_USABLE_TYPES = {"jug", "crimp", "sloper", "pinch"}
-FOOT_USABLE_TYPES = {"jug", "crimp", "sloper", "pinch", "foothold"}
+# Feet CAN use hand holds in a pinch but strongly prefer dedicated footholds.
+HAND_USABLE_TYPES = {"jug", "crimp", "sloper", "pinch"}  # hands never use footholds
+FOOT_USABLE_TYPES = {"jug", "crimp", "sloper", "pinch", "foothold"}  # feet can use anything
 
 
 @dataclass(frozen=True)

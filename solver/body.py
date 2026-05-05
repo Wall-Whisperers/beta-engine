@@ -205,9 +205,9 @@ def solve_2link_ik(
     Returns the joint position (elbow / knee) or None if the target is out
     of reach. Uses the law of cosines, exactly as sketched in CLAUDE.md.
 
-    `elbow_up=True` puts the joint above the anchor→target line — sensible
-    default for arms; for legs we typically want elbow_up=False (knee
-    bends forward).
+    `elbow_up=True` puts the joint above the anchor→target line.
+    `elbow_up=False` puts it below.
+    Callers should use `natural_elbow_up` to pick the right branch.
     """
     delta = target - anchor
     dist = float(np.linalg.norm(delta))
@@ -225,6 +225,53 @@ def solve_2link_ik(
     sign = 1.0 if elbow_up else -1.0
     theta = angle_to_target + sign * elbow_angle
     return anchor + upper_len * np.array([np.cos(theta), np.sin(theta)])
+
+
+# ─── Pole vectors (world space, un-normalised) ────────────────────────────
+# The pole vector defines the preferred direction from the anchor to the
+# joint (elbow / knee). The IK solution whose joint-anchor vector aligns
+# best with the pole is chosen — the same technique used in Maya, Blender,
+# Unity, and Unreal for disambiguating 2-solution IK chains.
+#
+# Arms: elbow prefers to go outward (away from body midline) and downward.
+#   LH → left+down  RH → right+down
+# Legs: knee prefers to go outward (away from body midline), roughly level.
+#   LF → left       RF → right
+LIMB_POLES: dict[str, np.ndarray] = {
+    "LH": np.array([-1.0, -1.0]),
+    "RH": np.array([ 1.0, -1.0]),
+    "LF": np.array([-1.0,  0.0]),
+    "RF": np.array([ 1.0,  0.0]),
+}
+
+
+def solve_2link_ik_pole(
+    anchor: np.ndarray,
+    target: np.ndarray,
+    upper_len: float,
+    lower_len: float,
+    pole: np.ndarray,
+) -> Optional[np.ndarray]:
+    """2-link IK with pole-vector disambiguation.
+
+    Computes both IK solutions and returns the joint position whose
+    direction from the anchor best matches `pole`. This is the standard
+    approach used in animation software to control elbow/knee direction.
+    """
+    j_up = solve_2link_ik(anchor, target, upper_len, lower_len, elbow_up=True)
+    j_dn = solve_2link_ik(anchor, target, upper_len, lower_len, elbow_up=False)
+
+    if j_up is None and j_dn is None:
+        return None
+    if j_up is None:
+        return j_dn
+    if j_dn is None:
+        return j_up
+
+    pole_n = pole / (float(np.linalg.norm(pole)) + 1e-9)
+    score_up = float(np.dot(j_up - anchor, pole_n))
+    score_dn = float(np.dot(j_dn - anchor, pole_n))
+    return j_up if score_up >= score_dn else j_dn
 
 
 @dataclass
@@ -255,13 +302,17 @@ def resolve_skeleton(
     for limb in HAND_LIMBS:
         anchor = com + body.anchor_offset(limb)
         shoulders[limb] = anchor
-        joint = solve_2link_ik(anchor, targets[limb], body.upper_arm(), body.lower_arm(), elbow_up=True)
+        joint = solve_2link_ik_pole(
+            anchor, targets[limb], body.upper_arm(), body.lower_arm(), LIMB_POLES[limb]
+        )
         elbows[limb] = joint if joint is not None else 0.5 * (anchor + targets[limb])
 
     for limb in FOOT_LIMBS:
         anchor = com + body.anchor_offset(limb)
         hips[limb] = anchor
-        joint = solve_2link_ik(anchor, targets[limb], body.upper_leg(), body.lower_leg(), elbow_up=False)
+        joint = solve_2link_ik_pole(
+            anchor, targets[limb], body.upper_leg(), body.lower_leg(), LIMB_POLES[limb]
+        )
         knees[limb] = joint if joint is not None else 0.5 * (anchor + targets[limb])
 
     return Skeleton(

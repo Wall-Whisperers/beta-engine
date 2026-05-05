@@ -163,12 +163,10 @@ def solve_astar(
     return None
 
 
-def _move_cost(wall: Wall, pose: Pose, limb: Limb, target_id: str) -> float:
-    """Slightly favour high-positivity holds and short moves."""
+def _move_cost(wall: Wall, pose: Pose, limb: Limb, target_id: str, body: BodyModel | None = None) -> float:
+    """Cost per move. Worse holds (slopers etc.) cost slightly more."""
     target = wall.by_id(target_id)
-    base = 1.0
-    positivity_bonus = 0.5 * (1.0 - target.positivity)  # worse hold → costlier
-    return base + positivity_bonus
+    return 1.0 + 0.5 * (1.0 - target.positivity)
 
 
 def _reconstruct(
