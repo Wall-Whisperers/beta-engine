@@ -11,3 +11,9 @@ pymunk==7.0.1
 # environment in `rl/` follows the standard reset()/step() API so
 # Stable-Baselines3 / RLlib agents can be dropped in later.
 gymnasium==1.0.0
+# 3D physics for Phase-4 climber simulation (sim3d/). MuJoCo is
+# Apache-2 since 2021, has fast contact solving, native Python
+# bindings, an interactive viewer, and an MJX/JAX backend that the
+# RL stack can scale onto a GPU later. The 3.x line ships
+# manylinux wheels so no native build is needed inside Docker.
+mujoco==3.2.6

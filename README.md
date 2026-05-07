@@ -1,13 +1,14 @@
 # Beta Engine
 
-A four-part climbing-wall MVP:
+A five-part climbing-wall MVP:
 
 | Part | Folder | What it does |
 |------|--------|--------------|
 | **Grid editor** | `grid_editor/` | Web tool for placing holds on a grid and saving walls as JSON |
 | **Solver** | `solver/` | **2D-only** IK + A\*/RL solver that reads those JSON files and outputs a move sequence |
-| **Physics** | `physics/` | **pymunk** rigid-body simulation — gravity, wall angle, force-limited grip, articulated stick figure |
-| **RL** | `rl/` | **Gymnasium** environment wrapping the physics, ready for PPO/SAC/etc. |
+| **Physics 2D** | `physics/` | **pymunk** rigid-body simulation — gravity, wall angle, force-limited grip, articulated stick figure |
+| **Sim 3D** | `sim3d/` | **MuJoCo** 3D simulator — full articulated humanoid + slab/overhang walls + browser-based three.js viewer |
+| **RL** | `rl/` | **Gymnasium** environment wrapping the 2D physics, ready for PPO/SAC/etc. (3D wrapper coming) |
 
 The editor locks the JSON schema everything downstream depends on. The solver
 is a first pass at the body-model → reachability → search → visualizer pipeline,
@@ -25,6 +26,7 @@ For deeper detail on each part see:
 - [`grid_editor/README.md`](grid_editor/README.md)
 - [`solver/README.md`](solver/README.md)
 - [`physics/README.md`](physics/README.md)
+- [`sim3d/README.md`](sim3d/README.md) — 3D simulator (MuJoCo + three.js viewer)
 - [`rl/README.md`](rl/README.md)
 - [`planning-gabe.md`](planning-gabe.md) — long-term architecture + decisions log
 - [`CLAUDE.md`](CLAUDE.md) — team context + build phases
@@ -157,6 +159,24 @@ docker compose exec beta-engine python -m rl --wall example-v2-boulder --episode
 See [`rl/README.md`](rl/README.md) for the action/observation spaces and how to
 plug in Stable-Baselines3.
 
+### 8) Open the 3D simulator (browser-based)
+
+The 3D simulator runs in the same Flask process as the editor. Once
+`docker compose up` is running, open <http://localhost:8000/sim3d/>.
+Pick a wall, set climber dimensions, hit **Start session**, and use
+the per-limb dropdowns or the **Live (60 Hz)** button to drive the
+sim.
+
+For headless smoke tests inside the container:
+
+```bash
+docker compose exec beta-engine python -m sim3d --headless --frames 120
+docker compose exec beta-engine python -m sim3d --headless --beta h_006 RH:h_008 LF:h_005
+```
+
+See [`sim3d/README.md`](sim3d/README.md) for the body model, wall
+angle convention, and tuning notes.
+
 ---
 
 ## Running without Docker
@@ -166,11 +186,14 @@ python -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-# Grid editor (serves on :8000)
+# Grid editor (serves on :8000) — also hosts /sim3d/
 python -m grid_editor.server
 
 # Solver
 python -m solver --wall example-v2-boulder --method both --gif
+
+# 3D simulator with native MuJoCo viewer (needs an OpenGL display)
+python -m sim3d --wall example-v2-boulder
 ```
 
 > The editor hard-codes `/data/walls/` to match the Docker path. For a
