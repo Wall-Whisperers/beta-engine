@@ -225,6 +225,25 @@ def reachable_holds(
     ]
 
 
+def _all_limbs_reachable(body: BodyModel, wall: Wall, pose: Pose) -> bool:
+    """After a move, verify every stationary limb is still within reach.
+
+    When feet advance they pull the COM up, which can push a shoulder far
+    above a low hand hold. The one-limb reachability check doesn't catch
+    this because it computes COM *without* the moving limb. This check uses
+    the full 4-limb COM and is applied to the resulting pose.
+    """
+    com = estimate_com(wall, pose)
+    for limb in LIMBS:
+        hold_id = pose.get(limb)
+        if hold_id is None:
+            continue
+        h = wall.by_id(hold_id)
+        if not can_reach(body, com, limb, h):
+            return False
+    return True
+
+
 def reachable_moves(
     body: BodyModel,
     wall: Wall,
@@ -234,7 +253,8 @@ def reachable_moves(
     when:
       - the *moving* state (limb in flight, 3 points of contact) is stable,
       - the *target* hold is reachable + inside the limb's envelope + IK-solvable,
-      - the *resulting* 4-limb pose is stable AND anatomically OK.
+      - the *resulting* 4-limb pose is stable, anatomically OK, AND all
+        stationary limbs remain within reach from the new COM.
     """
     moves: list[tuple[Limb, str]] = []
     for limb in LIMBS:
@@ -242,7 +262,9 @@ def reachable_moves(
             continue
         for target in reachable_holds(body, wall, pose, limb):
             new_pose = pose.with_limb(limb, target.hold_id)
-            if is_stable(wall, new_pose) and pose_anatomy_ok(wall, new_pose):
+            if (is_stable(wall, new_pose)
+                    and pose_anatomy_ok(wall, new_pose)
+                    and _all_limbs_reachable(body, wall, new_pose)):
                 moves.append((limb, target.hold_id))
     return moves
 

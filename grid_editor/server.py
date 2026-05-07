@@ -1,22 +1,28 @@
-"""Beta Engine — climbing wall grid editor backend.
+"""Beta Engine — climbing wall grid editor + solver dashboard backend.
 
 Serves the static editor UI and provides a small JSON API for listing,
 loading, saving, and deleting wall files under /data/walls/.
+
+Also exposes /api/solver/* for on-demand generation and solving so the
+browser can trigger them without a CLI.
 
 Run directly:    python -m grid_editor.server
 Run via Docker:  docker compose up
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shutil
+import warnings
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, jsonify, request, send_from_directory
 
 DATA_DIR = Path("/data/walls")
+RUNS_DIR = Path("/data/runs")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = PROJECT_ROOT / "static"
 SCHEMA_PATH = PROJECT_ROOT / "schemas" / "wall.schema.json"
@@ -182,6 +188,126 @@ def delete_wall(wall_id: str) -> Any:
 @app.get("/healthz")
 def healthz() -> Any:
     return jsonify({"ok": True})
+
+
+# ── Solver API ────────────────────────────────────────────────────────────────
+
+@app.get("/solver")
+def solver_page() -> Any:
+    return send_from_directory(STATIC_DIR, "solver.html")
+
+
+@app.post("/api/solver/generate")
+def solver_generate() -> Any:
+    """Generate one synthetic wall, save it to /data/walls/, return its JSON."""
+    body = request.get_json(silent=True) or {}
+    try:
+        cols       = int(body.get("cols", 12))
+        rows       = int(body.get("rows", 18))
+        difficulty = float(body.get("difficulty", 0.5))
+        seed       = body.get("seed")
+        seed       = int(seed) if seed is not None else None
+        name       = body.get("name", "").strip() or None
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    if name and not WALL_ID_RE.match(name):
+        return jsonify({"error": "Name must be 1–64 chars: letters, digits, '-' or '_'."}), 400
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from solver.generate import GeneratorConfig, generate_wall
+        from solver.body import BodyModel
+
+    cfg = GeneratorConfig(cols=cols, rows=rows, difficulty=difficulty, seed=seed)
+    wall_dict = generate_wall(cfg, BodyModel(), wall_id=name)
+    if wall_dict is None:
+        return jsonify({"error": "Generator failed after all retries."}), 500
+
+    # If a name was given but a file already exists, reject rather than silently overwrite.
+    wall_id = wall_dict["wall_id"]
+    if name and (DATA_DIR / f"{wall_id}.json").exists():
+        return jsonify({"error": f"A wall named '{wall_id}' already exists."}), 409
+
+    # Save to /data/walls/ so the editor can load it immediately.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    wall_id = wall_dict["wall_id"]
+    path = DATA_DIR / f"{wall_id}.json"
+    path.write_text(json.dumps(wall_dict, indent=2), encoding="utf-8")
+
+    return jsonify({"wall_id": wall_id, "wall": wall_dict})
+
+
+@app.post("/api/solver/solve")
+def solver_solve() -> Any:
+    """Solve a wall with A* and return the move list + a base64-encoded PNG."""
+    body = request.get_json(silent=True) or {}
+    wall_id = body.get("wall_id")
+    if not wall_id:
+        return jsonify({"error": "wall_id required"}), 400
+
+    try:
+        path = _wall_path(str(wall_id))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not path.exists():
+        return jsonify({"error": "wall not found"}), 404
+
+    height_cm   = float(body.get("height_cm", 175.0))
+    wingspan_cm = float(body.get("wingspan_cm", 175.0))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from solver.wall import load_wall
+        from solver.body import BodyModel
+        from solver.astar import solve_astar
+        from solver.visualize import render_all_frames
+
+    wall = load_wall(path)
+    bmodel = BodyModel(height_cm=height_cm, wingspan_cm=wingspan_cm)
+    result = solve_astar(wall, bmodel)
+
+    if result is None:
+        return jsonify({"wall_id": wall_id, "solved": False, "moves": []})
+
+    # Render one PNG per pose frame and return as base64 array.
+    frames_b64 = [
+        base64.b64encode(png).decode()
+        for png in render_all_frames(wall, result, body=bmodel)
+    ]
+
+    return jsonify({
+        "wall_id": wall_id,
+        "solved": True,
+        "moves": result.text_steps(),
+        "n_moves": len(result.moves),
+        "expanded": result.expanded,
+        "frames": frames_b64,
+    })
+
+
+@app.get("/api/runs")
+def list_runs() -> Any:
+    """List training run directories and their log snippets."""
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    runs = []
+    for d in sorted(RUNS_DIR.iterdir(), reverse=True):
+        if not d.is_dir():
+            continue
+        log_path = d / "training.log"
+        log_tail = ""
+        if log_path.exists():
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            log_tail = "\n".join(lines[-20:])
+        images = [f.name for f in d.glob("*.png")] + [f.name for f in d.glob("*.gif")]
+        runs.append({
+            "run_id": d.name,
+            "has_best_model": (d / "best_model.zip").exists(),
+            "has_final_model": (d / "final_model.zip").exists(),
+            "images": sorted(images),
+            "log_tail": log_tail,
+        })
+    return jsonify({"runs": runs})
 
 
 def _seed_examples() -> None:

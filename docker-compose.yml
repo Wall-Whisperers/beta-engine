@@ -1,12 +1,29 @@
 services:
+  # ── Web server (wall editor + solver dashboard) ───────────────────────────
   beta-engine:
     build: .
     image: beta-engine:dev
     container_name: beta-engine
     ports:
       - "8000:8000"
-    # Bind-mount ./data so your saved walls live next to the repo —
-    # collaborators can inspect / commit them as plain JSON files.
     volumes:
       - ./data:/data
     restart: unless-stopped
+
+  # ── Solver (training / generation / one-shot solve) ───────────────────────
+  # Not started by default. Run ad-hoc commands with:
+  #
+  #   docker compose run --rm solver generate --count 20 --difficulty 0.5
+  #   docker compose run --rm solver solve --wall big-wall --gif
+  #   docker compose run --rm solver train --timesteps 500000 --n-envs 4
+  #
+  solver:
+    build: .
+    image: beta-engine:dev
+    container_name: beta-engine-solver
+    volumes:
+      - ./data:/data
+    profiles:
+      - solver
+    entrypoint: ["python", "-m", "solver"]
+    command: ["--help"]
