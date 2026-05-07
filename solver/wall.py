@@ -34,9 +34,27 @@ HAND_USABLE_TYPES = {"jug", "crimp", "sloper", "pinch"}  # hands never use footh
 FOOT_USABLE_TYPES = {"jug", "crimp", "sloper", "pinch", "foothold"}  # feet can use anything
 
 
+# Per-hold-type default friction coefficient. Used by the physics layer
+# when a hold's JSON doesn't carry an explicit `friction` value. Numbers
+# are intentionally rough — tuned by what feels right rather than measured.
+FRICTION_BY_TYPE: dict[str, float] = {
+    "jug": 0.9,
+    "crimp": 0.85,
+    "pinch": 0.8,
+    "foothold": 0.85,
+    "sloper": 0.6,
+}
+
+
 @dataclass(frozen=True)
 class Hold:
-    """A single hold in world coordinates (cm)."""
+    """A single hold in world coordinates (cm).
+
+    The first ten fields are the locked schema. The trailing three
+    (`friction_override`, `positivity_override`, `max_force_n`) are
+    optional physics-layer extensions added in Phase 3 — `None` means
+    "use the per-type default".
+    """
 
     hold_id: str
     grid_x: int
@@ -49,10 +67,23 @@ class Hold:
     color: str
     is_start: bool
     is_finish: bool
+    # Optional physics extensions (additive — older walls still load).
+    friction_override: float | None = None
+    positivity_override: float | None = None
+    max_force_n: float | None = None
 
     @property
     def positivity(self) -> float:
+        if self.positivity_override is not None:
+            return self.positivity_override
         return POSITIVITY_BY_TYPE.get(self.hold_type, 0.5)
+
+    @property
+    def friction(self) -> float:
+        """Friction coefficient — explicit override wins, else per-type default."""
+        if self.friction_override is not None:
+            return self.friction_override
+        return FRICTION_BY_TYPE.get(self.hold_type, 0.7)
 
     def usable_for_hand(self) -> bool:
         return self.hold_type in HAND_USABLE_TYPES
@@ -63,7 +94,12 @@ class Hold:
 
 @dataclass
 class Wall:
-    """A wall plus its holds in world (cm) coordinates."""
+    """A wall plus its holds in world (cm) coordinates.
+
+    `wall_angle_deg` and `surface_friction` are physics extensions; they
+    default to a vertical wall with mid-grippy plastic if the JSON
+    doesn't specify them.
+    """
 
     wall_id: str
     name: str
@@ -71,6 +107,9 @@ class Wall:
     rows: int
     cell_size_cm: float
     holds: list[Hold] = field(default_factory=list)
+    # Physics extensions (defaults match the original "vertical wall" assumption).
+    wall_angle_deg: float = 0.0
+    surface_friction: float = 0.7
 
     @property
     def width_cm(self) -> float:
@@ -142,6 +181,8 @@ def load_wall(
         rows=rows,
         cell_size_cm=resolved_cell,
         holds=holds,
+        wall_angle_deg=float(payload.get("wall_angle_deg", 0.0)),
+        surface_friction=float(payload.get("surface_friction", 0.7)),
     )
 
 
@@ -178,6 +219,9 @@ def _hold_from_json(h: dict, cell_size_cm: float) -> Hold:
         color=h["color"],
         is_start=bool(h["is_start"]),
         is_finish=bool(h["is_finish"]),
+        friction_override=(float(h["friction"]) if "friction" in h else None),
+        positivity_override=(float(h["positivity"]) if "positivity" in h else None),
+        max_force_n=(float(h["max_force_n"]) if "max_force_n" in h else None),
     )
 
 

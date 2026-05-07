@@ -1,11 +1,13 @@
 # Beta Engine
 
-A two-part climbing-wall MVP:
+A four-part climbing-wall MVP:
 
 | Part | Folder | What it does |
 |------|--------|--------------|
 | **Grid editor** | `grid_editor/` | Web tool for placing holds on a grid and saving walls as JSON |
 | **Solver** | `solver/` | **2D-only** IK + A\*/RL solver that reads those JSON files and outputs a move sequence |
+| **Physics** | `physics/` | **pymunk** rigid-body simulation — gravity, wall angle, force-limited grip, articulated stick figure |
+| **RL** | `rl/` | **Gymnasium** environment wrapping the physics, ready for PPO/SAC/etc. |
 
 The editor locks the JSON schema everything downstream depends on. The solver
 is a first pass at the body-model → reachability → search → visualizer pipeline,
@@ -22,6 +24,8 @@ or a full PPO agent.
 For deeper detail on each part see:
 - [`grid_editor/README.md`](grid_editor/README.md)
 - [`solver/README.md`](solver/README.md)
+- [`physics/README.md`](physics/README.md)
+- [`rl/README.md`](rl/README.md)
 - [`planning-gabe.md`](planning-gabe.md) — long-term architecture + decisions log
 - [`CLAUDE.md`](CLAUDE.md) — team context + build phases
 
@@ -43,6 +47,18 @@ beta-engine/
 │   ├── visualize.py   #   matplotlib PNG/GIF renderer
 │   ├── __main__.py    #   CLI entry point
 │   └── README.md      #   solver quickstart + flags + architecture
+├── physics/           # pymunk-backed 2D rigid-body simulator
+│   ├── world.py       #   ClimbWorld — Space + holds + climber
+│   ├── body.py        #   PhysicsBody — torso + force-limited limb leashes
+│   ├── config.py      #   gravity, mass, stiffness, posture-controller knobs
+│   ├── render.py      #   matplotlib renderer (headless)
+│   ├── __main__.py    #   CLI: simulate + render PNG/GIF
+│   └── README.md
+├── rl/                # Gymnasium environment wrapping physics/
+│   ├── env.py         #   ClimbingEnv (Discrete actions, Box obs)
+│   ├── random_policy.py
+│   ├── __main__.py    #   CLI: random-policy episode + GIF
+│   └── README.md
 ├── static/            # Vanilla-JS editor frontend (no build step)
 ├── schemas/           # wall.schema.json — JSON Schema 2020-12 source of truth
 ├── data/
@@ -112,9 +128,34 @@ docker compose exec beta-engine python -m solver --wall example-v2-boulder \
   --height-cm 190 --wingspan-cm 185 --gif
 ```
 
-See [`solver/README.md`](solver/README.md) for all CLI flags, the per-module
-reasoning, and the table of tweakable constants (joint envelopes, reward
-weights, A\* heuristic, etc.).
+See [`solver/README.md`](solver/README.md) for all CLI flags.
+
+### 6) Run the physics simulator
+
+```bash
+# Settle the climber on the start holds, render a still PNG
+docker compose exec beta-engine python -m physics --wall example-v2-boulder
+
+# Animate a hand-rolled beta through the physics engine
+docker compose exec beta-engine python -m physics --wall example-v2-boulder \
+  --gif --frames-per-move 12 \
+  --moves 'RF:h_005,LF:h_007,RH:h_008,LH:h_006,RF:h_009,LF:h_011,RH:h_012,LH:h_010,RH:h_013'
+```
+
+See [`physics/README.md`](physics/README.md) for the body model + tuning knobs.
+
+### 7) Run a Gymnasium episode
+
+```bash
+# One random-policy episode, prints reward per step
+docker compose exec beta-engine python -m rl --wall example-v2-boulder
+
+# Five episodes with summary stats + a GIF of the last one
+docker compose exec beta-engine python -m rl --wall example-v2-boulder --episodes 5 --gif
+```
+
+See [`rl/README.md`](rl/README.md) for the action/observation spaces and how to
+plug in Stable-Baselines3.
 
 ---
 
