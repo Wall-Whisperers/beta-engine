@@ -37,7 +37,9 @@ sim3d/
 ├── config.py        # tunable constants (timestep, joint limits, masses, ...)
 ├── body.py          # ClimberProfile dataclass + segment math + limb names
 ├── builder.py       # build_mjcf_xml(wall, profile) → (xml, hold_meta)
-├── world.py         # Climb3DWorld — owns MjModel + MjData
+├── world.py         # Climb3DWorld — owns MjModel + MjData + slip detection
+├── env.py           # Climbing3DEnv — Gymnasium wrapper for RL training
+├── moonboard.py     # MoonBoard problem JSON → Wall adapter
 ├── viewer.py        # native MuJoCo viewer wrapper
 ├── web.py           # Flask blueprint for the three.js front-end
 └── __main__.py      # `python -m sim3d` CLI demo
@@ -61,23 +63,65 @@ ClimberProfile + Wall  ──▶  builder.build_mjcf_xml  ──▶  MJCF string
        └──▶ web bridge   (sim3d/web.py → static/sim3d.{html,js})
 ```
 
-**Body model.** Climbing-specific, ~25 DOF (6 free + 19 hinge):
+**Body model.** Climbing-specific, 27 DOF (6 free + 21 hinge):
 
 - pelvis (root, free joint = 6 DOF)
 - spine (1 hinge: forward lean)
-- 2 × shoulder (3 hinges: az / el / roll) + 2 × elbow (1 hinge)
+- 2 × shoulder (3 hinges: az / el / roll) + 2 × elbow (1) + 2 × wrist (1)
 - 2 × hip (3 hinges: flex / abduct / rot) + 2 × knee (1) + 2 × ankle (1)
 
-Hands and feet are rigid stubs — that's where each limb's "tip site"
-lives, and where the equality constraint to the hold attaches. We
-deliberately did **not** model fingers / individual toes: in the MVP
-the question "is this hold reachable?" is more important than
-"how does the climber crimp?".
+Hands and feet are rigid stubs — that's where each limb's tip site
+lives, and where the weld equality to the hold attaches. We
+deliberately do **not** model fingers / individual toes: in the MVP
+the question "is this hold reachable?" matters more than "how does
+the climber crimp?". Wrist DOF gives the hand enough freedom to
+rotate into the hold; ankles do the same for feet.
 
-**Hold attachment.** One mocap body + weld equality constraint per
-limb. To attach: position the mocap at the hold, set `data.eq_active[i]
-= 1`, the limb's hand/foot body welds to it. To release: set
-`eq_active[i] = 0`. No model recompile needed → fast for RL resets.
+Every joint has anatomically motivated limits (see
+`config.JOINT_LIMITS_RAD`):
+
+| Joint | Range | Notes |
+|---|---|---|
+| spine_lean   | -15° → +60°  | climber tucks for high feet |
+| shoulder_az  | -50° → +180° | no excessive backward swing |
+| shoulder_el  |   0° → +180° | full overhead reach |
+| shoulder_roll| -80° → +80°  | internal/external rotation |
+| elbow        |   0° → +150° | **no hyperextension** |
+| wrist        | -70° → +70°  | flex/extend, no radial deviation |
+| hip_flex     | -20° → +140° | high-step capable |
+| hip_abduct   | -20° → +70°  | drop-knee, frog flag |
+| hip_rot      | -40° → +40°  | |
+| knee         |   0° → +150° | **no hyperextension** |
+| ankle        | -25° → +45°  | dorsi/plantar |
+
+Joints also carry passive stiffness + damping so the body doesn't
+flop into pretzels when the actuator is under-driving.
+
+**Hold attachment.** One mocap body + weld equality per limb. To
+attach: position the mocap at the hold, set `data.eq_active[i] = 1`,
+the limb welds to it. To release: set `eq_active[i] = 0`. No model
+recompile needed → fast for RL resets. The weld's `relpose` is set so
+the limb's *tip site* (fingertips / toe) lands on the hold rather
+than the wrist / ankle.
+
+**Slip model.** When `check_slip=True` (or `--slip` on the CLI, or
+`enable_slip=True` in the Gym env config), every step we compute the
+world-frame force on each active weld via `data.cfrc_int` and release
+any whose force exceeds the hold's rated capacity ×
+`SLIP_FORCE_SLACK`. A real climber blowing a crimp is exactly this —
+finger force exceeds skin/tendon capacity, the grip releases. Slip
+events are logged in `world.slip_events` for diagnostics.
+
+Slip detection is **off by default** in the bare `Climb3DWorld` API
+(it can fire spuriously during dynamic moves and needs careful
+tuning). It's **on by default** in the Gym env, where it's a
+fundamental part of the failure-cost reward signal.
+
+**Friction / smearing.** The wall surface and each hold carry their
+own friction tuples. Holds are `contype=2`/`conaffinity=2` so the
+limb doesn't *collide* with them (grabbing is mediated by the weld);
+the wall surface is `contype=1` and the limb tips can press against
+it for slab smearing or to balance against an overhang.
 
 **Coordinate convention.** `+X` along the wall, `+Y` away from the wall
 (toward the climber/camera), `+Z` up. Gravity is fixed at world `-Z`;
@@ -118,6 +162,15 @@ python -m sim3d --height 190 --wingspan 195 --beta h_006 RH:h_008 LF:h_005
 
 # 4. Headless smoke test (no display, exits after 120 frames):
 python -m sim3d --headless --frames 120
+
+# 5. Load a MoonBoard problem and view it in the native viewer:
+python -m sim3d --moonboard data/moonboard/sample-problems.json --problem 19215
+
+# 6. Random Gym episode (smoke test for the env wrapper) with slip on:
+python -m sim3d --gym --gym-episodes 3 --slip
+
+# 7. Random Gym episode on a MoonBoard problem:
+python -m sim3d --gym --moonboard data/moonboard/sample-problems.json --problem 19216
 ```
 
 `--beta` accepts either bare hold IDs (which round-robin through
@@ -175,21 +228,77 @@ profile = ClimberProfile(height_cm=175, wingspan_cm=175, mass_kg=70)
 world = Climb3DWorld(wall, profile)
 world.seed_pose(lh="h_003", rh="h_004", lf="h_001", rf="h_002")
 
-# Step 1 second of physics
-for _ in range(60):
-    world.step()
+# Step 1 second of physics, with slip detection enabled.
+slips = world.step(60, check_slip=True)
+print(f"slip events: {slips}")
 
 # Make a move
 world.move_limb("RH", "h_008", mode="snap")    # or "reach" for dynamic
 
 # Read state
-print(world.com())          # 3D centre of mass
+print(world.com())              # 3D centre of mass
 print(world.pelvis_pos())
 print(world.limb_tip_pos("RH"))
-print(world.on_hold("RH"))  # → "h_008"
+print(world.on_hold("RH"))      # → "h_008"
+print(world.limb_grip_force("RH"))   # newtons currently flowing through this limb
 
-# Get a render-ready snapshot (for the web viewer / debugging)
+# Render-ready snapshot for the web viewer
 snap = world.pose_snapshot()
+```
+
+### MoonBoard problems
+
+```python
+from sim3d.moonboard import load_moonboard_problems, moonboard_problem_to_wall
+from sim3d import Climb3DWorld, ClimberProfile
+
+problems = load_moonboard_problems("data/moonboard/sample-problems.json")
+wall = moonboard_problem_to_wall(problems[0])   # 11×18 grid, 40° overhang
+world = Climb3DWorld(wall, ClimberProfile())
+```
+
+The adapter accepts the standard public MoonBoard problem schema —
+`{id, name, grade, holdsets, start_holds, mid_holds, end_holds}` with
+`"E6"`-style position strings. By default only the problem's holds
+appear on the wall. Pass `include_full_board=True` to also include all
+198 T-nut positions as auxiliary holds (useful for letting an RL
+agent discover off-route footholds).
+
+### Gymnasium environment for RL
+
+```python
+from solver.wall import load_wall
+from sim3d.env import Climbing3DEnv, EnvConfig
+
+env = Climbing3DEnv(load_wall("example-v2-boulder"),
+                    config=EnvConfig(max_steps=30, enable_slip=True))
+obs, info = env.reset()
+for _ in range(30):
+    obs, reward, term, trunc, info = env.step(env.action_space.sample())
+    if term or trunc:
+        print(info["outcome"])
+        break
+```
+
+Two action modes are available:
+
+- **`discrete-move`** (default): `Discrete(4 * n_holds)` — pick a limb
+  and a hold. Best for the high-level beta-finding RL the project is
+  built around.
+- **`continuous-joint`**: `Box(-1, 1, (n_actuators,))` — direct joint
+  targets, scaled into each joint's range. For low-level motor
+  control. Trains slower but is more flexible.
+
+Observation is a flat 117-d vector (for 13-hold walls; scales with
+hold count): pelvis pose + COM + joint angles + joint velocities +
+limb-tip positions + per-limb on-hold one-hot + distance-to-finish.
+
+Drop-in compatible with Stable-Baselines3:
+
+```python
+from stable_baselines3 import PPO  # `pip install stable-baselines3` separately
+model = PPO("MlpPolicy", Climbing3DEnv(wall), verbose=1)
+model.learn(total_timesteps=100_000)
 ```
 
 ---
@@ -204,16 +313,16 @@ snap = world.pose_snapshot()
 - Stream poses to a browser without exposing MuJoCo to the network.
 
 **You can't yet (next phases):**
-- Train an RL agent — the actuators and `step()` API are RL-ready, but
-  there's no Gymnasium env wrapper here. The `rl/` package still talks
-  to the 2D world; porting it is Phase 5.
 - Solve a route — the A\* solver in `solver/` runs against the 2D
-  reachability checker. A 3D reachability checker on top of `Climb3DWorld`
-  is the natural next step.
+  reachability checker. A 3D reachability checker on top of
+  `Climb3DWorld` is the natural next step.
 - Use a Hill-type muscle model. The brief asked us to "think about
   muscles" — we considered it, but a torque-limited PD position
   servo is the right level of detail for the MVP. Hill muscles add a
   ~5× model-complexity cost for a marginal RL benefit.
+- Train policies that complete unseen MoonBoard problems with high
+  reliability — the env runs, but procedural curriculum (random
+  walls of increasing difficulty) is needed to get there.
 
 ---
 

@@ -17,13 +17,16 @@ SUBSTEPS_PER_FRAME = int(round(1.0 / PHYS_DT / RENDER_HZ))  # 8
 GRAVITY_M_S2 = 9.81
 
 # Wall plate dimensions are derived from the Wall (cols × rows × cell_size_cm)
-# at build time. These are just safety paddings around the playable area:
+# at build time. We pad above and to the sides only — never below — so the
+# plate bottom can sit exactly at z=0 alongside the floor.
 WALL_PADDING_M = 0.30
 WALL_THICKNESS_M = 0.05
 
-# Floor height (metres below the wall's bottom edge). Pure cosmetic /
-# safety net so a fallen climber doesn't sink to -inf.
-FLOOR_DROP_M = 0.05
+# Floor sits at z=0 (top surface). The MJCF plane geom's "thickness" is
+# implicit; we render it as a thin slab visually. No floor penetration is
+# allowed; holds must sit at z >= floor_z + small clearance.
+FLOOR_Z = 0.0
+HOLD_FLOOR_CLEARANCE = 0.02
 
 # ─── Hold geometry ──────────────────────────────────────────────────────────
 # Holds are visualised as a small puck poking out of the wall. The
@@ -76,23 +79,61 @@ MASS_FRAC = {
 import math
 DEG = math.pi / 180.0
 
+# Anatomically motivated. Tighter than what we had — looser limits let the
+# RL agent explore physically silly poses, which then makes the policy
+# fragile when transferred. Numbers below are biased toward the "trained
+# climber" end of the human range of motion. Refs: Norkin & White, "Joint
+# Range of Motion"; ACSM exercise physiology tables.
 JOINT_LIMITS_RAD = {
-    # Spine: forward flex / side bend (single hinge, "lean")
-    "spine_lean":      (-30 * DEG, 30 * DEG),
-    # Shoulders — 3-axis ball decomposed into 3 hinges (azimuth, elevation, roll)
-    "shoulder_az":     (-90 * DEG, 180 * DEG),    # forward/back
-    "shoulder_el":     (-30 * DEG, 180 * DEG),    # abduction (arm overhead = 180)
-    "shoulder_roll":   (-90 * DEG, 90 * DEG),     # internal/external rotation
-    # Elbow: flexion only (no hyperextension)
-    "elbow":           (0 * DEG, 150 * DEG),
-    # Hips — 3-axis decomposed
-    "hip_flex":        (-30 * DEG, 130 * DEG),    # bring knee to chest = +130
-    "hip_abduct":      (-30 * DEG, 60 * DEG),     # leg out to side
-    "hip_rot":         (-45 * DEG, 45 * DEG),
-    # Knee: flexion only
-    "knee":            (0 * DEG, 150 * DEG),
-    # Ankle: dorsi/plantar
-    "ankle":           (-30 * DEG, 50 * DEG),
+    # Spine — forward flex (climber tucks for high feet); we keep it
+    # single-axis to avoid the under-actuated lumbar mess.
+    "spine_lean":      (-15 * DEG, 60 * DEG),
+
+    # Shoulder (3-axis Euler around hinges). Order matters: az is
+    # forward/back, then el (abduction), then roll (internal/external).
+    # No hyper-extension behind the back (humans clear ~50° max).
+    "shoulder_az":     (-50 * DEG, 180 * DEG),
+    "shoulder_el":     (  0 * DEG, 180 * DEG),
+    "shoulder_roll":   (-80 * DEG,  80 * DEG),
+
+    # Elbow — strict flexion, NO hyperextension. 150° is "fist near
+    # shoulder", 0° is locked-out arm.
+    "elbow":           (  0 * DEG, 150 * DEG),
+
+    # Wrist — 1 DOF flexion/extension. Modest range is enough to wrap a
+    # hold; we don't model radial/ulnar deviation.
+    "wrist":           (-70 * DEG,  70 * DEG),
+
+    # Hip flex (knee to chest), abduction (legs apart), rotation.
+    # Bias hip_flex high so high-step betas are reachable.
+    "hip_flex":        (-20 * DEG, 140 * DEG),
+    "hip_abduct":      (-20 * DEG,  70 * DEG),
+    "hip_rot":         (-40 * DEG,  40 * DEG),
+
+    # Knee — flexion only, no hyperextension. 0° = locked-out, 150° = heel-to-butt.
+    "knee":            (  0 * DEG, 150 * DEG),
+
+    # Ankle — dorsi (toe up) / plantar (toe down).
+    "ankle":           (-25 * DEG,  45 * DEG),
+}
+
+# Per-joint passive stiffness (Nm / rad) and damping (Nm·s / rad).
+# These give every joint a slight "spring back to neutral" feel, which
+# stops the climber from flopping into pretzels when the actuator is
+# under-driving. Numbers chosen so the joints feel taut but not stiff —
+# climbers DO have passive elastic torque from tendons / ligaments.
+JOINT_PASSIVE = {
+    "spine_lean":    (15.0, 2.0),
+    "shoulder_az":   ( 5.0, 0.8),
+    "shoulder_el":   ( 5.0, 0.8),
+    "shoulder_roll": ( 3.0, 0.5),
+    "elbow":         ( 4.0, 0.6),
+    "wrist":         ( 2.0, 0.3),
+    "hip_flex":      (10.0, 1.5),
+    "hip_abduct":    (10.0, 1.5),
+    "hip_rot":       ( 6.0, 1.0),
+    "knee":          ( 8.0, 1.2),
+    "ankle":         ( 4.0, 0.6),
 }
 
 # ─── Actuation ──────────────────────────────────────────────────────────────
@@ -101,30 +142,50 @@ JOINT_LIMITS_RAD = {
 # angle with a stiff PD. We don't model muscle physiology — the user's
 # brief said to "think about muscles" and we explicitly chose to model
 # them as torque-limited PD servos rather than Hill-type muscles, which
-# would 5x the simulator complexity for marginal RL benefit.
-ACTUATOR_KP = 200.0
-ACTUATOR_KV = 20.0
-# Per-joint torque cap (Nm). A real climber is roughly 50-150 Nm at the
-# shoulder, 80 Nm at the hip; values below are intentionally generous so
-# unsolvable poses fail because of geometry, not because the actuator
-# saturated. Tune later when sim2real matters.
+# would 5× the simulator complexity for marginal RL benefit.
+ACTUATOR_KP = 120.0
+ACTUATOR_KV = 8.0
+
+# Per-joint torque cap (Nm). Real climber peak ≈ 60–150 Nm shoulder,
+# 80 Nm spine, 200 Nm hip, 150 Nm knee. We keep these generous so failure
+# modes are geometric (out-of-reach), not actuator saturation.
 TORQUE_CAP_NM = {
-    "shoulder": 150.0,
-    "elbow":    100.0,
-    "spine":     80.0,
-    "hip":      200.0,
-    "knee":     150.0,
-    "ankle":     80.0,
+    "shoulder": 180.0,
+    "elbow":    120.0,
+    "wrist":     30.0,
+    "spine":    120.0,
+    "hip":      220.0,
+    "knee":     180.0,
+    "ankle":     90.0,
 }
 
 # ─── Hold attachment ────────────────────────────────────────────────────────
-# When a limb is "on" a hold we activate an equality/connect between
-# the limb's tip site and a per-limb mocap target body. The mocap is
-# moved to the hold's centre on attach; on release we just deactivate
-# the constraint. solref/solimp control how stiff the catch is.
-HOLD_CONSTRAINT_SOLREF = (0.01, 1.0)   # (timeconst, dampratio)
+# When a limb is "on" a hold we activate a weld equality between the
+# limb's hand/foot body and a per-limb mocap target body. The mocap is
+# moved to the hold's centre on attach; on release we deactivate the
+# constraint. solref/solimp control how stiff the catch is — climbers
+# describe "snapping onto a hold" as a quick lock-in, so we tune for a
+# fast catch with low spring-back.
+HOLD_CONSTRAINT_SOLREF = (0.02, 1.0)
 HOLD_CONSTRAINT_SOLIMP = (0.95, 0.99, 0.001, 0.5, 2)
+
+# Slip model. We don't trust raw weld constraints to model breakaway —
+# the weld is rigid until released. Instead, every step we read the
+# constraint force on each active weld, and if it exceeds the hold's
+# capacity (max_force_n × this slack factor) we deactivate the weld.
+# Setting > 1.0 gives the climber more grip than the hold's rated
+# capacity (real climbers do peak above hold-rated forces in dynos);
+# setting < 1.0 makes them slip more easily.
+SLIP_FORCE_SLACK = 1.25
 
 # Friction on the bare wall surface (used for slab smearing). Holds
 # carry their own per-hold friction patch.
 DEFAULT_WALL_FRICTION = (0.7, 0.005, 0.001)  # (slide, spin, roll)
+
+# When the limb's tip body collides with the wall plate (mid-flight),
+# we want enough friction to enable smearing. These geom-level frictions
+# are multiplied with the wall friction by MuJoCo via geometric mean.
+LIMB_TIP_FRICTION = {
+    "hand": (1.6, 0.01, 0.005),    # chalk + skin
+    "foot": (1.4, 0.01, 0.005),    # rubber sole
+}

@@ -100,29 +100,40 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
     """Emit the <body> tree for the climber, with a free joint at the
     pelvis. Caller embeds this inside <worldbody>.
 
-    Tree layout (joint count in parens):
+    Tree layout — DOF count in parens:
 
         pelvis (free, 6)
         ├── chest (spine_lean, 1)
         │   ├── head
-        │   ├── L shoulder (3) → upper_arm → elbow (1) → forearm → hand [site_lh_tip]
-        │   └── R shoulder (3) → upper_arm → elbow (1) → forearm → hand [site_rh_tip]
-        ├── L thigh (hip 3) → shin (knee 1) → foot (ankle 1) [site_lf_tip]
-        └── R thigh (hip 3) → shin (knee 1) → foot (ankle 1) [site_rf_tip]
+        │   ├── L shoulder (3) → upper_arm → elbow (1) → forearm → wrist (1) → hand
+        │   └── R shoulder (3) → upper_arm → elbow (1) → forearm → wrist (1) → hand
+        ├── L thigh (hip 3) → shin (knee 1) → foot (ankle 1)
+        └── R thigh (hip 3) → shin (knee 1) → foot (ankle 1)
 
-    Total non-free DOF: 1 (spine) + 4×2 (shoulders+elbow) + 5×2 (hip+knee+ankle)
-                      = 19, plus the 6 free DOF = 25.
+    Total non-free DOF: 1 + 5×2 + 5×2 = 21, plus 6 free = 27.
+
+    Collision groups:
+        contype=1, conaffinity=1 — torso/limbs
+        Wall plate is also contype=1, so the climber CAN press against
+        the wall (essential for slab and overhang). Holds are contype=2
+        and don't collide with anyone — grabbing is mediated by the
+        weld equality, not contact.
     """
     s = profile.segments
     m = profile.masses
-    # Hand and foot half-extents (the rigid stubs at the end of each chain).
-    hand_half = (0.04, 0.025, 0.06)
-    foot_half = (0.05, 0.10, s.foot_h / 2.0)
+    hand_half = (0.045, 0.025, 0.06)
+    foot_half = (0.05, 0.10, max(0.025, s.foot_h / 2.0))
 
-    # Quick helpers — segment geoms are capsules along Z by default.
+    R = lambda key: (
+        f'{cfg.JOINT_LIMITS_RAD[key][0]:.4f} {cfg.JOINT_LIMITS_RAD[key][1]:.4f}'
+    )
+    P = lambda key: (
+        f'stiffness="{cfg.JOINT_PASSIVE[key][0]:.2f}" '
+        f'damping="{cfg.JOINT_PASSIVE[key][1]:.2f}"'
+    )
+
     def capsule(name: str, length: float, radius: float, mass: float, rgba: str) -> str:
-        # Capsule oriented down (-Z) from the parent attach point so
-        # the next child can sit at -Z * length.
+        # Oriented down (-Z) from the parent so the next child sits at z = -length.
         return (
             f'<geom name="{name}" type="capsule" '
             f'fromto="0 0 0  0 0 {-length:.4f}" '
@@ -133,25 +144,26 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
     pelvis_x, pelvis_y, pelvis_z = start_pos_m
     sw = s.shoulder_width / 2.0
     pw = s.pelvis_width / 2.0
-    # Joint range strings (radians).
-    R = lambda key: (
-        f'{cfg.JOINT_LIMITS_RAD[key][0]:.4f} {cfg.JOINT_LIMITS_RAD[key][1]:.4f}'
-    )
-
     skin = "0.86 0.72 0.55 1.0"
     cloth = "0.20 0.40 0.70 1.0"
+    hand_fric = " ".join(f"{v:.3f}" for v in cfg.LIMB_TIP_FRICTION["hand"])
+    foot_fric = " ".join(f"{v:.3f}" for v in cfg.LIMB_TIP_FRICTION["foot"])
 
+    # The hand_z offset puts the hand body's site at the lower face of
+    # the hand box (where a real climber's fingers would wrap). Mocap
+    # attaches there, so the constraint puts that point at the hold.
     return f"""
     <body name="pelvis" pos="{pelvis_x:.4f} {pelvis_y:.4f} {pelvis_z:.4f}">
         <freejoint name="root"/>
         <geom name="g_pelvis" type="box"
-              size="{pw:.4f} 0.08 {0.08:.4f}"
+              size="{pw:.4f} 0.10 {0.09:.4f}"
               mass="{m.pelvis:.3f}" rgba="{cloth}"
               friction="1.0 0.005 0.001"/>
         <site name="site_com" pos="0 0 0" size="0.02" rgba="1 1 0 0.4"/>
 
-        <body name="chest" pos="0 0 {0.10:.4f}">
-            <joint name="spine_lean" type="hinge" axis="1 0 0" range="{R('spine_lean')}"/>
+        <body name="chest" pos="0 0 {0.12:.4f}">
+            <joint name="spine_lean" type="hinge" axis="1 0 0"
+                   range="{R('spine_lean')}" {P('spine_lean')}/>
             <geom name="g_chest" type="box"
                   size="{sw*0.9:.4f} 0.10 {s.spine/2:.4f}"
                   pos="0 0 {s.spine/2:.4f}"
@@ -165,19 +177,25 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
 
             <!-- LEFT ARM -->
             <body name="l_upperarm" pos="{-sw:.4f} 0 {s.spine - 0.05:.4f}">
-                <joint name="l_shoulder_az"   type="hinge" axis="0 1 0" range="{R('shoulder_az')}"/>
-                <joint name="l_shoulder_el"   type="hinge" axis="1 0 0" range="{R('shoulder_el')}"/>
-                <joint name="l_shoulder_roll" type="hinge" axis="0 0 1" range="{R('shoulder_roll')}"/>
+                <joint name="l_shoulder_az"   type="hinge" axis="0 1 0"
+                       range="{R('shoulder_az')}"   {P('shoulder_az')}/>
+                <joint name="l_shoulder_el"   type="hinge" axis="1 0 0"
+                       range="{R('shoulder_el')}"   {P('shoulder_el')}/>
+                <joint name="l_shoulder_roll" type="hinge" axis="0 0 1"
+                       range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
                 {capsule("g_l_upperarm", s.upper_arm, 0.045, m.upper_arm, skin)}
                 <body name="l_forearm" pos="0 0 {-s.upper_arm:.4f}">
-                    <joint name="l_elbow" type="hinge" axis="1 0 0" range="{R('elbow')}"/>
+                    <joint name="l_elbow" type="hinge" axis="1 0 0"
+                           range="{R('elbow')}" {P('elbow')}/>
                     {capsule("g_l_forearm", s.forearm, 0.038, m.forearm, skin)}
                     <body name="l_hand" pos="0 0 {-s.forearm:.4f}">
+                        <joint name="l_wrist" type="hinge" axis="1 0 0"
+                               range="{R('wrist')}" {P('wrist')}/>
                         <geom name="g_l_hand" type="box"
                               size="{hand_half[0]:.4f} {hand_half[1]:.4f} {hand_half[2]:.4f}"
                               pos="0 0 {-hand_half[2]:.4f}"
                               mass="{m.hand:.3f}" rgba="{skin}"
-                              friction="1.5 0.005 0.001"/>
+                              friction="{hand_fric}"/>
                         <site name="{LIMB_TIP_SITE['LH']}"
                               pos="0 0 {-hand_half[2]*2:.4f}" size="0.015"
                               rgba="0 1 0 0.6"/>
@@ -187,19 +205,25 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
 
             <!-- RIGHT ARM -->
             <body name="r_upperarm" pos="{sw:.4f} 0 {s.spine - 0.05:.4f}">
-                <joint name="r_shoulder_az"   type="hinge" axis="0 1 0" range="{R('shoulder_az')}"/>
-                <joint name="r_shoulder_el"   type="hinge" axis="1 0 0" range="{R('shoulder_el')}"/>
-                <joint name="r_shoulder_roll" type="hinge" axis="0 0 1" range="{R('shoulder_roll')}"/>
+                <joint name="r_shoulder_az"   type="hinge" axis="0 1 0"
+                       range="{R('shoulder_az')}"   {P('shoulder_az')}/>
+                <joint name="r_shoulder_el"   type="hinge" axis="1 0 0"
+                       range="{R('shoulder_el')}"   {P('shoulder_el')}/>
+                <joint name="r_shoulder_roll" type="hinge" axis="0 0 1"
+                       range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
                 {capsule("g_r_upperarm", s.upper_arm, 0.045, m.upper_arm, skin)}
                 <body name="r_forearm" pos="0 0 {-s.upper_arm:.4f}">
-                    <joint name="r_elbow" type="hinge" axis="1 0 0" range="{R('elbow')}"/>
+                    <joint name="r_elbow" type="hinge" axis="1 0 0"
+                           range="{R('elbow')}" {P('elbow')}/>
                     {capsule("g_r_forearm", s.forearm, 0.038, m.forearm, skin)}
                     <body name="r_hand" pos="0 0 {-s.forearm:.4f}">
+                        <joint name="r_wrist" type="hinge" axis="1 0 0"
+                               range="{R('wrist')}" {P('wrist')}/>
                         <geom name="g_r_hand" type="box"
                               size="{hand_half[0]:.4f} {hand_half[1]:.4f} {hand_half[2]:.4f}"
                               pos="0 0 {-hand_half[2]:.4f}"
                               mass="{m.hand:.3f}" rgba="{skin}"
-                              friction="1.5 0.005 0.001"/>
+                              friction="{hand_fric}"/>
                         <site name="{LIMB_TIP_SITE['RH']}"
                               pos="0 0 {-hand_half[2]*2:.4f}" size="0.015"
                               rgba="0 1 0 0.6"/>
@@ -209,20 +233,25 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
         </body>
 
         <!-- LEFT LEG -->
-        <body name="l_thigh" pos="{-pw:.4f} 0 -0.05">
-            <joint name="l_hip_flex"   type="hinge" axis="1 0 0" range="{R('hip_flex')}"/>
-            <joint name="l_hip_abduct" type="hinge" axis="0 1 0" range="{R('hip_abduct')}"/>
-            <joint name="l_hip_rot"    type="hinge" axis="0 0 1" range="{R('hip_rot')}"/>
+        <body name="l_thigh" pos="{-pw:.4f} 0 {-0.06:.4f}">
+            <joint name="l_hip_flex"   type="hinge" axis="1 0 0"
+                   range="{R('hip_flex')}"   {P('hip_flex')}/>
+            <joint name="l_hip_abduct" type="hinge" axis="0 1 0"
+                   range="{R('hip_abduct')}" {P('hip_abduct')}/>
+            <joint name="l_hip_rot"    type="hinge" axis="0 0 1"
+                   range="{R('hip_rot')}"    {P('hip_rot')}/>
             {capsule("g_l_thigh", s.thigh, 0.07, m.thigh, cloth)}
             <body name="l_shin" pos="0 0 {-s.thigh:.4f}">
-                <joint name="l_knee" type="hinge" axis="1 0 0" range="{R('knee')}"/>
+                <joint name="l_knee" type="hinge" axis="1 0 0"
+                       range="{R('knee')}" {P('knee')}/>
                 {capsule("g_l_shin", s.shin, 0.05, m.shin, skin)}
                 <body name="l_foot" pos="0 0 {-s.shin - foot_half[2]:.4f}">
-                    <joint name="l_ankle" type="hinge" axis="1 0 0" range="{R('ankle')}"/>
+                    <joint name="l_ankle" type="hinge" axis="1 0 0"
+                           range="{R('ankle')}" {P('ankle')}/>
                     <geom name="g_l_foot" type="box"
                           size="{foot_half[0]:.4f} {foot_half[1]:.4f} {foot_half[2]:.4f}"
                           mass="{m.foot:.3f}" rgba="0.10 0.10 0.10 1"
-                          friction="1.5 0.005 0.001"/>
+                          friction="{foot_fric}"/>
                     <site name="{LIMB_TIP_SITE['LF']}"
                           pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
                           size="0.015" rgba="0 1 0 0.6"/>
@@ -231,20 +260,25 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
         </body>
 
         <!-- RIGHT LEG -->
-        <body name="r_thigh" pos="{pw:.4f} 0 -0.05">
-            <joint name="r_hip_flex"   type="hinge" axis="1 0 0" range="{R('hip_flex')}"/>
-            <joint name="r_hip_abduct" type="hinge" axis="0 1 0" range="{R('hip_abduct')}"/>
-            <joint name="r_hip_rot"    type="hinge" axis="0 0 1" range="{R('hip_rot')}"/>
+        <body name="r_thigh" pos="{pw:.4f} 0 {-0.06:.4f}">
+            <joint name="r_hip_flex"   type="hinge" axis="1 0 0"
+                   range="{R('hip_flex')}"   {P('hip_flex')}/>
+            <joint name="r_hip_abduct" type="hinge" axis="0 1 0"
+                   range="{R('hip_abduct')}" {P('hip_abduct')}/>
+            <joint name="r_hip_rot"    type="hinge" axis="0 0 1"
+                   range="{R('hip_rot')}"    {P('hip_rot')}/>
             {capsule("g_r_thigh", s.thigh, 0.07, m.thigh, cloth)}
             <body name="r_shin" pos="0 0 {-s.thigh:.4f}">
-                <joint name="r_knee" type="hinge" axis="1 0 0" range="{R('knee')}"/>
+                <joint name="r_knee" type="hinge" axis="1 0 0"
+                       range="{R('knee')}" {P('knee')}/>
                 {capsule("g_r_shin", s.shin, 0.05, m.shin, skin)}
                 <body name="r_foot" pos="0 0 {-s.shin - foot_half[2]:.4f}">
-                    <joint name="r_ankle" type="hinge" axis="1 0 0" range="{R('ankle')}"/>
+                    <joint name="r_ankle" type="hinge" axis="1 0 0"
+                           range="{R('ankle')}" {P('ankle')}/>
                     <geom name="g_r_foot" type="box"
                           size="{foot_half[0]:.4f} {foot_half[1]:.4f} {foot_half[2]:.4f}"
                           mass="{m.foot:.3f}" rgba="0.10 0.10 0.10 1"
-                          friction="1.5 0.005 0.001"/>
+                          friction="{foot_fric}"/>
                     <site name="{LIMB_TIP_SITE['RF']}"
                           pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
                           size="0.015" rgba="0 1 0 0.6"/>
@@ -265,8 +299,8 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
     width_m = wall.width_cm / 100.0
     height_m = wall.height_cm / 100.0
     pad = cfg.WALL_PADDING_M
-    plate_w = width_m + 2 * pad
-    plate_h = height_m + 2 * pad
+    plate_w = width_m + 2 * pad      # pad on both sides
+    plate_h = height_m + pad         # pad above only — bottom anchors to z=0
     angle_deg = wall.wall_angle_deg
     theta = math.radians(angle_deg)
 
@@ -277,14 +311,40 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
     #     plate-local Y  =  outward normal (where holds protrude)
     #     plate-local Z  =  up the wall plane
     #
-    # Rotating the plate by +θ around world +X tips the top of the wall
-    # toward +Y for positive θ (overhang) and toward -Y for negative θ
-    # (slab). Plate centre therefore sits at:
-    #     (0,  +h/2 sinθ,  +h/2 cosθ)
-    # so the bottom edge stays at world Z = 0.
+    # Plate centre is at the midpoint of the playable wall region —
+    # NOT at plate_h/2 — because plate_h has padding only above. The
+    # plate bottom (plate-local z = -plate_h/2) maps to wall z = 0 by
+    # placing the centre at z_offset = (plate_h - pad)/2 in plate
+    # coords. Working it out: bottom edge in world = centre + (-plate_h/2)
+    # × plate_z_world. Plate_z_world for rotation +θ around +X is
+    # (0, sinθ, cosθ). For bottom = (0, 0, 0):
+    #     centre = (0, +(plate_h/2) sinθ, +(plate_h/2) cosθ)
+    # Then the playable region (height_m) sits between bottom and
+    # bottom + height_m × plate_z_world.
     cx = 0.0
-    cy = (height_m / 2.0) * math.sin(theta)
-    cz = (height_m / 2.0) * math.cos(theta)
+    cy = (plate_h / 2.0) * math.sin(theta)
+    cz = (plate_h / 2.0) * math.cos(theta)
+
+    # Floor-clearance lift: at high overhang angles, the lowest holds
+    # can compute to z < 0 (below the floor). Find the minimum hold
+    # world-z under the current wall placement, and if it's below the
+    # required clearance, lift the whole plate (and therefore every
+    # hold position) by the deficit. This keeps the convention
+    # "wall bottom at z=0 for vertical walls" while gracefully handling
+    # extreme angles.
+    if wall.holds:
+        cos_t0 = math.cos(theta)
+        sin_t0 = math.sin(theta)
+        local_y_tip0 = cfg.WALL_THICKNESS_M / 2.0 + cfg.HOLD_PROTRUDE_M
+        min_world_z = min(
+            cz - local_y_tip0 * sin_t0
+              + ((h.y_cm / 100.0) - plate_h / 2.0) * cos_t0
+            for h in wall.holds
+        )
+        deficit = cfg.FLOOR_Z + cfg.HOLD_FLOOR_CLEARANCE - min_world_z
+        if deficit > 0:
+            cz += deficit
+
     plate_axisangle = f"1 0 0 {theta:.5f}"
 
     nx, ny, nz = _wall_normal_world(angle_deg)
@@ -304,11 +364,15 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
 
     # ── Holds — children of the wall plate. ──────────────────────────
     # In plate-local coords:
-    #     local_x = wx_cm/100 - width/2          (centred on plate)
+    #     local_x = wx_cm/100 - width/2          (centred horizontally)
     #     local_y = thickness/2 + protrude/2     (sticking outward)
-    #     local_z = wy_cm/100 - height/2         (up the wall)
-    # Cylinder geom default-axis is +Z; rotate by -90° around X so the
-    # cylinder's long axis points along plate-local +Y (out of the wall).
+    #     local_z = wy_cm/100 - plate_h/2        (up the wall)
+    #
+    # Note plate_h not height_m — the plate centre is offset by half
+    # the *padded* height because we only pad above. A hold at
+    # wy_cm = 0 sits at plate-local z = -plate_h/2 = wall bottom.
+    # Cylinder geom default-axis is +Z; rotate by -90° around X so its
+    # long axis points along plate-local +Y (out of the wall).
     cyl_axisangle = "1 0 0 -1.5708"
     hold_meta: list[dict] = []
     hold_geoms = []
@@ -318,7 +382,7 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
         wx_cm = h.x_cm
         wy_cm = h.y_cm
         local_x = (wx_cm / 100.0) - width_m / 2.0
-        local_z_plane = (wy_cm / 100.0) - height_m / 2.0
+        local_z_plane = (wy_cm / 100.0) - plate_h / 2.0
         local_y_out = plate_half[1] + cfg.HOLD_PROTRUDE_M / 2.0
         radius = cfg.HOLD_RADIUS_BY_SIZE_M.get(h.size, 0.05)
 
@@ -445,35 +509,38 @@ def _build_equalities_v2() -> str:
 
 # ─── Actuators ────────────────────────────────────────────────────────────
 def _build_actuators() -> str:
-    """Position actuators on every non-free joint. ctrl is a target
-    angle (radians) the joint servos toward."""
+    """Position actuators on every non-free joint. `ctrl[i]` is a
+    target angle (radians); the actuator servos the joint to that
+    angle with a stiff PD plus the joint's passive stiffness/damping."""
     joints = [
         ("spine_lean", "spine"),
-        ("l_shoulder_az", "shoulder"),
-        ("l_shoulder_el", "shoulder"),
+        ("l_shoulder_az",   "shoulder"),
+        ("l_shoulder_el",   "shoulder"),
         ("l_shoulder_roll", "shoulder"),
-        ("l_elbow", "elbow"),
-        ("r_shoulder_az", "shoulder"),
-        ("r_shoulder_el", "shoulder"),
+        ("l_elbow",         "elbow"),
+        ("l_wrist",         "wrist"),
+        ("r_shoulder_az",   "shoulder"),
+        ("r_shoulder_el",   "shoulder"),
         ("r_shoulder_roll", "shoulder"),
-        ("r_elbow", "elbow"),
-        ("l_hip_flex", "hip"),
+        ("r_elbow",         "elbow"),
+        ("r_wrist",         "wrist"),
+        ("l_hip_flex",   "hip"),
         ("l_hip_abduct", "hip"),
-        ("l_hip_rot", "hip"),
-        ("l_knee", "knee"),
-        ("l_ankle", "ankle"),
-        ("r_hip_flex", "hip"),
+        ("l_hip_rot",    "hip"),
+        ("l_knee",       "knee"),
+        ("l_ankle",      "ankle"),
+        ("r_hip_flex",   "hip"),
         ("r_hip_abduct", "hip"),
-        ("r_hip_rot", "hip"),
-        ("r_knee", "knee"),
-        ("r_ankle", "ankle"),
+        ("r_hip_rot",    "hip"),
+        ("r_knee",       "knee"),
+        ("r_ankle",      "ankle"),
     ]
     parts = []
     for joint, group in joints:
         cap = cfg.TORQUE_CAP_NM[group]
         parts.append(
             f'<position name="act_{joint}" joint="{joint}" '
-            f'kp="{cfg.ACTUATOR_KP}" '
+            f'kp="{cfg.ACTUATOR_KP}" kv="{cfg.ACTUATOR_KV}" '
             f'forcerange="{-cap} {cap}"/>'
         )
     return "\n".join(parts)
@@ -501,13 +568,15 @@ def build_mjcf_xml(wall: Wall, profile: ClimberProfile | None = None) -> tuple[s
     eq_xml = _build_equalities_v2()
     act_xml = _build_actuators()
 
-    # Floor geom — a large ground plane below the climber. Acts as a
-    # safety net during early development; real climbers fall onto a
-    # crash pad, not infinity.
+    # Floor — its top surface sits at z = FLOOR_Z (= 0). The MJCF
+    # plane geom occupies the half-space z <= surface and is infinite
+    # in extent; we visualise a 40×40 m patch via the size attribute,
+    # and use contype=1 so the climber's body can land on it after a
+    # fall. Hold cylinders are contype=2 so they don't collide here.
     floor_xml = (
         f'<geom name="floor" type="plane" size="20 20 0.1" '
-        f'pos="0 0 {-cfg.FLOOR_DROP_M}" '
-        f'rgba="0.30 0.30 0.30 1" '
+        f'pos="0 0 {cfg.FLOOR_Z}" '
+        f'rgba="0.18 0.18 0.20 1" '
         f'friction="1.0 0.005 0.001" contype="1" conaffinity="1"/>'
     )
 

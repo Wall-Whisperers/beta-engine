@@ -67,6 +67,32 @@ def main(argv: list[str] | None = None) -> int:
         "--wall", default="example-v2-boulder",
         help="Wall ID or path to a wall JSON.",
     )
+    p.add_argument(
+        "--moonboard", metavar="PATH",
+        help="Path to a MoonBoard problem-list JSON. Overrides --wall.",
+    )
+    p.add_argument(
+        "--problem", type=int, metavar="ID",
+        help="MoonBoard problem id to load (with --moonboard).",
+    )
+    p.add_argument(
+        "--problem-name", metavar="NAME",
+        help="Substring of MoonBoard problem name (with --moonboard). "
+             "First match wins. Use this if you don't have the id.",
+    )
+    p.add_argument(
+        "--gym", action="store_true",
+        help="Run a Gymnasium random-policy episode instead of the viewer. "
+             "Useful sanity check for the env wrapper.",
+    )
+    p.add_argument(
+        "--gym-episodes", type=int, default=1,
+        help="Number of episodes when --gym is set.",
+    )
+    p.add_argument(
+        "--slip", action="store_true",
+        help="Enable slip detection (welds release when force exceeds capacity).",
+    )
     p.add_argument("--height", type=float, default=175.0,
                    help="Climber total height in cm.")
     p.add_argument("--wingspan", type=float, default=175.0,
@@ -97,7 +123,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
-    wall = load_wall(args.wall)
+    if args.moonboard:
+        from sim3d.moonboard import (
+            load_moonboard_problems, moonboard_problem_to_wall, find_problem,
+        )
+        problems = load_moonboard_problems(args.moonboard)
+        if args.problem is not None:
+            problem = find_problem(problems, id=args.problem)
+            if problem is None:
+                raise SystemExit(f"problem id {args.problem} not found in {args.moonboard}")
+        elif args.problem_name is not None:
+            problem = find_problem(problems, name=args.problem_name)
+            if problem is None:
+                raise SystemExit(f"no problem matches name {args.problem_name!r}")
+        else:
+            problem = problems[0]
+            print(f"(picked first problem: #{problem.id} {problem.name!r}; "
+                  f"use --problem ID or --problem-name to choose)")
+        wall = moonboard_problem_to_wall(problem)
+        print(f"MoonBoard: \"{problem.name}\" by {problem.setter} — V{problem.grade}")
+    else:
+        wall = load_wall(args.wall)
     profile = ClimberProfile(
         height_cm=args.height,
         wingspan_cm=args.wingspan,
@@ -129,16 +175,39 @@ def main(argv: list[str] | None = None) -> int:
 
     moves = parse_beta(args.beta)
 
+    if args.gym:
+        # Gym random-policy episode(s) — useful smoke test for the env.
+        from sim3d.env import Climbing3DEnv, EnvConfig
+        env = Climbing3DEnv(
+            wall, profile,
+            config=EnvConfig(
+                max_steps=30,
+                enable_slip=args.slip,
+            ),
+        )
+        for ep in range(args.gym_episodes):
+            obs, info = env.reset()
+            ep_reward = 0.0
+            for _ in range(env.cfg_env.max_steps):
+                a = env.action_space.sample()
+                obs, r, term, trunc, info = env.step(a)
+                ep_reward += r
+                if term or trunc:
+                    break
+            print(f"episode {ep+1}: reward={ep_reward:+.2f}, "
+                  f"outcome={info.get('outcome')}, com_z={info['com'][2]:.2f}")
+        return 0
+
     if args.headless:
-        for _ in range(args.frames):
-            world.step()
+        slip_total = world.step(args.frames, check_slip=args.slip)
         for limb, hold_id in moves:
             print(f"  → {limb} → {hold_id}")
             world.move_limb(limb, hold_id, mode="snap")
-            for _ in range(int(0.5 * 60)):  # 0.5 s settle
-                world.step()
-        print("final pelvis:", world.pelvis_pos())
-        print("final COM:   ", world.com())
+            slip_total += world.step(30, check_slip=args.slip)  # 0.5 s settle
+        print(f"final pelvis: {world.pelvis_pos()}")
+        print(f"final COM:    {world.com()}")
+        if args.slip:
+            print(f"slip events:  {slip_total}")
         return 0
 
     # ── Native viewer with optional scripted beta ────────────────────

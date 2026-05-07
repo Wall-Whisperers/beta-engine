@@ -33,9 +33,20 @@ from flask import Blueprint, abort, jsonify, request, send_from_directory
 
 from sim3d import Climb3DWorld, ClimberProfile
 from sim3d.body import LIMBS
+from sim3d.moonboard import (
+    load_moonboard_problems,
+    moonboard_problem_to_wall,
+    find_problem,
+)
 from solver.wall import load_wall
 
 bp = Blueprint("sim3d", __name__, url_prefix="/sim3d")
+
+# Standard search path for MoonBoard problem files. The browser viewer
+# discovers problems by listing this dir; advanced users can drop their
+# own JSON in here and it'll show up in the dropdown.
+MOONBOARD_DIR = Path("/data/moonboard")
+MOONBOARD_DIR_FALLBACK = Path(__file__).resolve().parent.parent / "data" / "moonboard"
 
 
 @dataclass
@@ -56,6 +67,52 @@ def viewer_page():
 
 
 # ─── Session lifecycle ────────────────────────────────────────────────────
+def _moonboard_dirs() -> list[Path]:
+    dirs = [d for d in (MOONBOARD_DIR, MOONBOARD_DIR_FALLBACK) if d.exists()]
+    # Dedupe: if both dirs exist and host the same canonical files,
+    # keep only the primary. Prevents the listing endpoint from
+    # returning each file twice.
+    if len(dirs) == 2 and dirs[0].resolve() == dirs[1].resolve():
+        return [dirs[0]]
+    return dirs
+
+
+def _moonboard_files_unique() -> list[Path]:
+    """Yield each moonboard JSON exactly once, primary dir wins on
+    name-collision."""
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in _moonboard_dirs():
+        for p in sorted(d.glob("*.json")):
+            if p.name in seen:
+                continue
+            seen.add(p.name)
+            out.append(p)
+    return out
+
+
+@bp.route("/api/moonboard", methods=["GET"])
+def list_moonboard_files():
+    """List MoonBoard problem-JSON files available to the server."""
+    files = []
+    for p in _moonboard_files_unique():
+        try:
+            problems = load_moonboard_problems(p)
+        except Exception as e:
+            files.append({"file": p.name, "dir": str(p.parent), "error": str(e)})
+            continue
+        files.append({
+            "file": p.name,
+            "dir": str(p.parent),
+            "problem_count": len(problems),
+            "sample": [
+                {"id": pr.id, "name": pr.name, "grade": pr.grade}
+                for pr in problems[:50]
+            ],
+        })
+    return jsonify({"files": files})
+
+
 @bp.route("/api/session", methods=["POST"])
 def create_session():
     payload = request.get_json(silent=True) or {}
@@ -65,10 +122,33 @@ def create_session():
     mass_kg = float(payload.get("mass_kg", 70))
     seed = bool(payload.get("seed", True))
 
-    try:
-        wall = load_wall(wall_id)
-    except (FileNotFoundError, KeyError) as e:
-        abort(404, description=f"wall not found: {e}")
+    moonboard_file = payload.get("moonboard_file")
+    moonboard_problem_id = payload.get("moonboard_problem_id")
+
+    if moonboard_file is not None:
+        # Load a MoonBoard problem rather than a stored wall.
+        target = None
+        for d in _moonboard_dirs():
+            cand = d / moonboard_file
+            if cand.exists():
+                target = cand
+                break
+        if target is None:
+            abort(404, description=f"moonboard file not found: {moonboard_file}")
+        problems = load_moonboard_problems(target)
+        problem = None
+        if moonboard_problem_id is not None:
+            problem = find_problem(problems, id=int(moonboard_problem_id))
+        if problem is None:
+            problem = problems[0] if problems else None
+        if problem is None:
+            abort(404, description="no problems in MoonBoard file")
+        wall = moonboard_problem_to_wall(problem)
+    else:
+        try:
+            wall = load_wall(wall_id)
+        except (FileNotFoundError, KeyError) as e:
+            abort(404, description=f"wall not found: {e}")
 
     profile = ClimberProfile(
         height_cm=height_cm,
