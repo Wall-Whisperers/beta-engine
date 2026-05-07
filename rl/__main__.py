@@ -29,14 +29,13 @@ from solver.wall import load_wall
 
 
 def _runs_dir() -> Path:
-    candidate = Path("/data/runs")
-    try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        return candidate
-    except (PermissionError, OSError):
-        fallback = Path(__file__).resolve().parent.parent / "data" / "runs"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
+    in_docker = Path("/.dockerenv").exists()
+    if in_docker:
+        d = Path("/data/runs")
+    else:
+        d = Path(__file__).resolve().parent.parent / "data" / "runs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -118,8 +117,9 @@ def main(argv: list[str] | None = None) -> int:
                 world.move_limb(limb, hid, mode="snap")
 
         gif_path = _runs_dir() / f"{wall.wall_id}-rl.gif"
+        print(f"Saving GIF → {gif_path.resolve()}")
         render_animation(world, gif_path, n_frames=n_frames, on_frame=on_frame)
-        print(f"Wrote {gif_path}")
+        print(f"Wrote {gif_path.resolve()}")
 
     return 0
 

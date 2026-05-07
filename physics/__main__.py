@@ -31,14 +31,16 @@ from solver.wall import load_wall
 
 
 def _runs_dir() -> Path:
-    candidate = Path("/data/runs")
-    try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        return candidate
-    except (PermissionError, OSError):
-        fallback = Path(__file__).resolve().parent.parent / "data" / "runs"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
+    # Inside Docker the /data volume is bind-mounted to ./data/ on the host.
+    # Outside Docker we write directly into the repo's data/runs/ so the
+    # user can find the files next to their code.
+    in_docker = Path("/.dockerenv").exists()
+    if in_docker:
+        d = Path("/data/runs")
+    else:
+        d = Path(__file__).resolve().parent.parent / "data" / "runs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _starting_holds(wall) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -144,8 +146,9 @@ def main(argv: list[str] | None = None) -> int:
         # Settle the body for a moment, then snapshot.
         world.step(60)
         png_path = runs / f"{wall.wall_id}-physics.png"
+        print(f"Saving PNG → {png_path.resolve()}")
         render_still(world, png_path)
-        print(f"Wrote {png_path}")
+        print(f"Wrote {png_path.resolve()}")
         return 0
 
     # GIF mode: play the move plan over the chosen number of frames.
@@ -169,12 +172,13 @@ def main(argv: list[str] | None = None) -> int:
             move_state["applied"] = target_idx
 
     gif_path = runs / f"{wall.wall_id}-physics.gif"
+    print(f"Saving GIF → {gif_path.resolve()}")
     render_animation(
         world, gif_path,
         n_frames=n_frames,
         on_frame=on_frame,
     )
-    print(f"Wrote {gif_path}")
+    print(f"Wrote {gif_path.resolve()}")
     return 0
 
 
