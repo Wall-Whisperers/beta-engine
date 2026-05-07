@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Beta Engine — Physics</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a; color: #e2e8f0; min-height: 100vh;
+    }
+    header {
+      background: #1e293b; border-bottom: 1px solid #334155;
+      padding: 1rem 1.5rem; display: flex; align-items: center; gap: 1rem;
+    }
+    header h1 { font-size: 1.1rem; font-weight: 600; color: #f8fafc; }
+    header a  { color: #94a3b8; font-size: 0.85rem; text-decoration: none; }
+    header a:hover { color: #cbd5e1; }
+
+    main {
+      max-width: 1000px; margin: 0 auto; padding: 2rem 1.5rem;
+      display: grid; grid-template-columns: 300px 1fr; gap: 1.5rem;
+    }
+
+    .panel {
+      background: #1e293b; border: 1px solid #334155;
+      border-radius: 10px; padding: 1.25rem;
+    }
+    .panel h2 {
+      font-size: 0.8rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.08em; color: #64748b; margin-bottom: 1rem;
+    }
+
+    label {
+      display: block; font-size: 0.8rem; color: #94a3b8;
+      margin-bottom: 0.25rem; margin-top: 0.75rem;
+    }
+    label:first-of-type { margin-top: 0; }
+
+    input[type=number], select {
+      width: 100%; background: #0f172a; border: 1px solid #334155;
+      border-radius: 6px; color: #e2e8f0; padding: 0.4rem 0.6rem;
+      font-size: 0.85rem;
+    }
+    select option { background: #1e293b; }
+
+    .btn {
+      display: block; width: 100%; margin-top: 1rem;
+      padding: 0.55rem; border: none; border-radius: 7px;
+      font-size: 0.85rem; font-weight: 600; cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn-blue { background: #3b82f6; color: #fff; }
+
+    .status {
+      margin-top: 0.75rem; font-size: 0.8rem; color: #94a3b8;
+      min-height: 1.4em;
+    }
+    .status.ok  { color: #22c55e; }
+    .status.err { color: #ef4444; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      display: inline-block; width: 10px; height: 10px;
+      border: 2px solid #475569; border-top-color: #94a3b8;
+      border-radius: 50%; animation: spin .7s linear infinite;
+      margin-right: 6px; vertical-align: middle;
+    }
+
+    /* ── Viewer ── */
+    .viewer-panel { display: flex; flex-direction: column; gap: 0.75rem; }
+    .frame-wrap {
+      position: relative; background: #020617; border-radius: 8px;
+      overflow: hidden; min-height: 420px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .frame-wrap img { max-width: 100%; max-height: 560px; display: block; }
+    .frame-wrap .placeholder {
+      color: #334155; font-size: 0.85rem;
+    }
+    .nav-arrow {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      background: rgba(30,41,59,.75); border: none; color: #e2e8f0;
+      font-size: 1.4rem; padding: 0.5rem 0.7rem; border-radius: 6px;
+      cursor: pointer; z-index: 10;
+    }
+    .nav-arrow:hover { background: rgba(51,65,85,.9); }
+    .nav-arrow.left  { left:  8px; }
+    .nav-arrow.right { right: 8px; }
+
+    .controls-row {
+      display: flex; align-items: center; gap: 0.5rem;
+    }
+    .frame-slider {
+      flex: 1; accent-color: #3b82f6;
+    }
+    .frame-label {
+      font-size: 0.75rem; color: #64748b; white-space: nowrap; min-width: 60px; text-align: right;
+    }
+    .btn-play {
+      background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
+      border-radius: 6px; padding: 0.3rem 0.7rem; cursor: pointer;
+      font-size: 0.8rem;
+    }
+    .btn-play:hover { background: #334155; }
+
+    .move-label {
+      font-size: 0.8rem; color: #94a3b8; text-align: center; min-height: 1.4em;
+    }
+
+    .meta-row {
+      display: flex; gap: 1rem; font-size: 0.75rem; color: #64748b; flex-wrap: wrap;
+    }
+    .meta-row span b { color: #cbd5e1; }
+
+    .stable-badge {
+      display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px;
+      font-size: 0.7rem; font-weight: 700;
+    }
+    .stable-badge.yes { background: #14532d; color: #4ade80; }
+    .stable-badge.no  { background: #7f1d1d; color: #f87171; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Beta Engine — Physics Simulation</h1>
+  <a href="/">← Editor</a>
+</header>
+
+<main>
+  <!-- Left panel -->
+  <div class="panel">
+    <h2>Simulate</h2>
+
+    <label>Wall</label>
+    <select id="wall-select"><option value="">Loading…</option></select>
+
+    <label>Height (cm)</label>
+    <input type="number" id="height" value="175" min="140" max="220" />
+
+    <label>Wingspan (cm)</label>
+    <input type="number" id="wingspan" value="175" min="130" max="230" />
+
+    <label>Mass (kg)</label>
+    <input type="number" id="mass" value="70" min="40" max="120" />
+
+    <button class="btn btn-blue" id="btn-simulate">Simulate</button>
+    <div class="status" id="sim-status"></div>
+  </div>
+
+  <!-- Right panel -->
+  <div class="panel viewer-panel">
+    <h2>Physics Viewer</h2>
+
+    <div class="frame-wrap" id="frame-wrap">
+      <span class="placeholder">Run a simulation to see physics here</span>
+      <button class="nav-arrow left"  onclick="seekFrame(-1)">&#8592;</button>
+      <button class="nav-arrow right" onclick="seekFrame(+1)">&#8594;</button>
+    </div>
+
+    <div class="move-label" id="move-label"></div>
+
+    <div class="controls-row">
+      <button class="btn-play" id="btn-play" onclick="togglePlay()">&#9654; Play</button>
+      <input type="range" class="frame-slider" id="frame-slider"
+             min="0" max="0" value="0" oninput="goToFrame(+this.value)" />
+      <span class="frame-label" id="frame-label">— / —</span>
+    </div>
+
+    <div class="meta-row" id="meta-row"></div>
+  </div>
+</main>
+
+<script>
+// ── Wall list ──────────────────────────────────────────────────────────────
+async function loadWallList() {
+  const sel = document.getElementById('wall-select');
+  try {
+    const r = await fetch('/api/walls');
+    const d = await r.json();
+    sel.innerHTML = d.walls.map(id =>
+      `<option value="${id}">${id}</option>`
+    ).join('');
+  } catch { sel.innerHTML = '<option>Error loading walls</option>'; }
+}
+loadWallList();
+
+// ── Frame state ────────────────────────────────────────────────────────────
+let _frames = [];
+let _moves  = [];
+let _frameIdx = 0;
+let _playTimer = null;
+
+function goToFrame(i) {
+  if (!_frames.length) return;
+  _frameIdx = Math.max(0, Math.min(_frames.length - 1, i));
+
+  const img = document.getElementById('frame-img');
+  if (img) img.src = 'data:image/png;base64,' + _frames[_frameIdx];
+
+  document.getElementById('frame-slider').value = _frameIdx;
+  document.getElementById('frame-label').textContent =
+    `${_frameIdx + 1} / ${_frames.length}`;
+
+  const label = _frameIdx === 0 ? 'Start pose'
+      : (_moves[_frameIdx - 1] || `Step ${_frameIdx}`);
+  document.getElementById('move-label').textContent = label;
+}
+
+function seekFrame(delta) { goToFrame(_frameIdx + delta); }
+
+function togglePlay() {
+  const btn = document.getElementById('btn-play');
+  if (_playTimer) {
+    clearInterval(_playTimer);
+    _playTimer = null;
+    btn.textContent = '▶ Play';
+  } else {
+    if (_frameIdx >= _frames.length - 1) goToFrame(0);
+    btn.textContent = '⏸ Pause';
+    _playTimer = setInterval(() => {
+      if (_frameIdx >= _frames.length - 1) {
+        clearInterval(_playTimer); _playTimer = null;
+        btn.textContent = '▶ Play';
+      } else { goToFrame(_frameIdx + 1); }
+    }, 900);
+  }
+}
+
+function _showFrames(frames, moves, wallId, nMoves, expanded, stable) {
+  _frames   = frames;
+  _moves    = moves;
+  _frameIdx = 0;
+
+  const wrap = document.getElementById('frame-wrap');
+  let img = document.getElementById('frame-img');
+  if (!img) {
+    img = document.createElement('img');
+    img.id = 'frame-img';
+    wrap.innerHTML = '';
+    wrap.appendChild(img);
+    ['left','right'].forEach(dir => {
+      const btn = document.createElement('button');
+      btn.className = `nav-arrow ${dir}`;
+      btn.innerHTML = dir === 'left' ? '&#8592;' : '&#8594;';
+      btn.onclick = () => seekFrame(dir === 'left' ? -1 : 1);
+      wrap.appendChild(btn);
+    });
+  }
+
+  const slider = document.getElementById('frame-slider');
+  slider.max   = frames.length - 1;
+  slider.value = 0;
+
+  document.getElementById('meta-row').innerHTML =
+    `<span><b>${wallId}</b></span>` +
+    `<span>moves: <b>${nMoves}</b></span>` +
+    `<span>expanded: <b>${expanded}</b></span>` +
+    `<span>final stable: <span class="stable-badge ${stable ? 'yes' : 'no'}">${stable ? 'YES' : 'NO'}</span></span>`;
+
+  goToFrame(0);
+}
+
+// ── Simulate ───────────────────────────────────────────────────────────────
+document.getElementById('btn-simulate').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-simulate');
+  const st  = document.getElementById('sim-status');
+  const wall_id = document.getElementById('wall-select').value;
+  if (!wall_id) { st.textContent = 'Select a wall first.'; st.className='status err'; return; }
+
+  btn.disabled = true;
+  st.innerHTML = '<span class="spinner"></span>Running A* + physics…';
+  st.className = 'status';
+
+  try {
+    const r = await fetch('/api/physics/simulate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wall_id,
+        height_cm:   +document.getElementById('height').value,
+        wingspan_cm: +document.getElementById('wingspan').value,
+        mass_kg:     +document.getElementById('mass').value,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || 'Server error');
+    if (!d.solved) {
+      st.textContent = 'No solution found for this wall.';
+      st.className = 'status err';
+      return;
+    }
+    _showFrames(d.frames, d.moves, wall_id, d.n_moves, d.expanded, d.stable);
+    st.textContent = `Done — ${d.n_moves} moves, ${d.frames.length} frames.`;
+    st.className = 'status ok';
+  } catch (e) {
+    st.textContent = 'Error: ' + e.message;
+    st.className = 'status err';
+  } finally { btn.disabled = false; }
+});
+
+// ── Keyboard ───────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft')  seekFrame(-1);
+  if (e.key === 'ArrowRight') seekFrame(+1);
+});
+</script>
+</body>
+</html>

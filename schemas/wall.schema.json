@@ -19,8 +19,25 @@
       "required": ["cols", "rows"],
       "properties": {
         "cols": { "type": "integer", "minimum": 1, "maximum": 200 },
-        "rows": { "type": "integer", "minimum": 1, "maximum": 200 }
+        "rows": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "cell_size_cm": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Real-world size of one grid cell in centimetres. Used by the physics + reachability layers; defaults to 20 cm if absent."
+        }
       }
+    },
+    "wall_angle_deg": {
+      "type": "number",
+      "minimum": -45,
+      "maximum": 45,
+      "description": "Deviation from vertical. 0 = vertical, +ve = overhang (top tilted toward the climber), -ve = slab. Physics layer rotates gravity by this angle in the wall-plane."
+    },
+    "surface_friction": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2,
+      "description": "Friction coefficient for the bare wall surface (used for smearing). 0 = ice, 0.7 ≈ chalked plastic, 1.0+ ≈ very textured wall."
     },
     "holds": {
       "type": "array",
@@ -63,7 +80,24 @@
           "description": "Hex code (#RRGGBB) or any free-form color name."
         },
         "is_start": { "type": "boolean" },
-        "is_finish": { "type": "boolean" }
+        "is_finish": { "type": "boolean" },
+        "friction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Per-hold friction coefficient. Optional; physics layer falls back to a per-type default if absent."
+        },
+        "positivity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "How much the hold mechanically catches the hand/foot. 1 = a perfect bucket, 0 = a tiny smear. Drives max usable force in the physics layer."
+        },
+        "max_force_n": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Optional explicit cap on the load this hold can take in newtons. If absent, derived from positivity + grip strength."
+        }
       }
     }
   }
