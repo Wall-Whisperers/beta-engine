@@ -28,6 +28,7 @@ import numpy as np
 
 from src.parsers import format1
 from src.xml_gen import scene as scene_mod
+from src.viewer import launch as viewer_launch
 from src.xml_gen.wall import (
     COS_A,
     SIN_A,
@@ -93,23 +94,6 @@ def _print_sanity_checks(route, xml_str):
     return xs, ys, zs
 
 
-def _launch_viewer(model, data):
-    """Attempt to open the MuJoCo interactive viewer.
-
-    On macOS, MuJoCo's passive viewer requires the script to be run under
-    mjpython (MuJoCo's bundled Python runtime with display support).
-    If launch_passive raises RuntimeError for this reason, the error is
-    re-raised so the caller can fall back gracefully.
-    """
-    import mujoco.viewer
-    print("\nOpening MuJoCo viewer — close the window to exit.")
-    print("(On macOS: if this fails, run with:  mjpython scripts/day1_viewer.py)")
-    with mujoco.viewer.launch_passive(model, data) as viewer:
-        while viewer.is_running():
-            mujoco.mj_step(model, data)
-            viewer.sync()
-
-
 def main():
     # ── Load and select route ─────────────────────────────────────────────────
     print(f"Loading routes from {_MOONBOARD1_PATH} ...")
@@ -154,14 +138,8 @@ def main():
         print("--- End scene XML ---")
         sys.exit(1)
 
-    # ── Launch viewer ─────────────────────────────────────────────────────────
-    viewer_ok = False
-    try:
-        _launch_viewer(model, data)
-        viewer_ok = True
-    except Exception as exc:
-        print(f"\nVIEWER UNAVAILABLE ({type(exc).__name__}: {exc})")
-        print(f"VIEWER UNAVAILABLE - scene XML written to output/scene_day1.xml")
+    # ── Launch viewer (pure visualisation — no grip interaction) ─────────────
+    viewer_launch(model, data, title="MoonBoard Day 1 — Visualisation")
 
 if __name__ == "__main__":
     main()

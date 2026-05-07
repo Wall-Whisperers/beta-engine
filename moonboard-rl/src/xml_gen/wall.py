@@ -19,6 +19,8 @@ Wall surface outward normal (pointing toward climber):
 
 import math
 
+import numpy as np
+
 # ── Physical constants ────────────────────────────────────────────────────────
 SPACING: float = 0.20       # metres between adjacent holds
 NUM_COLS: int = 11          # columns A–K
@@ -34,8 +36,8 @@ _ANGLE_RAD = math.radians(OVERHANG_DEG)
 SIN_A: float = math.sin(_ANGLE_RAD)   # ≈ 0.6428
 COS_A: float = math.cos(_ANGLE_RAD)   # ≈ 0.7660
 
-# Wall outward normal (toward climber).
-WALL_NORMAL = (0.0, COS_A, -SIN_A)
+# Wall outward normal (toward climber) as a numpy unit vector.
+WALL_NORMAL: np.ndarray = np.array([0.0, COS_A, -SIN_A])
 
 # Wall box half-extents in the box's LOCAL frame (before rotation):
 #   x-half: (10 columns × 0.20 m / 2) + 0.2 m margin
@@ -109,3 +111,20 @@ def wall_xml() -> str:
         ),
     ]
     return "\n".join(lines)
+
+
+def hold_body_name(col: int, row: int) -> str:
+    """Return the deterministic MuJoCo body name for a hold at (col, row).
+
+    The name format is ``hold_{col}_{row}`` where col is 0-indexed (0=A, 10=K)
+    and row is 1-indexed (1–18).  This matches the names emitted by holds_xml()
+    and is used by GripManager to look up body indices via mj_name2id at runtime.
+
+    Args:
+        col: 0-indexed column number (0 = column A, 10 = column K).
+        row: 1-indexed row number (1 = bottom, 18 = top).
+
+    Returns:
+        Body name string, e.g. ``"hold_5_8"`` for column F, row 8.
+    """
+    return f"hold_{col}_{row}"
