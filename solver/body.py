@@ -362,10 +362,19 @@ def _pick_leg_joint(
     limb: Limb,
     com_x: float,
 ) -> Optional[np.ndarray]:
-    """Pick the IK solution whose knee points outward from the body center.
+    """Pick the IK solution whose knee is on the anatomically correct side.
 
-    Left leg: prefer knee to the left of the hip.
-    Right leg: prefer knee to the right of the hip.
+    Rule: the knee must be on the OUTWARD side of the hip→foot line.
+    Cross product of (foot - hip) × (knee - hip):
+      - Positive (CCW) = knee is to the LEFT of the hip→foot direction → correct for LF
+      - Negative (CW)  = knee is to the RIGHT of the hip→foot direction → correct for RF
+
+    This matches the one hard anatomical constraint that holds in all 2D
+    climbing positions: the knee can only flex forward/outward, never
+    hyperextend backward through the hip→foot line.
+
+    When both solutions land on the same side (near-vertical reach), fall
+    back to preferring the one further from the body midline.
     """
     j_up = solve_2link_ik(anchor, target, upper, lower, elbow_up=True)
     j_dn = solve_2link_ik(anchor, target, upper, lower, elbow_up=False)
@@ -375,10 +384,32 @@ def _pick_leg_joint(
         return j_dn
     if j_dn is None:
         return j_up
+
+    d = target - anchor  # hip → foot vector
+
+    def cross(j: np.ndarray) -> float:
+        e = j - anchor
+        return float(d[0] * e[1] - d[1] * e[0])
+
+    c_up = cross(j_up)
+    c_dn = cross(j_dn)
+
     if limb == "LF":
-        return j_up if j_up[0] <= j_dn[0] else j_dn   # prefer knee further left
+        # Want positive cross (knee left of hip→foot line).
+        if c_up >= 0 and c_dn < 0:
+            return j_up
+        if c_dn >= 0 and c_up < 0:
+            return j_dn
+        # Both on same side — prefer furthest left (smallest x).
+        return j_up if j_up[0] <= j_dn[0] else j_dn
     else:
-        return j_up if j_up[0] >= j_dn[0] else j_dn   # prefer knee further right
+        # Want negative cross (knee right of hip→foot line).
+        if c_dn <= 0 and c_up > 0:
+            return j_dn
+        if c_up <= 0 and c_dn > 0:
+            return j_up
+        # Both on same side — prefer furthest right (largest x).
+        return j_up if j_up[0] >= j_dn[0] else j_dn
 
 
 def resolve_skeleton(
