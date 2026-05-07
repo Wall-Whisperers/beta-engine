@@ -191,12 +191,20 @@ def pose_anatomy_ok(wall: Wall, pose: Pose) -> bool:
     if pts["LF"] is not None and pts["RF"] is not None:
         if pts["LF"][0] - pts["RF"][0] > FOOT_CROSSOVER_LIMIT_CM:
             return False
-    # No two end-effectors at the exact same patch of wall.
+    # No two end-effectors at the exact same patch of wall —
+    # except both hands matching the same finish hold is explicitly allowed.
+    finish_ids = {h.hold_id for h in wall.finishes()}
     placed = [(l, p) for l, p in pts.items() if p is not None]
-    for i, (_, a) in enumerate(placed):
-        for _, b in placed[i + 1:]:
+    for i, (la, a) in enumerate(placed):
+        for lb, b in placed[i + 1:]:
             if float(np.linalg.norm(a - b)) < END_EFFECTOR_MIN_SEPARATION_CM:
-                return False
+                matching_hands = (
+                    la in HAND_LIMBS and lb in HAND_LIMBS
+                    and pose.get(la) in finish_ids
+                    and pose.get(la) == pose.get(lb)
+                )
+                if not matching_hands:
+                    return False
     return True
 
 
