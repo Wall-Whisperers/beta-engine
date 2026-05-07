@@ -46,7 +46,7 @@ import numpy as np
 import pymunk
 
 from physics import config as cfg
-from solver.body import BodyModel, LIMB_POLES, solve_2link_ik_pole
+from solver.body import BodyModel, _pick_arm_joint, _pick_leg_joint
 
 Limb = Literal["LH", "RH", "LF", "RF"]
 LIMBS: tuple[Limb, ...] = ("LH", "RH", "LF", "RF")
@@ -178,7 +178,11 @@ class PhysicsBody:
         is_arm = limb in HAND_LIMBS
         upper = (bm.upper_arm() if is_arm else bm.upper_leg()) / cfg.CM_PER_M
         lower = (bm.lower_arm() if is_arm else bm.lower_leg()) / cfg.CM_PER_M
-        joint = solve_2link_ik_pole(anchor, target, upper, lower, LIMB_POLES[limb])
+        if is_arm:
+            joint = _pick_arm_joint(anchor, target, upper, lower, limb)
+        else:
+            com_x = float(self.torso.position[0])
+            joint = _pick_leg_joint(anchor, target, upper, lower, limb, com_x)
         if joint is None:
             return 0.5 * (anchor + target)
         return np.array(joint)

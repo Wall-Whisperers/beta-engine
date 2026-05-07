@@ -219,10 +219,18 @@ def reachable_holds(
         candidates = (h for h in wall.holds if h.usable_for_foot())
 
     occupied = {pose.LH, pose.RH, pose.LF, pose.RF} - {None, pose.get(limb)}
-    return [
-        h for h in candidates
-        if h.hold_id not in occupied and can_reach(body, com, limb, h)
-    ]
+    finish_ids = {h.hold_id for h in wall.finishes()}
+
+    def _allowed(h: Hold) -> bool:
+        if h.hold_id in occupied:
+            # Allow both hands to match the same finish hold.
+            if limb in HAND_LIMBS and h.hold_id in finish_ids:
+                other_hand = "RH" if limb == "LH" else "LH"
+                return pose.get(other_hand) == h.hold_id
+            return False
+        return True
+
+    return [h for h in candidates if _allowed(h) and can_reach(body, com, limb, h)]
 
 
 def _all_limbs_reachable(body: BodyModel, wall: Wall, pose: Pose) -> bool:
