@@ -200,7 +200,7 @@ function buildClimberMeshes(profile) {
 //     }
 //
 //     pose.static.holds = {
-//       hold_id: { world_pos, wall_normal, radius, is_start, is_finish, color }
+//       hold_id: { world_pos, wall_normal, radius, protrude, is_start, is_finish, color }
 //     }
 //
 // We DO NOT recompute the geometry on the JS side any more — that's
@@ -219,9 +219,12 @@ function buildWallAndHolds(pose) {
     );
     plate.receiveShadow = true;
     plate.position.set(...wallStatic.centre);
-    // Rotate around X by +theta. Three.js Object3D.rotation is intrinsic
-    // Tait-Bryan XYZ; setting only x is fine when the others are 0.
-    plate.rotation.x = theta;
+    // Three.js uses a Y-up-style right-handed X rotation matrix:
+    // local +Z maps to (0, -sin(a), cos(a)). MuJoCo's wall local +Z
+    // maps to (0, +sin(theta), cos(theta)), so the browser rotation is
+    // the negative of the MJCF axis-angle. Using +theta makes 40°
+    // MoonBoards render as an X: wall one way, body/holds the other.
+    plate.rotation.x = -theta;
     scene.add(plate);
 
     // Holds. Each hold is a small protruding cylinder. Cylinder default
@@ -234,16 +237,25 @@ function buildWallAndHolds(pose) {
         const radius = info.radius;
         const colorHex = info.color || '#888888';
 
-        // Cylinder body — colored as in the editor.
+        // Cylinder body — colored as in the editor. Server world_pos is
+        // the OUTER FACE/tip used for limb attachment; three.js wants the
+        // cylinder centre, so move back half the protrusion along the wall
+        // normal. Without this, holds float in front of steep walls.
         const mat = new THREE.MeshStandardMaterial({
             color: new THREE.Color(colorHex),
             roughness: 0.5,
         });
+        const protrude = info.protrude ?? 0.04;
+        const n = info.wall_normal;
         const cyl = new THREE.Mesh(
-            new THREE.CylinderGeometry(radius, radius, 0.04, 16),
+            new THREE.CylinderGeometry(radius, radius, protrude, 16),
             mat,
         );
-        cyl.position.set(...info.world_pos);
+        cyl.position.set(
+            info.world_pos[0] - n[0] * protrude * 0.5,
+            info.world_pos[1] - n[1] * protrude * 0.5,
+            info.world_pos[2] - n[2] * protrude * 0.5,
+        );
         cyl.rotation.x = -theta;
         cyl.castShadow = true;
         scene.add(cyl);
@@ -258,17 +270,15 @@ function buildWallAndHolds(pose) {
             );
             // Position the ring at the hold's base on the wall surface.
             // Move it back along the wall normal a tiny amount.
-            const n = info.wall_normal;
             ring.position.set(
-                info.world_pos[0] - n[0] * 0.025,
-                info.world_pos[1] - n[1] * 0.025,
-                info.world_pos[2] - n[2] * 0.025,
+                info.world_pos[0] - n[0] * (protrude + 0.001),
+                info.world_pos[1] - n[1] * (protrude + 0.001),
+                info.world_pos[2] - n[2] * (protrude + 0.001),
             );
-            // Ring lies in its local XY-plane, normal +Z. Rotate so its
-            // normal aligns with the wall outward normal.
-            ring.rotation.x = -theta + Math.PI / 2;
-            // Because RingGeometry's "front face" is +Z, rotating around X by
-            // (-theta + π/2) puts the disc parallel to the wall surface.
+            // RingGeometry's normal is local +Z. Rotate it to the wall
+            // outward normal (0, cosθ, -sinθ). For three.js X rotations
+            // that is -theta - π/2.
+            ring.rotation.x = -theta - Math.PI / 2;
             scene.add(ring);
             holdRings[hid] = ring;
         }

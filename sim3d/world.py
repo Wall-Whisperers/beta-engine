@@ -765,25 +765,31 @@ class Climb3DWorld:
                     "world_pos": list(meta["world_pos"]),
                     "wall_normal": list(meta["wall_normal"]),
                     "radius": radius,
+                    "protrude": _cfg.HOLD_PROTRUDE_M,
                     "is_start": meta["is_start"],
                     "is_finish": meta["is_finish"],
                     "color": self.wall.by_id(meta["hold_id"]).color,
                 }
 
-            # Plate centre needs to match the builder's lift-for-floor
-            # logic, so re-derive from the actual hold positions.
-            cz_base = (plate_h / 2.0) * math.cos(theta)
+            # Plate centre must exactly match builder._build_wall_xml.
+            # If this drifts, especially on 40° MoonBoard overhangs, the
+            # browser shows the wall on one diagonal while MuJoCo/body/holds
+            # occupy another. Keep this math in lockstep with the MJCF.
             cy_base = (plate_h / 2.0) * math.sin(theta)
-            min_hold_z = min(
-                (h["world_pos"][2] for h in self._hold_meta_by_id.values()),
-                default=0.0,
-            )
-            # The lift offset in the builder is added to cz only.
-            # Approximating: the plate's bottom-near corner sits at the
-            # lowest point on the wall surface; the lowest hold sits
-            # slightly above that. The exact offset isn't critical for
-            # rendering — the holds drive correctness, the plate is
-            # just a visual backdrop sized to match.
+            cz_base = (plate_h / 2.0) * math.cos(theta)
+            if self.wall.holds:
+                cos_t0 = math.cos(theta)
+                sin_t0 = math.sin(theta)
+                local_y_tip0 = _cfg.WALL_THICKNESS_M / 2.0 + _cfg.HOLD_PROTRUDE_M
+                min_world_z = min(
+                    cz_base - local_y_tip0 * sin_t0
+                    + ((h.y_cm / 100.0) - plate_h / 2.0) * cos_t0
+                    for h in self.wall.holds
+                )
+                deficit = _cfg.FLOOR_Z + _cfg.HOLD_FLOOR_CLEARANCE - min_world_z
+                if deficit > 0:
+                    cz_base += deficit
+
             snap["static"] = {
                 "wall": {
                     "width_m": width_m,
