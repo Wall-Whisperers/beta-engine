@@ -300,58 +300,16 @@ def _pick_arm_joint(
     target: np.ndarray,
     upper: float,
     lower: float,
-    limb: "Limb",
+    limb: Limb,
 ) -> Optional[np.ndarray]:
-    """Pick the IK solution that places the elbow on the gravity side of the
-    shoulder-to-hand line.
+    """Pick the IK solution using pole-vector disambiguation.
 
-    For any non-vertical reach, one IK branch puts the elbow "below" the
-    shoulder→hold line (where gravity would pull it) and the other puts it
-    "above". We want the below branch.
-
-    Geometrically: the signed cross product of (hold-shoulder) and (elbow-shoulder)
-    tells which side the elbow is on. The "gravity side" is the one whose normal
-    component points downward — which corresponds to -sign(d.x) for the cross
-    product sign. Intuitively: reaching up-right → elbow drops to the right of
-    the line; reaching up-left → elbow drops to the left.
-
-    For near-vertical reaches (|d.x| < 8 cm) the cross-product rule is
-    degenerate so we fall back to: prefer lower y, then prefer the ipsilateral
-    side (LH elbow left, RH elbow right).
+    The pole vector encodes the anatomical preference: elbows go outward
+    (away from body midline) and downward. LH elbow prefers left+down,
+    RH elbow prefers right+down. This is stable across all reach directions,
+    including crossover moves where a hand reaches past the midline.
     """
-    j_up = solve_2link_ik(anchor, target, upper, lower, elbow_up=True)
-    j_dn = solve_2link_ik(anchor, target, upper, lower, elbow_up=False)
-    if j_up is None and j_dn is None:
-        return None
-    if j_up is None:
-        return j_dn
-    if j_dn is None:
-        return j_up
-
-    d = target - anchor
-    dx = float(d[0])
-
-    if abs(dx) >= 8.0:
-        # Cross product of (target-anchor) × (elbow-anchor): positive = CCW (left of line).
-        def cross(j: np.ndarray) -> float:
-            e = j - anchor
-            return float(d[0] * e[1] - d[1] * e[0])
-
-        # Gravity-side sign: -sign(dx). Reaching right → want elbow CW (cross < 0).
-        want_negative = dx > 0
-        c_up = cross(j_up)
-        c_dn = cross(j_dn)
-        # Pick the one whose cross sign matches what we want.
-        if want_negative:
-            return j_up if c_up <= c_dn else j_dn
-        else:
-            return j_up if c_up >= c_dn else j_dn
-    else:
-        # Near-vertical reach: prefer lower elbow, then prefer outward side.
-        lateral_sign = -1.0 if limb == "LH" else 1.0
-        score_up = -j_up[1] * 2.0 + lateral_sign * j_up[0]
-        score_dn = -j_dn[1] * 2.0 + lateral_sign * j_dn[0]
-        return j_up if score_up >= score_dn else j_dn
+    return solve_2link_ik_pole(anchor, target, upper, lower, LIMB_POLES[limb])
 
 
 def _pick_leg_joint(
@@ -362,54 +320,14 @@ def _pick_leg_joint(
     limb: Limb,
     com_x: float,
 ) -> Optional[np.ndarray]:
-    """Pick the IK solution whose knee is on the anatomically correct side.
+    """Pick the IK solution using pole-vector disambiguation.
 
-    Rule: the knee must be on the OUTWARD side of the hip→foot line.
-    Cross product of (foot - hip) × (knee - hip):
-      - Positive (CCW) = knee is to the LEFT of the hip→foot direction → correct for LF
-      - Negative (CW)  = knee is to the RIGHT of the hip→foot direction → correct for RF
-
-    This matches the one hard anatomical constraint that holds in all 2D
-    climbing positions: the knee can only flex forward/outward, never
-    hyperextend backward through the hip→foot line.
-
-    When both solutions land on the same side (near-vertical reach), fall
-    back to preferring the one further from the body midline.
+    Knees always prefer the outward lateral direction: left knee goes left,
+    right knee goes right. This is the anatomically correct projection of
+    "knee bends forward" into the 2D wall plane, and is robust to all foot
+    positions (below, above, same height, crossover).
     """
-    j_up = solve_2link_ik(anchor, target, upper, lower, elbow_up=True)
-    j_dn = solve_2link_ik(anchor, target, upper, lower, elbow_up=False)
-    if j_up is None and j_dn is None:
-        return None
-    if j_up is None:
-        return j_dn
-    if j_dn is None:
-        return j_up
-
-    d = target - anchor  # hip → foot vector
-
-    def cross(j: np.ndarray) -> float:
-        e = j - anchor
-        return float(d[0] * e[1] - d[1] * e[0])
-
-    c_up = cross(j_up)
-    c_dn = cross(j_dn)
-
-    if limb == "LF":
-        # Want positive cross (knee left of hip→foot line).
-        if c_up >= 0 and c_dn < 0:
-            return j_up
-        if c_dn >= 0 and c_up < 0:
-            return j_dn
-        # Both on same side — prefer furthest left (smallest x).
-        return j_up if j_up[0] <= j_dn[0] else j_dn
-    else:
-        # Want negative cross (knee right of hip→foot line).
-        if c_dn <= 0 and c_up > 0:
-            return j_dn
-        if c_up <= 0 and c_dn > 0:
-            return j_up
-        # Both on same side — prefer furthest right (largest x).
-        return j_up if j_up[0] >= j_dn[0] else j_dn
+    return solve_2link_ik_pole(anchor, target, upper, lower, LIMB_POLES[limb])
 
 
 def resolve_skeleton(
