@@ -56,6 +56,54 @@ _RESET_QUAT: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
 _RESET_PROXIMITY: float = 0.20
 _RESET_ALIGNMENT: float = -1.0
 
+# Foot proximity is very relaxed because legs in A-pose hang ~0.5 m below the
+# lowest holds on typical V4 routes.  The constraint snaps the foot to the hold
+# during the second warmup phase; slip detection is bypassed during warmup.
+_RESET_PROXIMITY_FEET: float = 0.50
+
+# qpos indices for the hip / knee joints used to set the climbing start pose.
+# The freejoint occupies qpos[0:7]; hinge joints start at qpos[7] in the order
+# they appear in humanoid.xml:
+#   [7]=abdomen_z  [8]=abdomen_y  [9]=abdomen_x
+#   [10]=right_hip_x  [11]=right_hip_z  [12]=right_hip_y  [13]=right_knee
+#   [14]=left_hip_x   [15]=left_hip_z   [16]=left_hip_y   [17]=left_knee
+#   [18..20]=right_shoulder/elbow  [21..23]=left_shoulder/elbow
+_QI_RIGHT_HIP_Y: int = 12   # range −110° to  20°
+_QI_RIGHT_KNEE:  int = 13   # range −160° to  −2°
+_QI_LEFT_HIP_Y:  int = 16   # range −110° to  20°
+_QI_LEFT_KNEE:   int = 17   # range −160° to  −2°
+
+# Hip flex and knee bend applied at reset to bring feet up toward the wall.
+# −80° is within the joint range for both joints and raises the foot site by
+# ≈ 0.1–0.2 m relative to A-pose, reducing the constraint snap distance.
+_RESET_HIP_Y: float = np.radians(-80.0)
+_RESET_KNEE:  float = np.radians(-80.0)
+
+# Physics steps (at model.opt.timestep resolution) to run after engaging grips
+# at reset so the constraint forces settle before the policy sees the first obs.
+# Without this, activating a connect constraint with a ~0.17 m hand-to-hold gap
+# creates a violent impulse that launches the humanoid on the very first step.
+# 50 steps × 2 ms timestep = 100 ms = 5 × the constraint time-constant (20 ms)
+# → 99% settled.  More steps slow down resets with no physical benefit.
+_RESET_WARMUP_STEPS: int = 50
+
+# Fall detection thresholds.
+# Torso z < this → fallen to the floor.
+# After warmup, a valid hanging torso sits at z ≈ 0.49 m (hands gripped at
+# z = 0.86 m, limp arms, gravity).  0.30 m leaves headroom for dynamic moves
+# while still catching a genuine fall (floor stops body at z ≈ 0.10 m).
+_FALL_Z_THRESHOLD: float = 0.30
+# Torso y > this → launched away from the wall face.
+# A hanging climber swings to y ≈ -0.4; the threshold is set to +1.0 so only
+# a clear forward launch (> 1 m past the hold face) triggers this condition.
+_FALL_Y_THRESHOLD: float = 1.0
+
+# Multiplier for high-water-mark height reward.
+_HWM_HEIGHT_SCALE: float = 5.0
+
+# Energy penalty coefficient (applied to squared joint targets each step).
+_ENERGY_PENALTY_COEFF: float = 0.01
+
 
 class MoonBoardEnv(gym.Env):
     """Gymnasium environment for MoonBoard climbing simulation.
@@ -238,8 +286,12 @@ class MoonBoardEnv(gym.Env):
             dtype=np.float32,
         )
 
+        # ── Foot hold selection (computed once from route, reused every reset) ──
+        self._foot_hold_names: tuple[str, str] = self._select_foot_holds()
+
         # ── Episode state (values set in reset) ───────────────────────────────
-        self._prev_pelvis_z: float = 0.0
+        self._reset_pelvis_z: float = 0.0   # pelvis z after warmup
+        self._max_pelvis_z: float = 0.0     # high-water mark for height reward (Fix 2)
         self._step_count: int = 0
         self._consec_finish_count: int = 0
         # Route-holds index of the current target hold for each limb slot.
@@ -251,6 +303,8 @@ class MoonBoardEnv(gym.Env):
         self._hand_mid_ptr: list[int] = [0, 0]
         # Ordered history of mid-hold pointers for foot lag computation.
         self._hand_mid_history: list[list[int]] = [[], []]
+        # Holds gripped for the first time this episode (yo-yo guard, Fix 3).
+        self._holds_matched_this_episode: set[str] = set()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Gymnasium interface
@@ -291,24 +345,21 @@ class MoonBoardEnv(gym.Env):
         # ── Physics reset ─────────────────────────────────────────────────────
         self._mj.mj_resetData(self._model, self._data)
 
-        # Hardcoded starting pose: torso near wall with arms in default A-pose.
-        # Grid search found this places lhand at 0.167 m and rhand at 0.178 m
-        # from hold_5_5 (the start hold sphere centre).
-        # TODO (Week 2): replace with Reference State Initialization (RSI).
+        # Starting pose: torso near wall in A-pose.
+        # TODO (Week 2): replace with Reference State Initialization (RSI) using
+        #   hip_y/knee angles to lift feet toward foot holds (requires route-specific IK).
         q = np.zeros(self._model.nq, dtype=np.float64)
         q[0] = _RESET_TORSO_X
         q[1] = _RESET_TORSO_Y
         q[2] = _RESET_TORSO_Z
-        q[3], q[4], q[5], q[6] = _RESET_QUAT  # 180° around Z
+        q[3], q[4], q[5], q[6] = _RESET_QUAT          # 180° around Z
         self._data.qpos[:] = q
         self._mj.mj_forward(self._model, self._data)
 
-        # ── Engage start grips ────────────────────────────────────────────────
-        # Both hand slots grip the first (and for this route, only) start hold.
-        # Thresholds are relaxed because the A-pose arm Z-axis does not face the
-        # wall and hand-to-hold distance (~0.17 m) exceeds the default 0.12 m
-        # proximity threshold.  Restored immediately after.
-        orig_prox = _gm_mod.PROXIMITY_THRESHOLD
+        # ── Phase 1: engage hand grips, warmup ──────────────────────────────
+        # Thresholds relaxed: A-pose hands are ~0.17 m from the start hold and
+        # the arm Z-axis does not yet face the wall.
+        orig_prox  = _gm_mod.PROXIMITY_THRESHOLD
         orig_align = _gm_mod.ALIGNMENT_THRESHOLD
         _gm_mod.PROXIMITY_THRESHOLD = _RESET_PROXIMITY
         _gm_mod.ALIGNMENT_THRESHOLD = _RESET_ALIGNMENT
@@ -321,47 +372,99 @@ class MoonBoardEnv(gym.Env):
             _gm_mod.PROXIMITY_THRESHOLD = orig_prox
             _gm_mod.ALIGNMENT_THRESHOLD = orig_align
 
-        # ── Verify both hands engaged ─────────────────────────────────────────
         active = self._grip_manager.get_active_hold_ids()
         if 0 not in active or 1 not in active:
             lhand_pos = np.array(self._data.site_xpos[self._site_ids[0]])
             rhand_pos = np.array(self._data.site_xpos[self._site_ids[1]])
-            start_worlds = [
-                self._hold_positions[n]
-                for n in (hold_body_name(h.col, h.row) for h in self._start_holds)
-                if n in self._hold_positions
-            ]
             raise RuntimeError(
                 f"[MoonBoardEnv] reset(): failed to grip both start holds.\n"
                 f"  Active grips after attempt: {active}\n"
                 f"  lhand site world pos: {lhand_pos}\n"
                 f"  rhand site world pos: {rhand_pos}\n"
-                f"  start hold world positions: {start_worlds}\n"
+                f"  start hold world positions: "
+                f"{[self._hold_positions[n] for n in start_names if n in self._hold_positions]}\n"
             )
 
+        # Settle the body with only hands gripped so the feet find their natural
+        # resting position before the foot constraints are added.
+        self._data.ctrl[:] = 0.0
+        for _ in range(_RESET_WARMUP_STEPS):
+            self._mj.mj_step(self._model, self._data)
+
+        # ── Phase 2: engage foot grips, warmup ──────────────────────────────
+        # Foot proximity is very relaxed (0.50 m) because the legs hang well
+        # below the lowest route holds.  The constraint closes the gap during
+        # phase-2 warmup; check_slip() is NOT called during mj_step here, so
+        # transient high forces don't auto-release the grip.
+        lfoot_hold, rfoot_hold = self._foot_hold_names
+        _gm_mod.PROXIMITY_THRESHOLD = _RESET_PROXIMITY_FEET
+        _gm_mod.ALIGNMENT_THRESHOLD = _RESET_ALIGNMENT
+        try:
+            self._grip_manager.try_grip(2, lfoot_hold)   # left foot
+            self._grip_manager.try_grip(3, rfoot_hold)   # right foot
+        finally:
+            _gm_mod.PROXIMITY_THRESHOLD = orig_prox
+            _gm_mod.ALIGNMENT_THRESHOLD = orig_align
+
+        for _ in range(_RESET_WARMUP_STEPS):
+            self._mj.mj_step(self._model, self._data)
+
+        # Zero residual velocities, then re-settle so the constraint is at
+        # true static equilibrium before the policy takes its first step.
+        # Without the re-settle, zeroing qvel while the body is mid-oscillation
+        # creates a zero-velocity / non-equilibrium state; the first mj_step
+        # then produces a constraint-force spike (>4000 N observed) that triggers
+        # check_slip() and releases the grip on step 1.
+        self._data.qvel[:] = 0.0
+        for _ in range(20):
+            self._mj.mj_step(self._model, self._data)
         self._mj.mj_forward(self._model, self._data)
+
+        # Verify active grips.  Feet may not engage if the route has no holds
+        # within the relaxed threshold; warn but don't crash.
+        active = self._grip_manager.get_active_hold_ids()
+        n_active = len(active)
+        if n_active < 4:
+            print(
+                f"[MoonBoardEnv] WARNING: reset() achieved only {n_active}/4 grips "
+                f"(active slots: {sorted(active.keys())}).  "
+                f"Foot holds '{lfoot_hold}'/'{rfoot_hold}' may be out of reach."
+            )
 
         # ── Reset episode counters ────────────────────────────────────────────
         self._step_count = 0
         self._consec_finish_count = 0
+        self._holds_matched_this_episode = set()   # Fix 3: yo-yo guard
 
         # ── Target hold sequencing init ───────────────────────────────────────
         # TODO (Week 2): replace with beta planner.
         self._hand_mid_ptr = [0, 0]
         self._hand_mid_history = [[], []]
         first_mid_ri = self._mid_holds_ri[0] if self._mid_holds_ri else 0
-        first_start_ri = self._start_holds_ri[0] if self._start_holds_ri else 0
+
+        # Foot slots target the selected foot hold (by route index).
+        lfoot_ri = next(
+            (i for i, h in enumerate(self._route.holds)
+             if hold_body_name(h.col, h.row) == lfoot_hold),
+            first_mid_ri,
+        )
+        rfoot_ri = next(
+            (i for i, h in enumerate(self._route.holds)
+             if hold_body_name(h.col, h.row) == rfoot_hold),
+            first_mid_ri,
+        )
         self._target_hold_indices = [
-            first_mid_ri,    # slot 0 (lhand) → first mid hold
-            first_mid_ri,    # slot 1 (rhand) → first mid hold (same)
-            first_start_ri,  # slot 2 (lfoot) → first start hold
-            first_start_ri,  # slot 3 (rfoot) → first start hold (same)
+            first_mid_ri,   # slot 0 (lhand) → first mid hold
+            first_mid_ri,   # slot 1 (rhand) → first mid hold
+            lfoot_ri,       # slot 2 (lfoot) → selected foot hold
+            rfoot_ri,       # slot 3 (rfoot) → selected foot hold
         ]
         self._prev_grip_target_state = [False, False, False, False]
 
-        # Initialise pelvis z for height-progress reward.
+        # Post-warmup pelvis z as the height baseline for this episode.
         pelvis_pos = np.array(self._data.xpos[self._torso_id])
-        self._prev_pelvis_z = float(pelvis_pos[2])
+        self._reset_pelvis_z = float(pelvis_pos[2])
+        self._max_pelvis_z   = self._reset_pelvis_z   # Fix 2: HWM init
 
         obs = self._get_obs()
         return obs, {}
@@ -421,14 +524,19 @@ class MoonBoardEnv(gym.Env):
                     self._advance_foot_target(slot)
 
         # ── Reward ────────────────────────────────────────────────────────────
-        reward, info = self._compute_reward(curr_grip_target)
+        reward, info = self._compute_reward(curr_grip_target, joint_targets)
 
         # Update grip-target history after computing reward (rising-edge uses prev).
         self._prev_grip_target_state = list(curr_grip_target)
 
         # ── Termination ───────────────────────────────────────────────────────
         pelvis_pos = np.array(self._data.xpos[self._torso_id])
-        fell = bool(pelvis_pos[2] < 0.2)
+        # Two fall conditions:
+        # 1. Torso dropped to floor level (z < 0.5 m).
+        # 2. Torso launched away from wall face (y > -0.40 m).
+        #    The wall face at start-hold level is y ≈ -0.99 m; anything above
+        #    -0.40 m is clearly off the wall and in free space.
+        fell = bool(pelvis_pos[2] < _FALL_Z_THRESHOLD or pelvis_pos[1] > _FALL_Y_THRESHOLD)
 
         both_on_finish = False
         if self._end_holds_ri:
@@ -592,43 +700,110 @@ class MoonBoardEnv(gym.Env):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compute_reward(
-        self, curr_grip_target: list[bool]
+        self,
+        curr_grip_target: list[bool],
+        joint_targets: np.ndarray,
     ) -> tuple[float, dict[str, float]]:
         """Compute base reward components (fall/finish bonuses added by step()).
 
+        Implements four exploit-prevention mechanisms:
+          Fix 2 — High-Water Mark height: reward only NEW upward progress.
+          Fix 3 — Yo-yo guard: each hold yields a match bonus at most once/episode.
+          Fix 4 — Energy penalty: discourage maximum-torque jitter.
+
         Args:
-            curr_grip_target: Per-slot bool — True if slot is gripping its
-                current target hold this step.
+            curr_grip_target: Per-slot bool — True if slot grips its target hold.
+            joint_targets: Float32 array (nu,) of joint position targets for
+                the current step, used to compute the energy penalty.
 
         Returns:
             Tuple of (total_base_reward, info_dict).  info_dict keys:
-                height_progress, hold_match_bonus, alive_bonus.
+                height_reward, hold_match_bonus, energy_penalty.
         """
         info: dict[str, float] = {}
 
-        # ── Height progress ───────────────────────────────────────────────────
+        # ── Fix 2: High-Water Mark height reward ─────────────────────────────
+        # Only reward NEW upward progress beyond the furthest point reached this
+        # episode.  An agent that climbs to hold N and hangs earns 0/step there;
+        # it must reach hold N+1 to earn any more height reward.  This prevents
+        # the "camper" exploit of climbing once and farming altitude reward.
         pelvis_z = float(np.array(self._data.xpos[self._torso_id])[2])
-        delta_z = pelvis_z - self._prev_pelvis_z
-        height_progress = float(np.clip(delta_z * 2.0, -0.1, 0.1))
-        self._prev_pelvis_z = pelvis_z
-        info["height_progress"] = height_progress
+        if pelvis_z > self._max_pelvis_z:
+            height_reward = float((pelvis_z - self._max_pelvis_z) * _HWM_HEIGHT_SCALE)
+            self._max_pelvis_z = pelvis_z
+        else:
+            height_reward = 0.0
+        info["height_reward"] = height_reward
 
-        # ── Hold match bonus (rising edge only) ───────────────────────────────
+        # ── Fix 3: Hold match bonus (rising edge + yo-yo guard) ───────────────
+        # Rising edge: only award when the slot transitions from not-gripping to
+        # gripping its target hold this step.
+        # Yo-yo guard: each target hold's bonus is awarded at most once per
+        # episode.  After the first award the hold ID is added to
+        # _holds_matched_this_episode so releasing and re-gripping yields nothing.
         hold_match_bonus = 0.0
+        active = self._grip_manager.get_active_hold_ids()
         for slot in range(4):
-            if curr_grip_target[slot] and not self._prev_grip_target_state[slot]:
+            rising = curr_grip_target[slot] and not self._prev_grip_target_state[slot]
+            if not rising:
+                continue
+            th = self._route.holds[self._target_hold_indices[slot]]
+            hold_name = hold_body_name(th.col, th.row)
+            if hold_name not in self._holds_matched_this_episode:
                 hold_match_bonus += 5.0
+                self._holds_matched_this_episode.add(hold_name)
         info["hold_match_bonus"] = hold_match_bonus
 
-        # ── Alive bonus ───────────────────────────────────────────────────────
-        info["alive_bonus"] = 0.1
+        # ── Fix 4: Energy penalty ─────────────────────────────────────────────
+        # Penalise large joint targets every step.  Discourages the "jitter"
+        # exploit where the agent outputs maximum torques on all joints (which
+        # wastes energy and produces violent, unrealistic movement) because pure
+        # torque vibration earns negative reward and no height progress.
+        energy_penalty = float(
+            -_ENERGY_PENALTY_COEFF * np.sum(np.square(joint_targets))
+        )
+        info["energy_penalty"] = energy_penalty
 
-        total = height_progress + hold_match_bonus + 0.1
+        total = height_reward + hold_match_bonus + energy_penalty
         return total, info
 
     # ─────────────────────────────────────────────────────────────────────────
     # Target hold sequencing
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _select_foot_holds(self) -> tuple[str, str]:
+        """Pick the two lowest holds on the route as starting foot holds.
+
+        Selection rules:
+          1. Sort all route holds by row (ascending).
+          2. Take the hold(s) at the minimum row.
+          3. Among those, assign the leftmost column to the left foot (slot 2)
+             and the rightmost to the right foot (slot 3).
+          4. If there is only one hold at the minimum row, use it for both feet.
+          5. If there are no holds in the model at all, fall back to the first
+             hold in the route.
+
+        Returns:
+            Tuple (lfoot_hold_name, rfoot_hold_name) as hold body name strings.
+        """
+        available = [
+            h for h in self._route.holds
+            if hold_body_name(h.col, h.row) in self._hold_body_ids
+        ]
+        if not available:
+            # Degenerate route — use start hold for both feet.
+            fallback = hold_body_name(
+                self._start_holds[0].col, self._start_holds[0].row
+            ) if self._start_holds else "hold_5_5"
+            return fallback, fallback
+
+        min_row = min(h.row for h in available)
+        lowest = [h for h in available if h.row == min_row]
+        lowest_sorted = sorted(lowest, key=lambda h: h.col)
+
+        lfoot = hold_body_name(lowest_sorted[0].col, lowest_sorted[0].row)
+        rfoot = hold_body_name(lowest_sorted[-1].col, lowest_sorted[-1].row)
+        return lfoot, rfoot
 
     def _advance_hand_target(self, hand_slot: int) -> None:
         """Advance a hand slot's target to the next available mid hold.

@@ -49,8 +49,12 @@ This will:
 | `test_grip.py` | `mjpython scripts/test_grip.py` | Automated grip pipeline test (500 steps, logs forces) |
 | `interactive_grip.py` | `mjpython scripts/interactive_grip.py` | Manual grip testing with key bindings |
 | `test_env.py` | `python3 scripts/test_env.py` | Gymnasium `check_env` validation + 3 random rollouts |
+| `sanity_check.py` | `python3 scripts/sanity_check.py` | Scripted policy test: no-NaN, reward components, step pipeline |
+| `train_ppo_smoke.py` | `python3 scripts/train_ppo_smoke.py` | PPO training (1M steps) with TensorBoard + mp4 video callbacks |
+| `clean_output.py` | `python3 scripts/clean_output.py --yes` | Delete videos, model checkpoints, and TensorBoard logs |
+| `watch_random_agent.py` | `mjpython scripts/watch_random_agent.py` | Watch random or trained agent in real time (MuJoCo viewer) |
 
-`day1_viewer.py`, `test_grip.py`, and `interactive_grip.py` fall back to headless/log-only mode automatically when `mjpython` is unavailable.  `test_env.py` runs with plain `python3`.
+`day1_viewer.py`, `test_grip.py`, `interactive_grip.py`, and `watch_random_agent.py` require `mjpython` on macOS for the interactive viewer.  All other scripts run with plain `python3`.
 
 ### Interactive Grip Key Bindings
 
@@ -86,11 +90,18 @@ moonboard-rl/
   assets/
     humanoid.xml      — MuJoCo humanoid model (from Gymnasium assets)
   scripts/
-    day1_viewer.py      — Pure visualisation
-    test_grip.py        — Automated grip pipeline test
-    interactive_grip.py — Manual grip tester with key bindings
-    test_env.py         — Gymnasium check_env + 3 random rollouts
-  output/             — Auto-created; scene XML written here on fallback
+    day1_viewer.py        — Pure visualisation
+    test_grip.py          — Automated grip pipeline test
+    interactive_grip.py   — Manual grip tester with key bindings
+    test_env.py           — Gymnasium check_env + 3 random rollouts
+    sanity_check.py       — Scripted policy sanity check (no-NaN, rewards)
+    train_ppo_smoke.py    — PPO 1M-step smoke test with TensorBoard + mp4
+    watch_random_agent.py — Watch random or trained agent in real time
+  output/
+    tb_logs/            — TensorBoard logs (created by train_ppo_smoke.py)
+    checkpoints/        — Saved PPO model weights (.zip)
+    videos/             — Evaluation rollout mp4s (smoke_<step>.mp4)
+  requirements.txt
   requirements.txt
 ```
 
@@ -229,10 +240,79 @@ import gymnasium as gym
 import src.envs  # triggers gym.register("MoonBoard-v0")
 ```
 
+## PPO Training (Day 5)
+
+### Sanity check
+
+Verifies the env pipeline (no NaN, correct reward components, >20 steps with a scripted policy):
+
+```bash
+python3 scripts/sanity_check.py          # headless
+python3 scripts/sanity_check.py --render # with MuJoCo viewer
+```
+
+Exit code 0 = PASS, 1 = FAIL.
+
+### Training
+
+```bash
+python3 scripts/train_ppo_smoke.py                  # 1M steps (default)
+python3 scripts/train_ppo_smoke.py --timesteps 200000  # quick smoke test
+python3 scripts/train_ppo_smoke.py --seed 42
+```
+
+Outputs:
+- **TensorBoard** logs → `output/tb_logs/`
+- **Evaluation videos** → `output/videos/smoke_<step>.mp4` every 100k steps
+- **Final model** → `output/checkpoints/smoke_final.zip`
+
+### Visualisation
+
+```bash
+# Monitor training metrics in real time:
+tensorboard --logdir moonboard-rl/output/tb_logs
+
+# Watch the trained agent:
+mjpython scripts/watch_random_agent.py --policy output/checkpoints/smoke_final.zip
+
+# Watch random agent (no training needed):
+mjpython scripts/watch_random_agent.py
+
+# Open a saved evaluation video:
+open output/videos/smoke_100000.mp4   # macOS
+```
+
+### PPO hyperparameters
+
+| Parameter | Value |
+|-----------|-------|
+| policy | MlpPolicy |
+| n_steps | 2048 |
+| batch_size | 64 |
+| n_epochs | 10 |
+| learning_rate | 3e-4 |
+| ent_coef | 0.01 |
+| clip_range | 0.2 |
+| gamma | 0.99 |
+| gae_lambda | 0.95 |
+
+### TensorBoard tags
+
+| Tag | Description |
+|-----|-------------|
+| `reward/alive_bonus` | Mean alive bonus per step |
+| `reward/height_progress` | Mean height-progress reward per step |
+| `reward/hold_match_bonus` | Mean hold-match bonus per step |
+| `reward/fall_penalty` | Mean fall penalty per step |
+| `reward/finish_bonus` | Mean finish bonus per step |
+| `rollout/ep_rew_mean` | Mean episode reward (SB3 default) |
+| `rollout/ep_len_mean` | Mean episode length (SB3 default) |
+
 ## Build Phases
 
 - **Day 1** ✅ — Wall + holds visualisation, humanoid in scene, all three JSON parsers
 - **Days 2–3** ✅ — Connect constraint grip mechanic, GripManager, slip detection, interactive viewer
 - **Day 4** ✅ — Gymnasium `Env` wrapper: action/observation spaces, `reset()`, `step()`, reward v0, target hold sequencing, `check_env` passing
-- **Week 2** — RSI reset poses, beta planner, PPO training loop with stable-baselines3
+- **Day 5** ✅ — Sanity check script, PPO smoke test (1M steps), TensorBoard logging, mp4 video callbacks, `watch_random_agent.py` for real-time policy visualisation
+- **Week 2** — RSI reset poses, beta planner, shaped reward tuning, longer training runs
 - **Week 3+** — RL training on synthetic walls, AMP discriminator, transfer to real routes

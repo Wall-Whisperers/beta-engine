@@ -185,12 +185,21 @@ def build_scene_xml(route: Route, humanoid_xml_path: str) -> str:
     # ── Worldbody ─────────────────────────────────────────────────────────────
     worldbody = ET.SubElement(scene, "worldbody")
 
+    # Main light: from above-behind, casts wall shadows.
     light = ET.SubElement(worldbody, "light")
     light.set("name", "main_light")
-    light.set("diffuse", ".9 .9 .9")
+    light.set("diffuse", ".8 .8 .8")
     light.set("pos", "0 -1 5")
     light.set("dir", "0 0.2 -1")
     light.set("directional", "true")
+    # Fill light: from in front of the wall so the climbing face is visible.
+    fill = ET.SubElement(worldbody, "light")
+    fill.set("name", "fill_light")
+    fill.set("diffuse", ".6 .6 .6")
+    fill.set("ambient", ".1 .1 .1")
+    fill.set("pos", "0 3 4")
+    fill.set("dir", "0 -0.4 -1")
+    fill.set("directional", "true")
 
     _inject_xml_fragment(worldbody, wall_xml())
     _inject_xml_fragment(worldbody, holds_xml(route.holds))

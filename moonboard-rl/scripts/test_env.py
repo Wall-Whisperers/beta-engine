@@ -14,10 +14,13 @@ sys.path.insert(0, _PROJECT_ROOT)
 import warnings
 
 import numpy as np
+import gymnasium as gym
 from gymnasium.utils.env_checker import check_env
+import mujoco
 
 from src.parsers import format1
 from src.envs.moonboard_env import MoonBoardEnv
+from src.xml_gen import scene as scene_mod
 
 _MOONBOARD1 = os.path.join(_PROJECT_ROOT, "moonboard_data", "moonboard1.json")
 _HUMANOID = os.path.join(_PROJECT_ROOT, "assets", "humanoid.xml")
@@ -155,10 +158,8 @@ def main() -> None:
     print(f"{'='*60}")
     print(f"  nq={env._nj_pos + 7}  nv={env._nj_vel + 6}  nu={env._nu}")
 
-    import mujoco
     _tmp_routes = format1.load_routes(_MOONBOARD1)
     _tmp_route = _select_route(_tmp_routes)
-    from src.xml_gen import scene as scene_mod
     _xml = scene_mod.build_scene_xml(_tmp_route, _HUMANOID)
     _model = mujoco.MjModel.from_xml_string(_xml)
     pp = float(_model.opt.timestep) * 10

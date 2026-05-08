@@ -60,9 +60,20 @@ ALIGNMENT_THRESHOLD: float = 0.70
 normal for grip to engage.  Cosine 0.70 ≈ 45.5°.  Set to -1.0 in tests/
 interactive mode where the arm is in a neutral default orientation."""
 
-MAX_CONSTRAINT_FORCE: float = 500.0
+MAX_CONSTRAINT_FORCE: float = 6000.0
 """Force magnitude (Newtons) above which a grip auto-releases (slip detection).
-500 N is roughly 3× bodyweight on one limb — generous for a test harness."""
+
+Rationale: the MuJoCo humanoid weighs 43.7 kg (429 N total).
+  Static two-handed hang:  ~215 N per constraint.
+  Dynamic deadpoint moves:  3-5× per-limb BW → 650-1070 N.
+  Initialization transient: the connect constraint engages ~0.17 m from the
+    hold surface at reset; solref="0.02 1" then produces a stiff spring force
+    of ~4000-4400 N for the first 1-2 substeps until the constraint gap closes.
+  True free-fall slip: body falling at ≥ 3 m/s stopped in ~20 ms →
+    F = m·Δv/Δt ≈ 43.7 × 3 / 0.02 ≈ 6500 N.
+6000 N sits above the initialization transient (4400 N) and just below the
+free-fall threshold (≈6500 N), so the constraint releases on genuine falls
+while tolerating the reset settling spike."""
 
 
 class GripManager:
