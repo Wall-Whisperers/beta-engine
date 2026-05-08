@@ -48,8 +48,9 @@ This will:
 | `day1_viewer.py` | `mjpython scripts/day1_viewer.py` | Pure visualisation — wall, holds, humanoid, no grip |
 | `test_grip.py` | `mjpython scripts/test_grip.py` | Automated grip pipeline test (500 steps, logs forces) |
 | `interactive_grip.py` | `mjpython scripts/interactive_grip.py` | Manual grip testing with key bindings |
+| `test_env.py` | `python3 scripts/test_env.py` | Gymnasium `check_env` validation + 3 random rollouts |
 
-All three fall back to headless/log-only mode automatically when `mjpython` is unavailable.
+`day1_viewer.py`, `test_grip.py`, and `interactive_grip.py` fall back to headless/log-only mode automatically when `mjpython` is unavailable.  `test_env.py` runs with plain `python3`.
 
 ### Interactive Grip Key Bindings
 
@@ -79,13 +80,16 @@ moonboard-rl/
     grip/
       grip_manager.py — GripManager: connect constraint retargeting, slip detection
     viewer.py         — Unified viewer entry point (key callbacks, on_step hook)
-    envs/             — Gymnasium environments (Day 4+, placeholder for now)
+    envs/
+      moonboard_env.py — MoonBoardEnv(gymnasium.Env): reset/step/obs/reward
+      __init__.py      — make_env() factory + gymnasium.register("MoonBoard-v0")
   assets/
     humanoid.xml      — MuJoCo humanoid model (from Gymnasium assets)
   scripts/
     day1_viewer.py      — Pure visualisation
     test_grip.py        — Automated grip pipeline test
     interactive_grip.py — Manual grip tester with key bindings
+    test_env.py         — Gymnasium check_env + 3 random rollouts
   output/             — Auto-created; scene XML written here on fallback
   requirements.txt
 ```
@@ -163,11 +167,72 @@ A MuJoCo `connect` equality constraint pins a point in body1's local frame to a 
 3. **`anchor2 = R_hold.T @ (site_world - hold_world)`** — where the site currently sits, in the hold body's local frame. **Critical:** without this step MuJoCo enforces the pose from model-load time and the arm snaps violently.
 4. **`data.eq_active[eq_id] = 1`** — use `data.eq_active` (runtime), not `model.eq_active0` (load-time default; has no effect after simulation starts).
 
+## Gymnasium Environment (Day 4)
+
+`MoonBoardEnv` is a fully compliant `gymnasium.Env` (passes `check_env` with 0 errors, 0 warnings).
+
+### Action space — `Box(21,)`
+
+| Indices | Content | Bounds |
+|---------|---------|--------|
+| `[0:17]` | Joint position targets (17 actuators) | `ctrlrange` per joint `[-0.4, 0.4]` |
+| `[17:21]` | Grip intent signals, one per limb slot | `[-1.0, 1.0]` |
+
+A grip intent `> 0.0` tells the env to attempt `try_grip` on that slot's current target hold; `≤ 0.0` releases.
+
+### Observation space — `Box(133,)`
+
+| Stream | Indices | Content | Dim |
+|--------|---------|---------|-----|
+| Proprioception | `[0:65]` | Joint pos/vel, pelvis pos + 6D rot + linvel + angvel, 4 limb sites in pelvis frame, grip state | 65 |
+| Exteroception | `[65:121]` | 8 nearest holds × (3 rel_pos + 3 role_onehot + 1 gripping_flag) | 56 |
+| Goal | `[121:133]` | Per-limb (target_world − site_world) vectors | 12 |
+
+### Reward function v0
+
+| Component | Value | Condition |
+|-----------|-------|-----------|
+| Height progress | `clip(Δz × 2, −0.1, 0.1)` | Every step |
+| Hold match bonus | `+5.0` per slot | Rising edge: slot just gripped its target hold |
+| Alive bonus | `+0.1` | Every non-terminal step |
+| Fall penalty | `−10.0` | Pelvis z < 0.2 m |
+| Finish bonus | `+50.0` | Both hands on finish hold for 10 consecutive steps |
+
+### Key constants
+
+| Parameter | Value |
+|-----------|-------|
+| `nq` | 24 (7 freejoint + 17 hinge) |
+| `nv` | 23 (6 freejoint + 17 hinge) |
+| `nu` (actuators) | 17 |
+| Policy period | 0.030 s (`timestep=0.003 × substeps=10`) |
+| Max episode steps | 2000 |
+
+### Usage
+
+```python
+from src.parsers import format1
+from src.envs.moonboard_env import MoonBoardEnv
+
+routes = format1.load_routes("moonboard_data/moonboard1.json")
+route = max([r for r in routes if r.grade_v == 4], key=lambda r: r.repeats)
+env = MoonBoardEnv(route=route, humanoid_xml_path="assets/humanoid.xml")
+
+obs, _ = env.reset()
+obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+```
+
+Or via gymnasium registry:
+
+```python
+import gymnasium as gym
+import src.envs  # triggers gym.register("MoonBoard-v0")
+```
+
 ## Build Phases
 
 - **Day 1** ✅ — Wall + holds visualisation, humanoid in scene, all three JSON parsers
 - **Days 2–3** ✅ — Connect constraint grip mechanic, GripManager, slip detection, interactive viewer
-- **Fixes** ✅ — Site-based anchoring (hand tip not elbow), unified viewer module, interactive key bindings
-- **Day 4** — Gymnasium `Env` wrapper: observation space, action space, `reset()`, `step()`
-- **Week 2** — Basic reward function, PPO training loop with stable-baselines3
-- **Week 3+** — RL training on synthetic walls, transfer to real routes
+- **Day 4** ✅ — Gymnasium `Env` wrapper: action/observation spaces, `reset()`, `step()`, reward v0, target hold sequencing, `check_env` passing
+- **Week 2** — RSI reset poses, beta planner, PPO training loop with stable-baselines3
+- **Week 3+** — RL training on synthetic walls, AMP discriminator, transfer to real routes
