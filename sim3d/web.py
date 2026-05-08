@@ -9,8 +9,11 @@ under `/sim3d/*`. From the browser:
     GET  /sim3d/api/session/<sid>/pose → current pose snapshot (JSON)
     POST /sim3d/api/session/<sid>/step → step the sim by N frames
     POST /sim3d/api/session/<sid>/move → move a limb to a hold
-    POST /sim3d/api/session/<sid>/seed → re-seed the pose
-    DELETE /sim3d/api/session/<sid>    → drop the session
+    POST /sim3d/api/session/<sid>/seed        → re-seed the pose
+    POST /sim3d/api/session/<sid>/policy      → load an SB3 PPO run/model
+    POST /sim3d/api/session/<sid>/policy/step → apply one policy action
+    DELETE /sim3d/api/session/<sid>/policy    → clear the loaded policy
+    DELETE /sim3d/api/session/<sid>           → drop the session
 
 Sessions are kept in memory only — they're a debug aid, not a
 multi-tenant production endpoint. One Climb3DWorld per session.
@@ -23,22 +26,24 @@ viewer. With 60 Hz steps the lock is held for <1 ms — fine.
 """
 from __future__ import annotations
 
+import json
 import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from flask import Blueprint, abort, jsonify, request, send_from_directory
 
 from sim3d import Climb3DWorld, ClimberProfile
 from sim3d.body import LIMBS
+from sim3d.env import Climbing3DEnv, EnvConfig
 from sim3d.moonboard import (
     load_moonboard_problems,
     moonboard_problem_to_wall,
     find_problem,
 )
-from solver.wall import load_wall
+from solver.wall import Wall, load_wall
 
 bp = Blueprint("sim3d", __name__, url_prefix="/sim3d")
 
@@ -48,11 +53,29 @@ bp = Blueprint("sim3d", __name__, url_prefix="/sim3d")
 MOONBOARD_DIR = Path("/data/moonboard")
 MOONBOARD_DIR_FALLBACK = Path(__file__).resolve().parent.parent / "data" / "moonboard"
 MOONBOARD_DATA_DIR_FALLBACK = Path(__file__).resolve().parent.parent / "moonboard_data"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SIM3D_RUNS_DIR = REPO_ROOT / "data" / "runs" / "sim3d"
+
+
+@dataclass
+class _PolicyState:
+    model: Any
+    env: Climbing3DEnv
+    obs: Any
+    run_path: str
+    model_path: str
+    config: dict[str, Any]
+    last_info: dict[str, Any] = field(default_factory=dict)
+    done: bool = False
 
 
 @dataclass
 class _Session:
     world: Climb3DWorld
+    wall: Wall
+    profile: ClimberProfile
+    source: dict[str, Any]
+    policy: Optional[_PolicyState] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -95,6 +118,152 @@ def _moonboard_files_unique() -> list[Path]:
     return out
 
 
+def _find_moonboard_file(name_or_path: str) -> Path:
+    raw = Path(name_or_path)
+    candidates = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.extend([raw, REPO_ROOT / raw])
+        candidates.extend(d / raw.name for d in _moonboard_dirs())
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(f"moonboard file not found: {name_or_path}")
+
+
+def _wall_response(wall: Wall) -> dict[str, Any]:
+    return {
+        "wall_id": wall.wall_id,
+        "name": wall.name,
+        "width_m": wall.width_cm / 100.0,
+        "height_m": wall.height_cm / 100.0,
+        "wall_angle_deg": wall.wall_angle_deg,
+        "n_holds": len(wall.holds),
+    }
+
+
+def _load_wall_from_request(payload: dict[str, Any]) -> tuple[Wall, dict[str, Any]]:
+    wall_id = payload.get("wall_id", "example-v2-boulder")
+    moonboard_file = payload.get("moonboard_file")
+    moonboard_problem_id = payload.get("moonboard_problem_id")
+    moonboard_vertical = bool(payload.get("moonboard_vertical_projection", False))
+
+    if moonboard_file is not None:
+        target = _find_moonboard_file(str(moonboard_file))
+        problems = load_moonboard_problems(target)
+        problem = None
+        if moonboard_problem_id is not None:
+            problem = find_problem(problems, id=int(moonboard_problem_id))
+        if problem is None:
+            problem = problems[0] if problems else None
+        if problem is None:
+            raise FileNotFoundError("no problems in MoonBoard file")
+        wall = moonboard_problem_to_wall(
+            problem, vertical_projection=moonboard_vertical,
+        )
+        return wall, {
+            "kind": "moonboard",
+            "moonboard_file": target.name,
+            "moonboard_problem_id": problem.id,
+            "moonboard_vertical_projection": moonboard_vertical,
+            "selected_value": f"moonboard:{target.name}:{problem.id}",
+        }
+
+    wall = load_wall(wall_id)
+    return wall, {
+        "kind": "wall",
+        "wall_id": wall.wall_id,
+        "selected_value": wall.wall_id,
+    }
+
+
+def _load_wall_from_train_config(cfg: dict[str, Any]) -> tuple[Wall, dict[str, Any]]:
+    if cfg.get("moonboard_file"):
+        return _load_wall_from_request({
+            "moonboard_file": cfg["moonboard_file"],
+            "moonboard_problem_id": cfg.get("moonboard_problem_id"),
+            "moonboard_vertical_projection": bool(
+                cfg.get("moonboard_vertical_projection", False)
+            ),
+        })
+    return _load_wall_from_request({"wall_id": cfg.get("wall", "example-v2-boulder")})
+
+
+def _seed_world(wall: Wall, world: Climb3DWorld) -> None:
+    starts = sorted(wall.starts(), key=lambda h: h.x_cm)
+    foots = sorted(
+        [h for h in wall.holds if h.usable_for_foot()],
+        key=lambda h: (h.y_cm, h.x_cm),
+    )[:2]
+    if len(starts) >= 2 and len(foots) >= 2:
+        lh, rh = starts[0].hold_id, starts[-1].hold_id
+    elif len(starts) == 1:
+        lh = rh = starts[0].hold_id
+    else:
+        hand_low = sorted(
+            [h for h in wall.holds if h.usable_for_hand()],
+            key=lambda h: (h.y_cm, h.x_cm),
+        )[:2]
+        lh, rh = (
+            (hand_low[0].hold_id, hand_low[-1].hold_id)
+            if hand_low else (None, None)
+        )
+    if lh is not None and rh is not None and len(foots) >= 2:
+        l_foot, r_foot = sorted(foots, key=lambda h: h.x_cm)
+        world.seed_pose(
+            lh=lh, rh=rh,
+            lf=l_foot.hold_id, rf=r_foot.hold_id,
+        )
+
+
+def _resolve_run_path(path_text: str) -> tuple[Path, Path, Path]:
+    if not path_text.strip():
+        raise FileNotFoundError("run path is required")
+    raw = Path(path_text.strip()).expanduser()
+    candidates = [raw]
+    if not raw.is_absolute():
+        candidates.extend([REPO_ROOT / raw, SIM3D_RUNS_DIR / raw])
+    run_path = next((p for p in candidates if p.exists()), None)
+    if run_path is None:
+        raise FileNotFoundError(f"run path not found: {path_text}")
+
+    model_path = run_path / "model.zip" if run_path.is_dir() else run_path
+    if not model_path.exists():
+        raise FileNotFoundError(f"model.zip not found under: {run_path}")
+
+    config_path = model_path.parent / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"config.json not found next to model: {model_path}"
+        )
+    return run_path, model_path, config_path
+
+
+def _policy_response(s: _Session, *, include_static: bool = False) -> dict[str, Any]:
+    policy = None
+    if s.policy is not None:
+        policy = {
+            "loaded": True,
+            "run_path": s.policy.run_path,
+            "model_path": s.policy.model_path,
+            "done": s.policy.done,
+            "last_info": s.policy.last_info,
+            "config": s.policy.config,
+        }
+    return {
+        "wall": _wall_response(s.wall),
+        "source": s.source,
+        "profile": {
+            "height_cm": s.profile.height_cm,
+            "wingspan_cm": s.profile.wingspan_cm,
+            "mass_kg": s.profile.mass_kg,
+        },
+        "pose": s.world.pose_snapshot(include_static=include_static),
+        "policy": policy,
+    }
+
+
 @bp.route("/api/moonboard", methods=["GET"])
 def list_moonboard_files():
     """List MoonBoard problem-JSON files available to the server."""
@@ -120,42 +289,15 @@ def list_moonboard_files():
 @bp.route("/api/session", methods=["POST"])
 def create_session():
     payload = request.get_json(silent=True) or {}
-    wall_id = payload.get("wall_id", "example-v2-boulder")
     height_cm = float(payload.get("height_cm", 175))
     wingspan_cm = float(payload.get("wingspan_cm", 175))
     mass_kg = float(payload.get("mass_kg", 70))
     seed = bool(payload.get("seed", True))
 
-    moonboard_file = payload.get("moonboard_file")
-    moonboard_problem_id = payload.get("moonboard_problem_id")
-    moonboard_vertical = bool(payload.get("moonboard_vertical_projection", False))
-
-    if moonboard_file is not None:
-        # Load a MoonBoard problem rather than a stored wall.
-        target = None
-        for d in _moonboard_dirs():
-            cand = d / moonboard_file
-            if cand.exists():
-                target = cand
-                break
-        if target is None:
-            abort(404, description=f"moonboard file not found: {moonboard_file}")
-        problems = load_moonboard_problems(target)
-        problem = None
-        if moonboard_problem_id is not None:
-            problem = find_problem(problems, id=int(moonboard_problem_id))
-        if problem is None:
-            problem = problems[0] if problems else None
-        if problem is None:
-            abort(404, description="no problems in MoonBoard file")
-        wall = moonboard_problem_to_wall(
-            problem, vertical_projection=moonboard_vertical,
-        )
-    else:
-        try:
-            wall = load_wall(wall_id)
-        except (FileNotFoundError, KeyError) as e:
-            abort(404, description=f"wall not found: {e}")
+    try:
+        wall, source = _load_wall_from_request(payload)
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        abort(404, description=str(e))
 
     profile = ClimberProfile(
         height_cm=height_cm,
@@ -165,54 +307,16 @@ def create_session():
     world = Climb3DWorld(wall, profile)
 
     if seed:
-        starts = sorted(wall.starts(), key=lambda h: h.x_cm)
-        foots = sorted(
-            [h for h in wall.holds if h.usable_for_foot()],
-            key=lambda h: (h.y_cm, h.x_cm),
-        )[:2]
-        if len(starts) >= 2 and len(foots) >= 2:
-            lh, rh = starts[0].hold_id, starts[-1].hold_id
-        elif len(starts) == 1:
-            lh = rh = starts[0].hold_id
-        else:
-            hand_low = sorted(
-                [h for h in wall.holds if h.usable_for_hand()],
-                key=lambda h: (h.y_cm, h.x_cm),
-            )[:2]
-            lh, rh = (
-                (hand_low[0].hold_id, hand_low[-1].hold_id)
-                if hand_low else (None, None)
-            )
-        if lh is not None and rh is not None and len(foots) >= 2:
-            l_foot, r_foot = sorted(foots, key=lambda h: h.x_cm)
-            world.seed_pose(
-                lh=lh, rh=rh,
-                lf=l_foot.hold_id, rf=r_foot.hold_id,
-            )
+        _seed_world(wall, world)
 
     sid = uuid.uuid4().hex[:12]
+    session = _Session(world=world, wall=wall, profile=profile, source=source)
     with _sessions_lock:
-        _sessions[sid] = _Session(world=world)
+        _sessions[sid] = session
 
-    return jsonify({
-        "session_id": sid,
-        "wall": {
-            "wall_id": wall.wall_id,
-            "name": wall.name,
-            "width_m": wall.width_cm / 100.0,
-            "height_m": wall.height_cm / 100.0,
-            "wall_angle_deg": wall.wall_angle_deg,
-            "n_holds": len(wall.holds),
-        },
-        "profile": {
-            "height_cm": profile.height_cm,
-            "wingspan_cm": profile.wingspan_cm,
-            "mass_kg": profile.mass_kg,
-        },
-        # include_static gives the viewer per-hold geometry (radius,
-        # normal direction, etc.) so it can render the wall correctly.
-        "pose": world.pose_snapshot(include_static=True),
-    })
+    response = _policy_response(session, include_static=True)
+    response["session_id"] = sid
+    return jsonify(response)
 
 
 @bp.route("/api/session/<sid>", methods=["DELETE"])
@@ -267,7 +371,101 @@ def move_limb(sid: str):
             s.world.move_limb(limb, hold_id, mode=mode)
         except (KeyError, ValueError) as e:
             abort(400, description=str(e))
+        s.policy = None
         return jsonify(s.world.pose_snapshot())
+
+
+@bp.route("/api/session/<sid>/policy", methods=["POST"])
+def load_policy(sid: str):
+    s = _get(sid)
+    payload = request.get_json(silent=True) or {}
+    run_text = str(payload.get("run_path", ""))
+    try:
+        run_path, model_path, config_path = _resolve_run_path(run_text)
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        wall, source = _load_wall_from_train_config(cfg)
+    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError) as e:
+        abort(400, description=str(e))
+
+    profile = ClimberProfile(
+        height_cm=float(cfg.get("height_cm", 175.0)),
+        wingspan_cm=float(cfg.get("wingspan_cm", 175.0)),
+        mass_kg=float(cfg.get("mass_kg", 70.0)),
+    )
+    env_cfg = EnvConfig(
+        move_mode=str(cfg.get("move_mode", "reach")),
+        move_frames=int(cfg.get("move_frames", 24)),
+        max_steps=int(cfg.get("max_episode_steps", 30)),
+        enable_slip=bool(cfg.get("enable_slip", True)),
+    )
+
+    try:
+        from stable_baselines3 import PPO
+        model = PPO.load(str(model_path))
+        env = Climbing3DEnv(wall, profile=profile, config=env_cfg)
+        obs, info = env.reset()
+    except Exception as e:  # SB3/MuJoCo shape errors should be surfaced clearly.
+        abort(400, description=f"failed to load policy: {e}")
+
+    with s.lock:
+        s.wall = wall
+        s.profile = profile
+        s.source = source
+        s.world = env.world
+        s.policy = _PolicyState(
+            model=model,
+            env=env,
+            obs=obs,
+            run_path=str(run_path),
+            model_path=str(model_path),
+            config=cfg,
+            last_info=info,
+        )
+        return jsonify(_policy_response(s, include_static=True))
+
+
+@bp.route("/api/session/<sid>/policy/step", methods=["POST"])
+def step_policy(sid: str):
+    s = _get(sid)
+    payload = request.get_json(silent=True) or {}
+    deterministic = bool(payload.get("deterministic", True))
+    with s.lock:
+        if s.policy is None:
+            abort(400, description="no policy loaded")
+        if s.policy.done:
+            obs, info = s.policy.env.reset()
+            s.policy.obs = obs
+            s.policy.last_info = info
+            s.policy.done = False
+            s.world = s.policy.env.world
+
+        action, _ = s.policy.model.predict(
+            s.policy.obs, deterministic=deterministic,
+        )
+        obs, reward, term, trunc, info = s.policy.env.step(action)
+        s.policy.obs = obs
+        s.policy.done = bool(term or trunc)
+        s.policy.last_info = info
+        s.world = s.policy.env.world
+
+        response = _policy_response(s)
+        action_serial = action.tolist() if hasattr(action, "tolist") else action
+        response["policy_step"] = {
+            "action": action_serial,
+            "reward": float(reward),
+            "terminated": bool(term),
+            "truncated": bool(trunc),
+            "info": info,
+        }
+        return jsonify(response)
+
+
+@bp.route("/api/session/<sid>/policy", methods=["DELETE"])
+def clear_policy(sid: str):
+    s = _get(sid)
+    with s.lock:
+        s.policy = None
+        return jsonify(_policy_response(s, include_static=True))
 
 
 @bp.route("/api/session/<sid>/seed", methods=["POST"])
@@ -280,4 +478,5 @@ def seed_pose(sid: str):
             s.world.seed_pose(**kwargs)
         except KeyError as e:
             abort(400, description=str(e))
+        s.policy = None
         return jsonify(s.world.pose_snapshot())

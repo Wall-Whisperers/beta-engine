@@ -22,9 +22,11 @@ const LIMBS = ['LH', 'RH', 'LF', 'RF'];
 let bodyMeshes = {};
 let holdMeshes = {};
 let holdRings = {};       // start/finish markers
-let session = null;       // {id, wall, profile, holdsByID}
+let wallPlate = null;
+let session = null;       // {id, wall, profile, pose, policy}
 let pollTimer = null;
 let liveTimer = null;
+let policyTimer = null;
 
 // ─── three.js scene ────────────────────────────────────────────────────────
 const canvas = document.getElementById('canvas');
@@ -327,8 +329,69 @@ function applyPose(pose) {
     // Update status panel
     const com = pose.bodies.pelvis ? pose.bodies.pelvis.pos : [0, 0, 0];
     const limbStr = LIMBS.map(l => `${l}: ${pose.limbs[l] ?? '·'}`).join('\n');
+    const policyStr = session?.policy
+        ? `\npolicy = ${session.policy.done ? 'done/reset on next step' : 'loaded'}\nrun = ${session.policy.run_path}`
+        : '';
     document.getElementById('status').textContent =
-        `t = ${pose.t.toFixed(2)} s\npelvis = (${com.map(v => v.toFixed(2)).join(', ')})\n${limbStr}`;
+        `t = ${pose.t.toFixed(2)} s\npelvis = (${com.map(v => v.toFixed(2)).join(', ')})\n${limbStr}${policyStr}`;
+}
+
+function clearSceneMeshes() {
+    for (const m of Object.values(bodyMeshes)) scene.remove(m);
+    for (const m of Object.values(holdMeshes)) scene.remove(m);
+    for (const m of Object.values(holdRings)) scene.remove(m);
+    if (wallPlate) scene.remove(wallPlate);
+    bodyMeshes = {};
+    holdMeshes = {};
+    holdRings = {};
+    wallPlate = null;
+}
+
+function setPolicyButtons(loaded) {
+    document.getElementById('policy-step').disabled = !loaded;
+    document.getElementById('policy-play').disabled = !loaded;
+    document.getElementById('policy-clear').disabled = !loaded;
+}
+
+function syncWallSelect(source) {
+    if (!source?.selected_value) return;
+    const sel = document.getElementById('wall-select');
+    let opt = [...sel.options].find(o => o.value === source.selected_value);
+    if (!opt) {
+        opt = document.createElement('option');
+        opt.value = source.selected_value;
+        opt.textContent = source.kind === 'moonboard'
+            ? `MoonBoard ${source.moonboard_file} · #${source.moonboard_problem_id}`
+            : source.selected_value;
+        sel.appendChild(opt);
+    }
+    sel.value = source.selected_value;
+}
+
+function applySessionState(j, sessionId = session?.id) {
+    session = {
+        id: sessionId,
+        wall: j.wall,
+        source: j.source,
+        profile: j.profile,
+        pose: j.pose,
+        policy: j.policy,
+    };
+    syncWallSelect(j.source);
+    document.getElementById('height').value = j.profile.height_cm;
+    document.getElementById('wingspan').value = j.profile.wingspan_cm;
+    document.getElementById('mass').value = j.profile.mass_kg;
+
+    clearSceneMeshes();
+    bodyMeshes = buildClimberMeshes(j.profile);
+    for (const m of Object.values(bodyMeshes)) scene.add(m);
+    wallPlate = buildWallAndHolds(j.pose);
+    applyPose(j.pose);
+    frameCamera(j.pose);
+    populateLimbControls(j.pose);
+    setPolicyButtons(Boolean(j.policy));
+    document.getElementById('reset-btn').disabled = false;
+    document.getElementById('demo-btn').disabled = false;
 }
 
 // ─── Wall list ────────────────────────────────────────────────────────────
@@ -365,15 +428,14 @@ async function loadWallList() {
 
 // ─── Session control ──────────────────────────────────────────────────────
 async function startSession() {
+    if (policyTimer) {
+        clearInterval(policyTimer);
+        policyTimer = null;
+        document.getElementById('policy-play').textContent = '▶ Play policy';
+    }
     if (session) {
         await fetch(`/sim3d/api/session/${session.id}`, { method: 'DELETE' });
-        // Tear down old meshes
-        for (const m of Object.values(bodyMeshes)) scene.remove(m);
-        for (const m of Object.values(holdMeshes)) scene.remove(m);
-        for (const m of Object.values(holdRings)) scene.remove(m);
-        bodyMeshes = {};
-        holdMeshes = {};
-        holdRings = {};
+        clearSceneMeshes();
     }
 
     const selectedWall = document.getElementById('wall-select').value;
@@ -400,17 +462,7 @@ async function startSession() {
         return;
     }
     const j = await r.json();
-    session = { id: j.session_id, wall: j.wall, profile: j.profile, pose: j.pose };
-
-    bodyMeshes = buildClimberMeshes(j.profile);
-    for (const m of Object.values(bodyMeshes)) scene.add(m);
-    buildWallAndHolds(j.pose);
-    applyPose(j.pose);
-    frameCamera(j.pose);
-
-    populateLimbControls(j.pose);
-    document.getElementById('reset-btn').disabled = false;
-    document.getElementById('demo-btn').disabled = false;
+    applySessionState(j, j.session_id);
 }
 
 function populateLimbControls(pose) {
@@ -435,7 +487,11 @@ function populateLimbControls(pose) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ limb, hold_id: sel.value, mode: 'reach' }),
             });
-            if (r.ok) applyPose(await r.json());
+            if (r.ok) {
+                if (session) session.policy = null;
+                setPolicyButtons(false);
+                applyPose(await r.json());
+            }
         };
         row.appendChild(sel);
         ctrls.appendChild(row);
@@ -449,7 +505,11 @@ async function moveLimb(limb, holdId, mode = 'reach') {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ limb, hold_id: holdId, mode }),
     });
-    if (r.ok) applyPose(await r.json());
+    if (r.ok) {
+        if (session) session.policy = null;
+        setPolicyButtons(false);
+        applyPose(await r.json());
+    }
 }
 
 async function demoFakeMoves() {
@@ -479,6 +539,66 @@ async function step(frames) {
     if (r.ok) applyPose(await r.json());
 }
 
+
+async function ensureSession() {
+    if (!session) await startSession();
+    return Boolean(session);
+}
+
+async function loadPolicy() {
+    if (!(await ensureSession())) return;
+    const runPath = document.getElementById('policy-path').value.trim();
+    if (!runPath) {
+        document.getElementById('status').textContent = 'Enter a run directory or model.zip path first.';
+        return;
+    }
+    const r = await fetch(`/sim3d/api/session/${session.id}/policy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_path: runPath }),
+    });
+    if (!r.ok) {
+        document.getElementById('status').textContent = `Policy load failed: ${await r.text()}`;
+        return;
+    }
+    const j = await r.json();
+    applySessionState(j, session.id);
+}
+
+async function stepPolicy() {
+    if (!session?.policy) return;
+    const r = await fetch(`/sim3d/api/session/${session.id}/policy/step`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deterministic: true }),
+    });
+    if (!r.ok) {
+        document.getElementById('status').textContent = `Policy step failed: ${await r.text()}`;
+        return;
+    }
+    const j = await r.json();
+    session.wall = j.wall;
+    session.source = j.source;
+    session.profile = j.profile;
+    session.policy = j.policy;
+    applyPose(j.pose);
+}
+
+async function clearPolicy() {
+    if (!session) return;
+    if (policyTimer) {
+        clearInterval(policyTimer);
+        policyTimer = null;
+        document.getElementById('policy-play').textContent = '▶ Play policy';
+    }
+    const r = await fetch(`/sim3d/api/session/${session.id}/policy`, { method: 'DELETE' });
+    document.getElementById('policy-path').value = '';
+    if (r.ok) {
+        const j = await r.json();
+        applySessionState(j, session.id);
+    }
+}
+
 document.getElementById('start-btn').onclick = startSession;
 document.getElementById('demo-btn').onclick = demoFakeMoves;
 document.getElementById('step1').onclick = () => step(6);    // 0.1 s
@@ -490,7 +610,11 @@ document.getElementById('reset-btn').onclick = async () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
     });
-    if (r.ok) applyPose(await r.json());
+    if (r.ok) {
+        if (session) session.policy = null;
+        setPolicyButtons(false);
+        applyPose(await r.json());
+    }
 };
 
 const playBtn = document.getElementById('play');
@@ -504,6 +628,21 @@ playBtn.onclick = () => {
     playBtn.textContent = '⏸ Pause';
     // 6 frames per request, ~10 requests/sec → ~real-time at 60 Hz sim.
     liveTimer = setInterval(() => step(6), 100);
+};
+
+const policyPlayBtn = document.getElementById('policy-play');
+document.getElementById('policy-load').onclick = loadPolicy;
+document.getElementById('policy-step').onclick = stepPolicy;
+document.getElementById('policy-clear').onclick = clearPolicy;
+policyPlayBtn.onclick = () => {
+    if (policyTimer) {
+        clearInterval(policyTimer);
+        policyTimer = null;
+        policyPlayBtn.textContent = '▶ Play policy';
+        return;
+    }
+    policyPlayBtn.textContent = '⏸ Pause policy';
+    policyTimer = setInterval(stepPolicy, 900);
 };
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
