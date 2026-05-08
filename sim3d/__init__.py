@@ -24,9 +24,6 @@ but matches how MuJoCo prefers to see things — geometry stays mobile
 in MJCF, gravity is a global.
 """
 
-from sim3d.body import ClimberProfile, Limb, LIMBS, HAND_LIMBS, FOOT_LIMBS
-from sim3d.world import Climb3DWorld
-
 __all__ = [
     "Climb3DWorld",
     "ClimberProfile",
@@ -35,3 +32,13 @@ __all__ = [
     "HAND_LIMBS",
     "FOOT_LIMBS",
 ]
+
+
+def __getattr__(name: str):
+    if name == "Climb3DWorld":
+        from sim3d.world import Climb3DWorld
+        return Climb3DWorld
+    if name in {"ClimberProfile", "Limb", "LIMBS", "HAND_LIMBS", "FOOT_LIMBS"}:
+        from sim3d import body
+        return getattr(body, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

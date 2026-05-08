@@ -91,7 +91,7 @@ class MoonboardProblem:
     id: int
     name: str
     setter: str
-    grade: int
+    grade: int | str
     holdsets: list[int]
     start_holds: list[str]
     mid_holds: list[str]
@@ -99,11 +99,16 @@ class MoonboardProblem:
 
     @classmethod
     def from_dict(cls, d: dict) -> "MoonboardProblem":
+        grade_raw = d.get("grade", 0)
+        try:
+            grade: int | str = int(grade_raw)
+        except (TypeError, ValueError):
+            grade = str(grade_raw).strip()
         return cls(
             id=int(d.get("id", 0)),
             name=str(d.get("name", "unnamed")),
             setter=str(d.get("setter", "")),
-            grade=int(d.get("grade", 0)),
+            grade=grade,
             holdsets=list(d.get("holdsets", [])),
             start_holds=list(d.get("start_holds", [])),
             mid_holds=list(d.get("mid_holds", [])),
@@ -230,9 +235,11 @@ def moonboard_problem_to_wall(
 def load_moonboard_problems(
     source: str | Path | Iterable[dict],
 ) -> list[MoonboardProblem]:
-    """Read a MoonBoard problem-list JSON file (the public format is a
-    top-level array of problem dicts). Also accepts an already-parsed
-    iterable of dicts."""
+    """Read MoonBoard problem JSON files.
+
+    Supports the list format used by ``moonboard1.json`` plus the keyed
+    legacy exports used by ``moonboard2.json`` / ``moonboard3.json``.
+    """
     if isinstance(source, (str, Path)):
         with open(source, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -246,9 +253,64 @@ def load_moonboard_problems(
                 raw = raw[key]
                 break
         else:
-            raise ValueError("MoonBoard JSON: expected a list of problems")
+            # Other MoonBoard dumps are keyed by problem id.
+            raw = [
+                _legacy_problem_to_public_format(value, problem_id=key)
+                for key, value in raw.items()
+                if isinstance(value, dict)
+            ]
 
     return [MoonboardProblem.from_dict(p) for p in raw]
+
+
+def _legacy_problem_to_public_format(d: dict, *, problem_id: str | int) -> dict:
+    moves = d.get("Moves", [])
+    starts: list[str] = []
+    mids: list[str] = []
+    ends: list[str] = []
+    for move in moves:
+        pos = _normalize_position(str(move.get("Description", "")))
+        if not pos:
+            continue
+        if bool(move.get("IsStart")):
+            starts.append(pos)
+        elif bool(move.get("IsEnd")):
+            ends.append(pos)
+        else:
+            mids.append(pos)
+
+    setter = d.get("Setter", "")
+    if isinstance(setter, dict):
+        setter = " ".join(
+            str(setter.get(k, "")).strip()
+            for k in ("Firstname", "Lastname")
+            if str(setter.get(k, "")).strip()
+        ) or str(setter.get("Nickname", ""))
+
+    return {
+        "id": int(problem_id),
+        "name": str(d.get("Name", f"problem-{problem_id}")),
+        "setter": str(setter),
+        "grade": str(d.get("Grade", "")),
+        "holdsets": [],
+        "start_holds": starts,
+        "mid_holds": mids,
+        "end_holds": ends,
+    }
+
+
+def _normalize_position(pos: str) -> str:
+    pos = pos.strip().upper()
+    if not pos:
+        return ""
+    if pos[0].isalpha():
+        return pos
+    # Some exports store holds as row+letter (for example "16F").
+    digits = "".join(ch for ch in pos if ch.isdigit())
+    letters = "".join(ch for ch in pos if ch.isalpha())
+    if digits and letters:
+        return f"{letters[0]}{int(digits)}"
+    return pos
 
 
 def find_problem(
@@ -266,7 +328,7 @@ def find_problem(
             continue
         if name is not None and name.lower() not in p.name.lower():
             continue
-        if grade is not None and p.grade != grade:
+        if grade is not None and str(p.grade) != str(grade):
             continue
         return p
     return None

@@ -47,6 +47,7 @@ bp = Blueprint("sim3d", __name__, url_prefix="/sim3d")
 # own JSON in here and it'll show up in the dropdown.
 MOONBOARD_DIR = Path("/data/moonboard")
 MOONBOARD_DIR_FALLBACK = Path(__file__).resolve().parent.parent / "data" / "moonboard"
+MOONBOARD_DATA_DIR_FALLBACK = Path(__file__).resolve().parent.parent / "moonboard_data"
 
 
 @dataclass
@@ -68,7 +69,10 @@ def viewer_page():
 
 # ─── Session lifecycle ────────────────────────────────────────────────────
 def _moonboard_dirs() -> list[Path]:
-    dirs = [d for d in (MOONBOARD_DIR, MOONBOARD_DIR_FALLBACK) if d.exists()]
+    dirs = [
+        d for d in (MOONBOARD_DIR, MOONBOARD_DIR_FALLBACK, MOONBOARD_DATA_DIR_FALLBACK)
+        if d.exists()
+    ]
     # Dedupe: if both dirs exist and host the same canonical files,
     # keep only the primary. Prevents the listing endpoint from
     # returning each file twice.
@@ -161,12 +165,29 @@ def create_session():
     world = Climb3DWorld(wall, profile)
 
     if seed:
-        starts = wall.starts()
-        foots = [h for h in wall.holds if h.hold_type == "foothold"][:2]
+        starts = sorted(wall.starts(), key=lambda h: h.x_cm)
+        foots = sorted(
+            [h for h in wall.holds if h.usable_for_foot()],
+            key=lambda h: (h.y_cm, h.x_cm),
+        )[:2]
         if len(starts) >= 2 and len(foots) >= 2:
+            lh, rh = starts[0].hold_id, starts[-1].hold_id
+        elif len(starts) == 1:
+            lh = rh = starts[0].hold_id
+        else:
+            hand_low = sorted(
+                [h for h in wall.holds if h.usable_for_hand()],
+                key=lambda h: (h.y_cm, h.x_cm),
+            )[:2]
+            lh, rh = (
+                (hand_low[0].hold_id, hand_low[-1].hold_id)
+                if hand_low else (None, None)
+            )
+        if lh is not None and rh is not None and len(foots) >= 2:
+            l_foot, r_foot = sorted(foots, key=lambda h: h.x_cm)
             world.seed_pose(
-                lh=starts[0].hold_id, rh=starts[1].hold_id,
-                lf=foots[0].hold_id, rf=foots[1].hold_id,
+                lh=lh, rh=rh,
+                lf=l_foot.hold_id, rf=r_foot.hold_id,
             )
 
     sid = uuid.uuid4().hex[:12]
