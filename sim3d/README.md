@@ -4,10 +4,14 @@ A MuJoCo-driven 3D successor to the 2D `physics/` package. Built so
 the rest of the project (solver, RL env, eventual photo→pipeline) can
 treat the climber as a real articulated body in 3D space.
 
-> **Phase 4 status — environment only.** This package gives you a
-> working 3D world: wall, holds, articulated climber, attach/release,
-> step. Solver and RL training are not wired up yet — that's the next
-> phase. The RL env in `rl/` still runs against the 2D world.
+> **Current status — research prototype.** This package now includes the
+> MuJoCo 3D world, a Gymnasium wrapper, and an SB3 PPO training entry
+> point. The high-level RL action space can choose limb→hold moves while
+> MuJoCo still integrates the body continuously between decisions. It is
+> good enough for experiments and demos, but it is not yet a production
+> climbing model: observations are wall-size dependent, reward shaping is
+> early, and policies must be replayed with the same wall/config used for
+> training.
 
 ---
 
