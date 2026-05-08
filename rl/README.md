@@ -26,6 +26,24 @@ docker compose exec beta-engine python -m rl --wall example-v2-boulder \
   --policy random --episodes 10
 ```
 
+```bash
+pip install stable-baselines3 tensorboard
+
+# Train
+python -m sim3d.train --steps 200_000 --run-id mb_v4 \
+    --moonboard data/moonboard/sample-problems.json --problem 19215
+
+# Watch loss curves
+tensorboard --logdir data/runs/sim3d/mb_v4/tb
+
+# Read episode stats
+column -ts, data/runs/sim3d/mb_v4/episode_stats.csv | head -20
+
+# Replay in the native viewer
+python -m sim3d --play data/runs/sim3d/mb_v4/model.zip \
+    --moonboard data/moonboard/sample-problems.json --problem 19215
+```
+
 GIF lands in `data/runs/<wall_id>-rl.gif`.
 
 ---
