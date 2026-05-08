@@ -185,7 +185,9 @@ def create_session():
             "wingspan_cm": profile.wingspan_cm,
             "mass_kg": profile.mass_kg,
         },
-        "pose": world.pose_snapshot(),
+        # include_static gives the viewer per-hold geometry (radius,
+        # normal direction, etc.) so it can render the wall correctly.
+        "pose": world.pose_snapshot(include_static=True),
     })
 
 
@@ -229,6 +231,8 @@ def move_limb(sid: str):
     payload = request.get_json(silent=True) or {}
     limb = str(payload.get("limb", "")).upper()
     hold_id = str(payload.get("hold_id", ""))
+    # Default to "reach" — the continuous Cartesian-impedance reach
+    # so the body actually swings into position rather than teleporting.
     mode = str(payload.get("mode", "reach"))
     if limb not in LIMBS:
         abort(400, description=f"limb must be one of {LIMBS}")

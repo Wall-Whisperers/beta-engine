@@ -186,47 +186,114 @@ function buildClimberMeshes(profile) {
 }
 
 // ─── Wall + holds ─────────────────────────────────────────────────────────
-function buildWallAndHolds(wall, pose) {
-    // Wall as a thin rectangle. We use the wall extents from the
-    // session response. Apply the wall_angle as a rotation about X.
-    const w = wall.width_m;
-    const h = wall.height_m;
-    const theta = wall.wall_angle_deg * Math.PI / 180;
+//
+// `pose.static` carries everything we need to render the wall and the
+// holds correctly. The server is source of truth for the math:
+//
+//     pose.static.wall = {
+//       plate_w, plate_h, thickness,
+//       angle_rad, angle_deg,
+//       centre: [x, y, z],
+//       normal: [nx, ny, nz],
+//     }
+//
+//     pose.static.holds = {
+//       hold_id: { world_pos, wall_normal, radius, is_start, is_finish, color }
+//     }
+//
+// We DO NOT recompute the geometry on the JS side any more — that's
+// what previously caused the "holds don't line up with the wall" bug.
+function buildWallAndHolds(pose) {
+    const wallStatic = pose.static.wall;
+    const theta = wallStatic.angle_rad;
 
-    const pad = 0.30;
+    // Wall plate. Box geometry uses (X, Y, Z) half-widths-x-2, so:
+    //     X = along wall  (plate_w)
+    //     Y = thickness   (thin axis = wall normal direction in local frame)
+    //     Z = up the wall (plate_h)
     const plate = new THREE.Mesh(
-        new THREE.BoxGeometry(w + pad * 2, 0.05, h + pad * 2),
+        new THREE.BoxGeometry(wallStatic.plate_w, wallStatic.thickness, wallStatic.plate_h),
         new THREE.MeshStandardMaterial({ color: 0xd9d2c4, roughness: 0.85 }),
     );
-    plate.castShadow = false;
     plate.receiveShadow = true;
-    // Bottom edge at z = 0, plate rotated by +theta around X so top
-    // tilts toward +Y for overhang. Centre at (0, h/2 sin θ, h/2 cos θ).
-    plate.position.set(0, (h / 2) * Math.sin(theta), (h / 2) * Math.cos(theta));
+    plate.position.set(...wallStatic.centre);
+    // Rotate around X by +theta. Three.js Object3D.rotation is intrinsic
+    // Tait-Bryan XYZ; setting only x is fine when the others are 0.
     plate.rotation.x = theta;
     scene.add(plate);
 
-    // Holds: we already have world positions from the pose snapshot.
+    // Holds. Each hold is a small protruding cylinder. Cylinder default
+    // axis in three.js is +Y, so we orient it along the wall normal by
+    // rotating around X by -theta (sends +Y → (0, cosθ, -sinθ) which
+    // is exactly the wall outward normal in our convention).
     holdMeshes = {};
-    holdRings = {};
-    for (const [hid, pos] of Object.entries(pose.holds)) {
-        const radius = 0.045;       // visual default — actual radius comes from size
+    for (const [hid, info] of Object.entries(pose.static.holds)) {
+        const radius = info.radius;
+        const colorHex = info.color || '#888888';
+
+        // Cylinder body — colored as in the editor.
+        const mat = new THREE.MeshStandardMaterial({
+            color: new THREE.Color(colorHex),
+            roughness: 0.5,
+        });
         const cyl = new THREE.Mesh(
             new THREE.CylinderGeometry(radius, radius, 0.04, 16),
-            new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.5 }),
+            mat,
         );
-        cyl.position.set(pos[0], pos[1], pos[2]);
-        // Orient cylinder along the wall normal (approximately +Y for
-        // vertical wall; for slab/overhang we'd rotate, but the visual
-        // is forgiving).
-        cyl.rotation.x = Math.PI / 2;
-        cyl.rotation.z = theta;
+        cyl.position.set(...info.world_pos);
+        cyl.rotation.x = -theta;
         cyl.castShadow = true;
         scene.add(cyl);
         holdMeshes[hid] = cyl;
+
+        // Start/finish ring marker just behind the hold (toward the wall).
+        if (info.is_start || info.is_finish) {
+            const markerColor = info.is_finish ? 0xff3333 : 0x33ff33;
+            const ring = new THREE.Mesh(
+                new THREE.RingGeometry(radius * 1.4, radius * 1.7, 24),
+                new THREE.MeshBasicMaterial({ color: markerColor, side: THREE.DoubleSide }),
+            );
+            // Position the ring at the hold's base on the wall surface.
+            // Move it back along the wall normal a tiny amount.
+            const n = info.wall_normal;
+            ring.position.set(
+                info.world_pos[0] - n[0] * 0.025,
+                info.world_pos[1] - n[1] * 0.025,
+                info.world_pos[2] - n[2] * 0.025,
+            );
+            // Ring lies in its local XY-plane, normal +Z. Rotate so its
+            // normal aligns with the wall outward normal.
+            ring.rotation.x = -theta + Math.PI / 2;
+            // Because RingGeometry's "front face" is +Z, rotating around X by
+            // (-theta + π/2) puts the disc parallel to the wall surface.
+            scene.add(ring);
+        }
     }
 
     return plate;
+}
+
+// Frame the camera so the climber and the wall are both visible
+// regardless of wall angle. For overhangs we step further out and
+// raise the camera so the wall doesn't occlude the climber.
+function frameCamera(pose) {
+    const ws = pose.static.wall;
+    const angle = ws.angle_deg;
+    const h = ws.height_m;
+    const w = ws.width_m;
+
+    // Distance scales with wall size; bias outward for overhangs.
+    const overhangFactor = Math.max(0, angle / 30);   // 0 for vertical, ~1.3 at 40° overhang
+    const distance = Math.max(4.5, h * 1.3) + overhangFactor * 1.5;
+    const camY = distance;
+    // Camera Z biased by wall midpoint, slightly above for overhangs
+    // (so the camera looks DOWN at the climber under the overhang).
+    const camZ = h * 0.55 + overhangFactor * 0.3;
+
+    camera.position.set(0, camY, camZ);
+    // Target = wall midpoint. The climber is roughly there at the start.
+    controls.target.set(0, ws.centre[1] * 0.7, h / 2);
+    controls.update();
 }
 
 // ─── Pose update ──────────────────────────────────────────────────────────
@@ -310,12 +377,9 @@ async function startSession() {
 
     bodyMeshes = buildClimberMeshes(j.profile);
     for (const m of Object.values(bodyMeshes)) scene.add(m);
-    buildWallAndHolds(j.wall, j.pose);
+    buildWallAndHolds(j.pose);
     applyPose(j.pose);
-
-    // Centre the camera target on the wall mid-height.
-    controls.target.set(0, 0, j.wall.height_m / 2);
-    controls.update();
+    frameCamera(j.pose);
 
     populateLimbControls(j.pose);
     document.getElementById('reset-btn').disabled = false;

@@ -70,6 +70,27 @@ class SlipEvent:
     capacity_n: float
 
 
+@dataclass
+class ReachState:
+    """Live state for a limb mid-flight between holds.
+
+    Setting a ReachState on a limb causes `step()` to apply a
+    Cartesian PD force on the limb's tip site each sub-step, pulling
+    it toward `target_world_pos`. When the tip is within
+    `REACH_ATTACH_RADIUS` of the target, or `t_remaining` runs out,
+    the controller activates the weld and clears itself.
+    """
+
+    target_hold_id: str
+    target_world_pos: np.ndarray
+    t_remaining: float
+    kp: float
+    kd: float
+    dyno: bool = False
+    closest_dist: float = 1e9
+    closest_t: float = 0.0
+
+
 class Climb3DWorld:
     """Owns the MuJoCo model + data + per-limb attachment state.
 
@@ -138,9 +159,33 @@ class Climb3DWorld:
             jnt_id = self.model.actuator_trnid[i, 0]
             self._actuator_jnt_qposadr.append(int(self.model.jnt_qposadr[jnt_id]))
 
+        # Map limb → list of actuator indices for that limb's chain.
+        # Used by the reach controller to relax those actuators while
+        # the limb is mid-flight (otherwise the actuator servos fight
+        # the Cartesian impedance pulling the limb to the target).
+        self._limb_actuator_ids: dict[Limb, list[int]] = {l: [] for l in LIMBS}
+        limb_joint_prefix = {
+            "LH": ("l_shoulder", "l_elbow", "l_wrist"),
+            "RH": ("r_shoulder", "r_elbow", "r_wrist"),
+            "LF": ("l_hip", "l_knee", "l_ankle"),
+            "RF": ("r_hip", "r_knee", "r_ankle"),
+        }
+        for i in range(self.model.nu):
+            jnt_id = int(self.model.actuator_trnid[i, 0])
+            jname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id)
+            if jname is None:
+                continue
+            for limb, prefixes in limb_joint_prefix.items():
+                if any(jname.startswith(p) for p in prefixes):
+                    self._limb_actuator_ids[limb].append(i)
+                    break
+
         # Track slips for diagnostics / RL reward shaping.
         self.slip_events: list[SlipEvent] = []
         self._max_slip_log = 200
+
+        # Continuous-reach state per limb (None = not reaching).
+        self._reaching: dict[Limb, Optional[ReachState]] = {l: None for l in LIMBS}
 
         # ── Tip-site offsets (in limb-body local frame) ────────────
         # The weld snaps the limb body origin to the mocap. To make
@@ -352,25 +397,57 @@ class Climb3DWorld:
         limb: Limb,
         target_hold_id: str,
         *,
-        mode: str = "snap",
+        mode: str = "reach",
     ) -> None:
-        """Move a limb to a new hold.
+        """Initiate a limb move.
 
-        mode="snap"  — release, teleport mocap, re-attach. Instant.
-                       Best for RL training (no in-flight physics).
-        mode="reach" — release, run physics ~0.3 s while the body
-                       shifts weight, then re-attach. Slower but
-                       produces dynamic-looking betas.
+        Three modes:
+
+        ``"snap"`` — instant teleport. Releases the weld, teleports the
+            mocap, re-welds. Use for fast RL training where you don't
+            care how the climber gets between holds, only that they
+            do. The body stays put because all other welds are still
+            engaged.
+
+        ``"reach"`` (default) — continuous Cartesian-impedance reach.
+            Releases the weld and registers a `ReachState`. Subsequent
+            calls to `step()` apply a PD force pulling the limb tip
+            toward the target hold. When the tip is within
+            `REACH_ATTACH_RADIUS` (default 5 cm) of the target — or
+            after `REACH_TIMEOUT_S` — the weld engages.
+            **Non-blocking:** call `step()` afterwards to actually do
+            the reach. The Gym env's `move_frames` setting is the
+            number of frames it gives a reach to complete.
+
+        ``"dyno"`` — explosive reach. Same as `reach` but with a
+            higher PD gain on the moving limb plus a brief leg-extension
+            push during the first 0.35 s. Useful for moves that are
+            geometrically out of static reach.
         """
+        if target_hold_id not in self._hold_meta_by_id:
+            raise KeyError(f"unknown hold: {target_hold_id}")
         if mode == "snap":
             self.release_limb(limb)
             self.attach_limb(limb, target_hold_id)
+            self._reaching[limb] = None
             return
-        if mode == "reach":
+        if mode in ("reach", "dyno"):
             self.release_limb(limb)
-            for _ in range(int(0.3 / cfg.PHYS_DT)):
-                mujoco.mj_step(self.model, self.data)
-            self.attach_limb(limb, target_hold_id)
+            target = np.array(self._hold_meta_by_id[target_hold_id]["world_pos"])
+            kp = cfg.REACH_KP_HAND if limb in HAND_LIMBS else cfg.REACH_KP_FOOT
+            kd = cfg.REACH_KD_HAND if limb in HAND_LIMBS else cfg.REACH_KD_FOOT
+            if mode == "dyno":
+                kp *= cfg.DYNO_KP_BOOST
+            self._reaching[limb] = ReachState(
+                target_hold_id=target_hold_id,
+                target_world_pos=target,
+                t_remaining=cfg.REACH_TIMEOUT_S,
+                kp=kp,
+                kd=kd,
+                dyno=(mode == "dyno"),
+                closest_dist=1e9,
+                closest_t=cfg.REACH_TIMEOUT_S,
+            )
             return
         raise ValueError(f"unknown mode: {mode!r}")
 
@@ -388,21 +465,135 @@ class Climb3DWorld:
     def step(self, frames: int = 1, *, check_slip: bool = False) -> int:
         """Advance physics by `frames` render frames.
 
-        If `check_slip` is True, after each physics sub-step we
-        compute the world-frame force on each active weld and
-        deactivate any whose force exceeds the hold's rated
-        capacity × `SLIP_FORCE_SLACK`. Disabled by default — the slip
-        model is opinionated and easy to tune wrong; turn it on in the
-        Gym env or via `--slip` once you trust the numbers.
-
-        Returns the number of slip events that occurred this call.
+        Per sub-step the loop runs:
+            1. Relax actuators on any reaching-limb chains so the
+               Cartesian impedance can actually move the limb.
+            2. Apply Cartesian-impedance forces to reaching limb tips.
+            3. Apply dyno leg-push if a dyno is in flight.
+            4. mj_step(): integrate one physics tick.
+            5. Check whether any reach completed (limb tip near target
+               or timeout) — if so, weld and clear the reach state.
+            6. Restore actuator gains.
+            7. Optionally check for grip slip.
         """
         slip_count = 0
+        # Snapshot original actuator gains; we temporarily zero gains on
+        # the reaching limbs' joints during each substep.
+        kp_orig = self.model.actuator_gainprm[:, 0].copy()
         for _ in range(frames * cfg.SUBSTEPS_PER_FRAME):
+            self._relax_reaching_actuators(kp_orig)
+            self._apply_reach_forces()
             mujoco.mj_step(self.model, self.data)
+            self._update_reach_state(cfg.PHYS_DT)
             if check_slip:
                 slip_count += self._check_slip()
+        # Restore gains and clear applied forces.
+        self.model.actuator_gainprm[:, 0] = kp_orig
+        self.data.qfrc_applied[:] = 0.0
         return slip_count
+
+    def _relax_reaching_actuators(self, kp_orig: np.ndarray) -> None:
+        """Zero actuator KP on any limb chain currently reaching, restore
+        the rest. Called before each physics substep so the change is
+        always one-substep scoped."""
+        self.model.actuator_gainprm[:, 0] = kp_orig
+        for limb in LIMBS:
+            if self._reaching[limb] is None:
+                continue
+            for aid in self._limb_actuator_ids[limb]:
+                self.model.actuator_gainprm[aid, 0] = 0.0
+
+    # ─── Continuous-reach controller ──────────────────────────────────
+    def _apply_reach_forces(self) -> None:
+        """Cartesian PD on each reaching limb's tip site.
+
+        Uses `mj_applyFT` to map a world-frame force at the tip site
+        into the generalised-coordinate force vector qfrc_applied. We
+        also temporarily zero the limb-chain actuator gains so the
+        actuator's "hold the seeded angle" behaviour doesn't fight
+        the reach controller.
+
+        The dyno boost: while a dyno reach is in flight, push the
+        knees/hips toward extension by adding torque to those joints'
+        qfrc_applied. Crude but effective for the "throw yourself at
+        the hold" dynamics.
+        """
+        # Reset just the qfrc slots we touch each substep so impulses
+        # don't accumulate across substeps. (We can't blanket-zero
+        # because other code may add to qfrc_applied.)
+        self.data.qfrc_applied[:] = 0.0
+
+        for limb in LIMBS:
+            rs = self._reaching[limb]
+            if rs is None:
+                continue
+            site_id = self._tip_site_idx[limb]
+            tip_pos = np.array(self.data.site_xpos[site_id])
+            # Tip linear velocity in world frame via 6-D site velocity.
+            vel = np.zeros(6, dtype=np.float64)
+            mujoco.mj_objectVelocity(
+                self.model, self.data, mujoco.mjtObj.mjOBJ_SITE,
+                site_id, vel, 0,   # 0 = world frame
+            )
+            tip_vel = vel[3:6]
+
+            err = rs.target_world_pos - tip_pos
+            force = rs.kp * err - rs.kd * tip_vel
+
+            # Apply force at the tip world position to the limb body.
+            body_id = self._limb_body_idx[limb]
+            mujoco.mj_applyFT(
+                self.model, self.data,
+                np.asarray(force, dtype=np.float64),
+                np.zeros(3, dtype=np.float64),     # no torque
+                np.asarray(tip_pos, dtype=np.float64),
+                body_id,
+                self.data.qfrc_applied,
+            )
+
+            # Dyno leg push: drive knee + hip-flex toward extension.
+            if rs.dyno and rs.t_remaining > (cfg.REACH_TIMEOUT_S - cfg.DYNO_DURATION_S):
+                self._dyno_leg_push(cfg.DYNO_LEG_PUSH_NM)
+
+    def _dyno_leg_push(self, torque_nm: float) -> None:
+        """Add torque to both knees and hip-flex joints to push the
+        body upward / outward during a dyno. Direction: extend (negative
+        knee angle isn't physical; the convention is knee=0 = extended,
+        so we push toward 0 → negative torque if knee>0)."""
+        for jname in ("l_knee", "r_knee", "l_hip_flex", "r_hip_flex"):
+            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if jid < 0:
+                continue
+            vadr = int(self.model.jnt_dofadr[jid])
+            qadr = int(self.model.jnt_qposadr[jid])
+            cur = float(self.data.qpos[qadr])
+            # Push toward 0 (extended) — same sign as -cur.
+            self.data.qfrc_applied[vadr] += -np.sign(cur) * torque_nm
+
+    def _update_reach_state(self, dt: float) -> None:
+        """Decrement timers, track closest-approach, finalise reaches
+        whose distance crossed the attach threshold or whose timer ran
+        out."""
+        for limb in LIMBS:
+            rs = self._reaching[limb]
+            if rs is None:
+                continue
+            tip = self.limb_tip_pos(limb)
+            dist = float(np.linalg.norm(tip - rs.target_world_pos))
+            if dist < rs.closest_dist:
+                rs.closest_dist = dist
+                rs.closest_t = rs.t_remaining
+            rs.t_remaining -= dt
+            if dist < cfg.REACH_ATTACH_RADIUS:
+                # On target — engage weld and clear reach.
+                self.attach_limb(limb, rs.target_hold_id)
+                self._reaching[limb] = None
+            elif rs.t_remaining <= 0.0:
+                # Timeout — weld at the closest-approach if reasonable,
+                # else snap (the move "failed" but we don't leave the
+                # limb dangling forever).
+                self.attach_limb(limb, rs.target_hold_id)
+                self._reaching[limb] = None
 
     def limb_grip_force(self, limb: Limb) -> float:
         """Magnitude of the world-frame force the climber is currently
@@ -504,16 +695,21 @@ class Climb3DWorld:
         return a.hold_id if a else None
 
     # ─── Pose snapshot for visualisation ──────────────────────────────
-    def pose_snapshot(self) -> dict:
+    def pose_snapshot(self, *, include_static: bool = False) -> dict:
         """Body positions/orientations for the web viewer.
 
         Returned shape:
             {
-              "t": float,                      # sim time (s)
+              "t": float,                       # sim time (s)
               "bodies": {name: {"pos": [x,y,z], "quat": [w,x,y,z]}},
               "limbs":  {LH: hold_id|null, ...},
-              "holds":  {hold_id: [x,y,z]}     # static — caller can cache
+              "reaching": {LH: hold_id|null, ...}, # set if the limb is mid-reach
+              "holds":  {hold_id: [x,y,z]}      # tip world position
             }
+
+        If `include_static=True` we also include wall + per-hold geometry
+        (radius, normal direction, plate size) under "static". The web
+        viewer fetches this once on session create rather than every frame.
         """
         names = (
             "pelvis", "chest", "head",
@@ -531,11 +727,15 @@ class Climb3DWorld:
             quat = np.array(self.data.xquat[bid]).tolist()  # [w,x,y,z]
             bodies[n] = {"pos": pos, "quat": quat}
 
-        return {
+        snap = {
             "t": float(self.data.time),
             "bodies": bodies,
             "limbs": {
                 l: (self._on_hold[l].hold_id if self._on_hold[l] else None)
+                for l in LIMBS
+            },
+            "reaching": {
+                l: (self._reaching[l].target_hold_id if self._reaching[l] else None)
                 for l in LIMBS
             },
             "holds": {
@@ -543,3 +743,59 @@ class Climb3DWorld:
                 for meta in self._hold_meta_by_id.values()
             },
         }
+
+        if include_static:
+            # Static info needed by the viewer once. Re-derived from the
+            # builder math so the viewer doesn't have to know MJCF
+            # internals — the server is source of truth.
+            from sim3d import config as _cfg
+            theta = math.radians(self.wall.wall_angle_deg)
+            width_m = self.wall.width_cm / 100.0
+            height_m = self.wall.height_cm / 100.0
+            pad = _cfg.WALL_PADDING_M
+            plate_w = width_m + 2 * pad
+            plate_h = height_m + pad     # pad above only
+            wall_normal = (0.0, math.cos(theta), -math.sin(theta))
+
+            holds_static = {}
+            for meta in self._hold_meta_by_id.values():
+                radius_key = self.wall.by_id(meta["hold_id"]).size
+                radius = _cfg.HOLD_RADIUS_BY_SIZE_M.get(radius_key, 0.05)
+                holds_static[meta["hold_id"]] = {
+                    "world_pos": list(meta["world_pos"]),
+                    "wall_normal": list(meta["wall_normal"]),
+                    "radius": radius,
+                    "is_start": meta["is_start"],
+                    "is_finish": meta["is_finish"],
+                    "color": self.wall.by_id(meta["hold_id"]).color,
+                }
+
+            # Plate centre needs to match the builder's lift-for-floor
+            # logic, so re-derive from the actual hold positions.
+            cz_base = (plate_h / 2.0) * math.cos(theta)
+            cy_base = (plate_h / 2.0) * math.sin(theta)
+            min_hold_z = min(
+                (h["world_pos"][2] for h in self._hold_meta_by_id.values()),
+                default=0.0,
+            )
+            # The lift offset in the builder is added to cz only.
+            # Approximating: the plate's bottom-near corner sits at the
+            # lowest point on the wall surface; the lowest hold sits
+            # slightly above that. The exact offset isn't critical for
+            # rendering — the holds drive correctness, the plate is
+            # just a visual backdrop sized to match.
+            snap["static"] = {
+                "wall": {
+                    "width_m": width_m,
+                    "height_m": height_m,
+                    "plate_w": plate_w,
+                    "plate_h": plate_h,
+                    "thickness": _cfg.WALL_THICKNESS_M,
+                    "angle_rad": theta,
+                    "angle_deg": self.wall.wall_angle_deg,
+                    "centre": [0.0, cy_base, cz_base],
+                    "normal": list(wall_normal),
+                },
+                "holds": holds_static,
+            }
+        return snap

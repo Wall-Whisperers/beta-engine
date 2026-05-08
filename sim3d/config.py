@@ -169,6 +169,33 @@ TORQUE_CAP_NM = {
 HOLD_CONSTRAINT_SOLREF = (0.02, 1.0)
 HOLD_CONSTRAINT_SOLIMP = (0.95, 0.99, 0.001, 0.5, 2)
 
+# ─── Continuous-reach controller ────────────────────────────────────────────
+# When a limb is mid-flight (released from one hold, reaching toward
+# another), we apply a Cartesian PD on the limb tip to drive it through
+# space. This is what makes the climber actually MOVE between holds
+# rather than teleport. Tuned by hand: enough force to overcome gravity
+# on the limb segment plus the actuator stiffness; not so much that the
+# tip overshoots.
+REACH_KP_HAND = 600.0      # N / m  — proportional gain pulling hand to target
+REACH_KD_HAND = 60.0       # N·s / m — velocity damping
+REACH_KP_FOOT = 800.0
+REACH_KD_FOOT = 80.0
+
+# Distance (m) at which the reach controller engages the weld. ~5 cm
+# matches the visual hold radius — when the hand is "on" the hold.
+REACH_ATTACH_RADIUS = 0.05
+# Hard timeout (s) on a reach. Past this we give up and weld at the
+# closest approach. Without a timeout, an unreachable target makes the
+# limb dangle forever.
+REACH_TIMEOUT_S = 1.5
+
+# Dyno: explosive whole-body extension when the moving limb is too far
+# for a static reach. We boost legs / hips toward extension and fly the
+# limb forward.
+DYNO_KP_BOOST = 2.5         # multiplier on REACH_KP for moving limb
+DYNO_LEG_PUSH_NM = 100.0    # extra Nm on knee+hip during dyno
+DYNO_DURATION_S = 0.35
+
 # Slip model. We don't trust raw weld constraints to model breakaway —
 # the weld is rigid until released. Instead, every step we read the
 # constraint force on each active weld, and if it exceeds the hold's

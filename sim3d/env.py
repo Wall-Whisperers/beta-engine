@@ -61,7 +61,8 @@ from solver.wall import Wall
 @dataclass
 class EnvConfig:
     action_mode: str = "discrete-move"           # or "continuous-joint"
-    move_frames: int = 24                        # physics frames between actions in discrete mode
+    move_mode: str = "reach"                     # "snap" | "reach" | "dyno"
+    move_frames: int = 60                        # physics frames between actions (1s @ 60Hz)
     max_steps: int = 60                          # episode cap
     fall_z: float = 0.20                         # below this pelvis-z = fall
     finish_hold_frames: int = 6                  # hand must stay on finish for this long
@@ -221,7 +222,7 @@ class Climbing3DEnv(gym.Env):
             if limb in HAND_LIMBS and not self._hand_eligible[hold_id_idx]:
                 info["invalid_action"] = "hand on foothold-only"
             else:
-                self.world.move_limb(limb, hold_id, mode="snap")
+                self.world.move_limb(limb, hold_id, mode=self.cfg_env.move_mode)
             slips = self.world.step(
                 self.cfg_env.move_frames,
                 check_slip=self.cfg_env.enable_slip,
