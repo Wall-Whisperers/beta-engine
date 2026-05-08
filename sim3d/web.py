@@ -37,7 +37,6 @@ from flask import Blueprint, abort, jsonify, request, send_from_directory
 
 from sim3d import Climb3DWorld, ClimberProfile
 from sim3d.body import LIMBS
-from sim3d.env import Climbing3DEnv, EnvConfig
 from sim3d.moonboard import (
     load_moonboard_problems,
     moonboard_problem_to_wall,
@@ -60,7 +59,7 @@ SIM3D_RUNS_DIR = REPO_ROOT / "data" / "runs" / "sim3d"
 @dataclass
 class _PolicyState:
     model: Any
-    env: Climbing3DEnv
+    env: Any
     obs: Any
     run_path: str
     model_path: str
@@ -392,15 +391,16 @@ def load_policy(sid: str):
         wingspan_cm=float(cfg.get("wingspan_cm", 175.0)),
         mass_kg=float(cfg.get("mass_kg", 70.0)),
     )
-    env_cfg = EnvConfig(
-        move_mode=str(cfg.get("move_mode", "reach")),
-        move_frames=int(cfg.get("move_frames", 24)),
-        max_steps=int(cfg.get("max_episode_steps", 30)),
-        enable_slip=bool(cfg.get("enable_slip", True)),
-    )
-
     try:
         from stable_baselines3 import PPO
+        from sim3d.env import Climbing3DEnv, EnvConfig
+
+        env_cfg = EnvConfig(
+            move_mode=str(cfg.get("move_mode", "reach")),
+            move_frames=int(cfg.get("move_frames", 24)),
+            max_steps=int(cfg.get("max_episode_steps", 30)),
+            enable_slip=bool(cfg.get("enable_slip", True)),
+        )
         model = PPO.load(str(model_path))
         env = Climbing3DEnv(wall, profile=profile, config=env_cfg)
         obs, info = env.reset()
