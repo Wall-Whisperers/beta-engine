@@ -7,7 +7,7 @@ matplotlib==3.9.2
 pillow==11.0.0
 
 # 2-D physics
-pymunk==6.9.0
+pymunk==7.0.1
 
 # RL environment interface
 gymnasium==1.0.0
