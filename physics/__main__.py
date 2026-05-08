@@ -101,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
                         "the solver can't find one yet.")
     p.add_argument("--frames-per-move", type=int, default=20,
                    help="how many rendered frames each move occupies")
+    p.add_argument("--interactive", action="store_true",
+                   help="open a live window; right-click an end-effector to drag it")
     args = p.parse_args(argv)
 
     wall = load_wall(args.wall, cell_size_cm=args.cell_size_cm)
@@ -117,6 +119,12 @@ def main(argv: list[str] | None = None) -> int:
     lh, rh, lf, rf = _starting_holds(wall)
     print(f"Seeding pose: LH={lh} RH={rh} LF={lf} RF={rf}")
     world.seed_pose(lh=lh, rh=rh, lf=lf, rf=rf)
+
+    if args.interactive:
+        from physics.interactive import launch
+        world.step(30)  # let the body settle before opening the window
+        launch(world)
+        return 0
 
     runs = _runs_dir()
 
