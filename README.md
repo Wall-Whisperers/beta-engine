@@ -1,6 +1,6 @@
 # Beta Engine
 
-A five-part climbing-wall MVP:
+A multi-part climbing-wall MVP:
 
 | Part | Folder | What it does |
 |------|--------|--------------|
@@ -8,12 +8,13 @@ A five-part climbing-wall MVP:
 | **Solver** | `solver/` | **2D-only** IK + A\*/RL solver that reads those JSON files and outputs a move sequence |
 | **Physics 2D** | `physics/` | **pymunk** rigid-body simulation — gravity, wall angle, force-limited grip, articulated stick figure |
 | **Sim 3D** | `sim3d/` | **MuJoCo** 3D simulator — full articulated humanoid + slab/overhang walls + browser-based three.js viewer |
-| **RL** | `rl/` | **Gymnasium** environment wrapping the 2D physics, ready for PPO/SAC/etc. (3D wrapper coming) |
+| **RL 2D** | `rl/` | **Gymnasium** environment wrapping the 2D physics for PPO/SAC-style experiments |
+| **RL 3D** | `sim3d/env.py`, `sim3d/train.py` | **Gymnasium + Stable-Baselines3 PPO** around the MuJoCo climber |
 
 The editor locks the JSON schema everything downstream depends on. The solver
 is a first pass at the body-model → reachability → search → visualizer pipeline,
 intended to work on hand-built walls before we layer on computer vision, physics,
-or a full PPO agent.
+or larger ML/RL training runs.
 
 > **Scope of the solver:** strictly 2D. Pose, IK, reachability, and stability
 > are all evaluated in the wall plane (x = horizontal, y = vertical). No body
@@ -56,10 +57,16 @@ beta-engine/
 │   ├── render.py      #   matplotlib renderer (headless)
 │   ├── __main__.py    #   CLI: simulate + render PNG/GIF
 │   └── README.md
-├── rl/                # Gymnasium environment wrapping physics/
+├── rl/                # 2D Gymnasium environment wrapping physics/
 │   ├── env.py         #   ClimbingEnv (Discrete actions, Box obs)
 │   ├── random_policy.py
 │   ├── __main__.py    #   CLI: random-policy episode + GIF
+│   └── README.md
+├── sim3d/             # MuJoCo 3D world + Gymnasium env + PPO trainer
+│   ├── builder.py     #   Wall/climber → MJCF XML
+│   ├── world.py       #   MjModel/MjData, reach controller, slip checks
+│   ├── env.py         #   Climbing3DEnv
+│   ├── train.py       #   Stable-Baselines3 PPO training entrypoint
 │   └── README.md
 ├── static/            # Vanilla-JS editor frontend (no build step)
 ├── schemas/           # wall.schema.json — JSON Schema 2020-12 source of truth
@@ -156,8 +163,7 @@ docker compose exec beta-engine python -m rl --wall example-v2-boulder
 docker compose exec beta-engine python -m rl --wall example-v2-boulder --episodes 5 --gif
 ```
 
-See [`rl/README.md`](rl/README.md) for the action/observation spaces and how to
-plug in Stable-Baselines3.
+See [`rl/README.md`](rl/README.md) for the 2D action/observation spaces and PPO example.
 
 ### 8) Open the 3D simulator (browser-based)
 
@@ -178,9 +184,6 @@ docker compose exec beta-engine python -m sim3d --headless --beta h_006 RH:h_008
 ### 9) Train an RL agent + replay it
 
 ```bash
-# Optional dep — kept out of requirements.txt so the base install stays small.
-pip install stable-baselines3 tensorboard
-
 # Quick smoke (1500 steps, ~1 min on CPU):
 python -m sim3d.train --steps 1500 --episode-steps 6 --run-id smoke
 

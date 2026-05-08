@@ -6,8 +6,8 @@ checks in `solver/` with an actual time-stepped sim — gravity, wall
 angle, friction-aware holds, force-limited grip, articulated stick
 figure.
 
-This is the Phase-3 step the [solver README](../solver/README.md) and
-[`planning-gabe.md`](../planning-gabe.md) call for.
+This is the 2D dynamics layer between the static `solver/` baseline and the
+full MuJoCo `sim3d/` stack.
 
 > **Why pymunk and not Box2D?**
 > Pymunk's pip wheels are reliably built across Linux/macOS/Windows
@@ -183,7 +183,7 @@ If a field is absent the physics falls back to a per-hold-type default
 
 | Limit | Why it's OK for now | Fix when |
 |---|---|---|
-| **Limbs are leashes, not full segmented bodies** | A multi-segment ragdoll tunes badly under gravity — folds or oscillates without active per-joint control. Leashes give meaningful forces with stable behaviour. | Phase 4 — once we have an RL policy outputting torques, we can drive a full articulated body. |
+| **Limbs are leashes, not full segmented bodies** | A multi-segment ragdoll tunes badly under gravity — folds or oscillates without active per-joint control. Leashes give meaningful forces with stable behaviour. | Use `sim3d/` for the full articulated MuJoCo body; keep this layer as the fast 2D dynamics approximation. |
 | **Posture force does most of the work in stable poses** | Means leash forces are ~0 when the climber is at the kinematic ideal. Forces only meaningfully engage near max reach. | Trade off `POSTURE_GAIN` against leash realism; or compute static contact forces analytically (added together in body-frame). |
 | **No body-on-wall collision** | The "wall" is just a frame for hold positions; the body floats. Ok on vertical walls. Breaks down on overhangs where the body would press into the wall. | Add a static `pymunk.Segment` plane at x=… and collision filter the body against it. |
 | **No friction cone / direction-dependent grip** | Hold orientation is in the JSON schema but the physics treats every hold as omnidirectional. | Replace `max_force` with a direction-dependent constraint (one Pin per hold direction, or a custom constraint). |

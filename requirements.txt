@@ -12,9 +12,12 @@ pymunk==7.0.1
 # RL environment interface
 gymnasium==1.0.0
 
-# RL training (PPO via MaskablePPO for invalid-action masking)
-stable-baselines3==2.4.0
+# 3D physics for sim3d/ climber simulation.
+mujoco==3.2.6
+
+# RL training (PPO). Pins torch as transitive dep for reproducibility.
+stable-baselines3==2.8.0
 sb3-contrib==2.4.0
 
-# SB3 needs torch; pin a broad range so Docker cache stays warm
-torch>=2.2,<3.0
+# TensorBoard for training logs.
+tensorboard==2.20.0

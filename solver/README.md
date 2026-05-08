@@ -252,9 +252,7 @@ A **dependency-free** RL implementation. State = pose tuple; action =
 `(limb, target_hold)` from `reachable_moves`.
 
 The env class (`ClimbingEnv`) is shaped like a Gym `reset()/step()`
-interface, deliberately, so swapping in PPO + Stable Baselines3 later
-is a small change — just replace the training loop in `solve_qlearn`,
-the env stays the same.
+interface, deliberately, so the project now also includes SB3-compatible environments in `rl/` and `sim3d/env.py`.
 
 **Reward shaping:**
 
@@ -340,13 +338,11 @@ Outputs land in `/data/runs/` inside the container, which maps to
 
 | Limitation | Why it's OK for now | How to fix later |
 |------------|---------------------|------------------|
-| **Vertical wall only** | Simplifies stability check | Add `wall_angle_deg` to schema + friction model in Phase 3 |
-| **No `cell_size_cm` in schema** | Schema is locked — see [`planning-gabe.md`](../planning-gabe.md) | Add it to `schemas/wall.schema.json` before Phase 3 |
-| **2D joint envelopes only** | First-pass approximation | Phase 3+: 3D body, hip twist, drop-knees |
-| **Static (no momentum)** | Model is purely kinematic | Phase 3: Pymunk physics step |
-| **Tabular RL won't scale past ~20 holds** | State space is N⁴ — fine for ~13 holds | Swap in PPO + Stable Baselines3 |
-| **Single-wall RL** | No procedural generation yet | Phase 4: train on 1000 random walls |
-| **No body-on-body collision** | Single rough end-effector separation check | Phase 3: full segment-segment collision |
+| **2D wall-plane reasoning** | Solver is a fast graph/search baseline, not the physics source of truth | Use `physics/` for 2D dynamics or `sim3d/` for MuJoCo body motion |
+| **Static (no momentum)** | A* needs deterministic reachability and cheap edge checks | Validate candidate betas in `physics/` or `sim3d/` after solving |
+| **Tabular Q-learning won't scale past ~20 holds** | State space is N⁴ — fine for the bundled 13-hold example | Use SB3 PPO with `rl/` or `sim3d.train` for neural policies |
+| **Single-wall tabular RL** | Keeps the toy baseline understandable | Train over MoonBoard/custom wall sets in `sim3d/` for generalisation |
+| **No body-on-body collision** | Single rough end-effector separation check is enough for graph pruning | Let MuJoCo collision/joint limits handle this in `sim3d/` |
 
 ---
 
