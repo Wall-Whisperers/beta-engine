@@ -124,6 +124,7 @@ def create_session():
 
     moonboard_file = payload.get("moonboard_file")
     moonboard_problem_id = payload.get("moonboard_problem_id")
+    moonboard_vertical = bool(payload.get("moonboard_vertical_projection", False))
 
     if moonboard_file is not None:
         # Load a MoonBoard problem rather than a stored wall.
@@ -143,7 +144,9 @@ def create_session():
             problem = problems[0] if problems else None
         if problem is None:
             abort(404, description="no problems in MoonBoard file")
-        wall = moonboard_problem_to_wall(problem)
+        wall = moonboard_problem_to_wall(
+            problem, vertical_projection=moonboard_vertical,
+        )
     else:
         try:
             wall = load_wall(wall_id)

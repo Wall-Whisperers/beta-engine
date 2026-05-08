@@ -186,18 +186,42 @@ class Climbing3DEnv(gym.Env):
         if self.cfg_env.seed_pose:
             kw = dict(self.cfg_env.seed_kwargs)
             if not kw:
-                # Auto-seed from start holds + lowest two foothold-eligible holds.
+                # Auto-seed from start holds + best two feet candidates.
+                # MoonBoard problems have no `foothold`-typed holds, so we
+                # fall back to the LOWEST two non-start holds (or the start
+                # holds themselves if that's all there is). Real climbers
+                # do exactly this: any decent hold becomes a foothold when
+                # you need one.
                 starts = self.wall.starts()
                 if len(starts) >= 2:
                     kw["lh"] = starts[0].hold_id
                     kw["rh"] = starts[1].hold_id
+                elif len(starts) == 1:
+                    kw["lh"] = kw["rh"] = starts[0].hold_id
+
                 feet_candidates = sorted(
                     (h for h in self.wall.holds if h.hold_type == "foothold"),
                     key=lambda h: h.y_cm,
                 )
+                if len(feet_candidates) < 2:
+                    # Fallback: any non-start, non-finish hold sorted
+                    # by height (lowest first), splitting left/right by x.
+                    used_for_hands = {kw.get("lh"), kw.get("rh")}
+                    extras = sorted(
+                        (h for h in self.wall.holds
+                         if h.hold_id not in used_for_hands and not h.is_finish),
+                        key=lambda h: h.y_cm,
+                    )
+                    feet_candidates = (feet_candidates or []) + extras
                 if len(feet_candidates) >= 2:
-                    kw["lf"] = feet_candidates[0].hold_id
-                    kw["rf"] = feet_candidates[1].hold_id
+                    # Pick the lowest left-side and lowest right-side hold.
+                    left = next((h for h in feet_candidates if h.grid_x <= self.wall.cols / 2), None)
+                    right = next((h for h in feet_candidates if h.grid_x > self.wall.cols / 2), None)
+                    if left is None: left = feet_candidates[0]
+                    if right is None or right is left:
+                        right = feet_candidates[1]
+                    kw["lf"] = left.hold_id
+                    kw["rf"] = right.hold_id
             self.world.seed_pose(**kw)
         else:
             # Reset and let the climber dangle from gravity.

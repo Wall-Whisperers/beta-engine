@@ -129,6 +129,7 @@ def moonboard_problem_to_wall(
     cell_size_cm: float = MB_CELL_SIZE_CM,
     wall_angle_deg: float = MB_WALL_ANGLE_DEG,
     include_full_board: bool = False,
+    vertical_projection: bool = False,
 ) -> Wall:
     """Build a `Wall` from a single MoonBoard problem.
 
@@ -143,7 +144,21 @@ def moonboard_problem_to_wall(
     The MoonBoard JSON doesn't carry per-position hold type info — we
     default everything to a medium jug. The overrides let you mark up
     a specific board (e.g. our friend's gym dumped its own board here).
+
+    `vertical_projection=True` flattens the row spacing in the wall's
+    own plane so that each row's *vertical* (world-Z) position matches
+    a vertical board. Useful when you want "row 6 is at the same height
+    as a vertical reference board" rather than "row 6 is 6 cell-units
+    along the tilted surface." Visually this is what looking at a
+    MoonBoard photo head-on shows. We adjust cell_size by 1/cos(angle)
+    so the world-Z spacing equals `cell_size_cm`. Horizontal spacing is
+    unchanged because columns are along world-X (perpendicular to the
+    tilt axis).
     """
+    import math as _math
+    effective_cell = cell_size_cm
+    if vertical_projection and abs(wall_angle_deg) > 1e-3:
+        effective_cell = cell_size_cm / _math.cos(_math.radians(wall_angle_deg))
     if isinstance(problem, dict):
         problem = MoonboardProblem.from_dict(problem)
 
@@ -169,7 +184,7 @@ def moonboard_problem_to_wall(
     for pos in positions:
         gx, gy = position_to_grid(pos)
         x_cm = (gx + 0.5) * cell_size_cm
-        y_cm = (gy + 0.5) * cell_size_cm
+        y_cm = (gy + 0.5) * effective_cell
 
         is_start = pos in starts
         is_finish = pos in finishes
@@ -204,7 +219,7 @@ def moonboard_problem_to_wall(
         name=f"MoonBoard · {problem.name} (V{problem.grade})",
         cols=MB_COLS,
         rows=MB_ROWS,
-        cell_size_cm=cell_size_cm,
+        cell_size_cm=effective_cell,
         holds=holds,
         wall_angle_deg=wall_angle_deg,
         surface_friction=MB_SURFACE_FRICTION,

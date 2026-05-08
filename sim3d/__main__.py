@@ -81,6 +81,14 @@ def main(argv: list[str] | None = None) -> int:
              "First match wins. Use this if you don't have the id.",
     )
     p.add_argument(
+        "--vertical-projection", action="store_true",
+        help="MoonBoard: lay holds out so each row's WORLD-Z spacing "
+             "equals the cell size — looks like the photo of a vertical "
+             "MoonBoard, even when the wall is tilted at 40°. Default "
+             "(off) keeps holds on the actual angled surface (physically "
+             "real but visually denser when tilted).",
+    )
+    p.add_argument(
         "--gym", action="store_true",
         help="Run a Gymnasium random-policy episode instead of the viewer. "
              "Useful sanity check for the env wrapper.",
@@ -92,6 +100,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--slip", action="store_true",
         help="Enable slip detection (welds release when force exceeds capacity).",
+    )
+    p.add_argument(
+        "--play", metavar="MODEL.zip",
+        help="Run a saved SB3 PPO model in the viewer instead of "
+             "manual controls. Pair with --wall or --moonboard. "
+             "Requires `pip install stable-baselines3`.",
+    )
+    p.add_argument(
+        "--play-frames", type=int, default=120,
+        help="Render frames per policy action when replaying (default 120 = 2 s).",
+    )
+    p.add_argument(
+        "--move-mode", default="reach", choices=("snap", "reach", "dyno"),
+        help="Limb-move mode for scripted betas and policy replay.",
     )
     p.add_argument("--height", type=float, default=175.0,
                    help="Climber total height in cm.")
@@ -140,8 +162,11 @@ def main(argv: list[str] | None = None) -> int:
             problem = problems[0]
             print(f"(picked first problem: #{problem.id} {problem.name!r}; "
                   f"use --problem ID or --problem-name to choose)")
-        wall = moonboard_problem_to_wall(problem)
-        print(f"MoonBoard: \"{problem.name}\" by {problem.setter} — V{problem.grade}")
+        wall = moonboard_problem_to_wall(
+            problem, vertical_projection=args.vertical_projection,
+        )
+        proj_note = " (vertical-projection)" if args.vertical_projection else ""
+        print(f"MoonBoard: \"{problem.name}\" by {problem.setter} — V{problem.grade}{proj_note}")
     else:
         wall = load_wall(args.wall)
     profile = ClimberProfile(
@@ -182,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
             wall, profile,
             config=EnvConfig(
                 max_steps=30,
+                move_mode=args.move_mode,
                 enable_slip=args.slip,
             ),
         )
@@ -196,6 +222,46 @@ def main(argv: list[str] | None = None) -> int:
                     break
             print(f"episode {ep+1}: reward={ep_reward:+.2f}, "
                   f"outcome={info.get('outcome')}, com_z={info['com'][2]:.2f}")
+        return 0
+
+    if args.play:
+        # Replay a trained policy in the native viewer.
+        from sim3d.env import Climbing3DEnv, EnvConfig
+        from sim3d.train import _require_sb3
+        sb3, _, _ = _require_sb3()
+        env = Climbing3DEnv(
+            wall, profile,
+            config=EnvConfig(
+                max_steps=30,
+                move_mode=args.move_mode,
+                move_frames=args.play_frames,
+                enable_slip=args.slip,
+            ),
+        )
+        model = sb3.PPO.load(args.play)
+        print(f"Loaded policy from {args.play}")
+        print(f"Wall: {wall.name} ({len(wall.holds)} holds)")
+        print("Native viewer running. Each policy action takes "
+              f"{args.play_frames} frames (~{args.play_frames/60:.1f}s).")
+
+        # Drive the env's world (which the viewer attaches to).
+        from sim3d.viewer import native_viewer
+        obs, info = env.reset()
+        with native_viewer(env.world) as viewer:
+            done = False
+            while viewer.is_running() and not done:
+                action, _ = model.predict(obs, deterministic=True)
+                a_int = int(action) if hasattr(action, "__int__") else action
+                limb, hold_id = env.decode_move(a_int) \
+                    if env.cfg_env.action_mode == "discrete-move" \
+                    else (None, None)
+                if limb is not None:
+                    print(f"  policy: {limb} → {hold_id}")
+                obs, r, term, trunc, info = env.step(action)
+                viewer.sync()
+                done = term or trunc
+            print(f"Outcome: {info.get('outcome')} | "
+                  f"final COM_z = {info['com'][2]:.2f} m")
         return 0
 
     if args.headless:

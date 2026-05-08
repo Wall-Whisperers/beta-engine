@@ -37,12 +37,14 @@ sim3d/
 ├── config.py        # tunable constants (timestep, joint limits, masses, ...)
 ├── body.py          # ClimberProfile dataclass + segment math + limb names
 ├── builder.py       # build_mjcf_xml(wall, profile) → (xml, hold_meta)
-├── world.py         # Climb3DWorld — owns MjModel + MjData + slip detection
+├── world.py         # Climb3DWorld — owns MjModel + MjData + slip detection +
+│                    #   continuous-reach Cartesian-impedance controller
 ├── env.py           # Climbing3DEnv — Gymnasium wrapper for RL training
 ├── moonboard.py     # MoonBoard problem JSON → Wall adapter
+├── train.py         # PPO trainer (optional SB3 dep) + episode CSV logger
 ├── viewer.py        # native MuJoCo viewer wrapper
 ├── web.py           # Flask blueprint for the three.js front-end
-└── __main__.py      # `python -m sim3d` CLI demo
+└── __main__.py      # `python -m sim3d` CLI demo (incl. --play <model>)
 ```
 
 **The data flow on each step:**
@@ -103,6 +105,22 @@ the limb welds to it. To release: set `eq_active[i] = 0`. No model
 recompile needed → fast for RL resets. The weld's `relpose` is set so
 the limb's *tip site* (fingertips / toe) lands on the hold rather
 than the wrist / ankle.
+
+**Continuous limb motion.** `move_limb` supports three modes:
+
+| Mode | Behaviour | Use when |
+|---|---|---|
+| `snap` | Instant teleport. | Fast RL training where you only care which holds the limb visits. |
+| `reach` (default) | Cartesian-impedance PD pulls the limb tip toward the target through space. Body sways under gravity + the reach force. Welds when the tip is within 5 cm or after 1.5 s. | Manual play, dynamic visualisation, realistic RL. |
+| `dyno` | Same as reach plus an explosive leg-extension push during the first 0.35 s — for moves that would be out of static reach. | Long throws between holds. |
+
+While a limb is reaching, its actuator KP is temporarily zeroed so
+the per-joint hold-pose servo doesn't fight the impedance controller.
+The applied force at the tip is mapped into joint-space via
+`mj_applyFT` (force at a world point through the body Jacobian). All
+of this happens automatically inside `step()` — you call
+`move_limb(..., mode="reach")` once and then `step()` until the limb
+attaches.
 
 **Slip model.** When `check_slip=True` (or `--slip` on the CLI, or
 `enable_slip=True` in the Gym env config), every step we compute the
@@ -264,6 +282,30 @@ appear on the wall. Pass `include_full_board=True` to also include all
 198 T-nut positions as auxiliary holds (useful for letting an RL
 agent discover off-route footholds).
 
+**Two layout conventions** for the 40° overhang:
+
+```python
+# Default: holds sit on the actual angled surface (physically real).
+wall = moonboard_problem_to_wall(problem)
+
+# vertical_projection=True: holds are spaced so each row's WORLD-Z
+# matches a vertical reference board. Looks like the photo of a
+# MoonBoard rather than the foreshortened tilted surface. Internally
+# we scale cell_size by 1/cos(40°) so the rows project to the same
+# vertical pitch as a flat board.
+wall = moonboard_problem_to_wall(problem, vertical_projection=True)
+```
+
+CLI: pass `--vertical-projection` to `python -m sim3d`. Web: send
+`{"moonboard_vertical_projection": true}` in the session-create POST.
+
+**Foothold fallback.** MoonBoard problems don't mark anything as
+`"foothold"` — competitions allow climbers to use any hold for feet.
+The Gym env handles this automatically: when no foothold-typed holds
+exist, it picks the lowest non-start non-finish hold on each side as
+the seeded foot anchor. So you get all four limbs on holds at reset
+even on bare MoonBoard problems.
+
 ### Gymnasium environment for RL
 
 ```python
@@ -301,6 +343,52 @@ model = PPO("MlpPolicy", Climbing3DEnv(wall), verbose=1)
 model.learn(total_timesteps=100_000)
 ```
 
+### Training a policy + viewing results
+
+The included `sim3d.train` module wraps PPO + episode-stat logging:
+
+```bash
+# 1. Install SB3 (optional dep, kept out of requirements.txt to keep base small)
+pip install stable-baselines3 tensorboard
+
+# 2. Train. Defaults to the example wall, ~100k timesteps, mode=reach.
+python -m sim3d.train --steps 100_000
+
+# Or train on a MoonBoard problem with vertical projection:
+python -m sim3d.train --moonboard data/moonboard/sample-problems.json \
+                     --problem 19215 --steps 200_000
+
+# 3. View results.
+ls data/runs/sim3d/run_<timestamp>/
+#   ├── config.json         # hyperparams + wall + climber profile
+#   ├── episode_stats.csv   # one row per episode (reward, length, outcome, com_z, slips)
+#   ├── tb/                 # TensorBoard event files
+#   └── model.zip           # trained PPO policy
+
+# Plot reward curve:
+tensorboard --logdir data/runs/sim3d/run_<timestamp>/tb
+# or just grep the CSV:
+column -ts, data/runs/sim3d/run_<timestamp>/episode_stats.csv | head -20
+
+# 4. Replay the policy in the native MuJoCo viewer:
+python -m sim3d --play data/runs/sim3d/run_<timestamp>/model.zip
+```
+
+**What you should see in the CSV during training:**
+- Early episodes have rewards around 0–2 (mostly per-step penalties).
+- Successful episodes show `outcome=completed` with reward > 100.
+- `final_com_z` trends upward as the policy learns to climb (up from
+  ~0.5 m baseline to ~1.5+ m for partial progress).
+- The `slips` column tells you how often the policy is over-gripping
+  beyond hold capacity — high values mean the slip-aware reward is
+  saturating and you may want to lower `slip_penalty`.
+
+**Viewer integration**: when `--play` is set, the native MuJoCo
+viewer opens and the policy drives the climber in real-time. Each
+discrete-move action takes `--play-frames` (default 120 = 2 s) of
+physics so the continuous-reach has time to actually swing the limb
+to the next hold rather than teleporting.
+
 ---
 
 ## What this gives you (and what it doesn't, yet)
@@ -323,6 +411,10 @@ model.learn(total_timesteps=100_000)
 - Train policies that complete unseen MoonBoard problems with high
   reliability — the env runs, but procedural curriculum (random
   walls of increasing difficulty) is needed to get there.
+- Web-side "play policy" button — the CLI replay (`--play`) works
+  through the native viewer; the browser viewer doesn't yet pick up
+  saved models directly. Open one of the moonboard sessions, train,
+  then replay through the desktop viewer to see learning land.
 
 ---
 

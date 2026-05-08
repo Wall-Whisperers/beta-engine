@@ -165,7 +165,8 @@ The 3D simulator runs in the same Flask process as the editor. Once
 `docker compose up` is running, open <http://localhost:8000/sim3d/>.
 Pick a wall, set climber dimensions, hit **Start session**, and use
 the per-limb dropdowns or the **Live (60 Hz)** button to drive the
-sim.
+sim. Limb moves are continuous now (Cartesian-impedance reach), so
+you'll see the body actually swing into the next hold.
 
 For headless smoke tests inside the container:
 
@@ -174,8 +175,34 @@ docker compose exec beta-engine python -m sim3d --headless --frames 120
 docker compose exec beta-engine python -m sim3d --headless --beta h_006 RH:h_008 LF:h_005
 ```
 
+### 9) Train an RL agent + replay it
+
+```bash
+# Optional dep — kept out of requirements.txt so the base install stays small.
+pip install stable-baselines3 tensorboard
+
+# Quick smoke (1500 steps, ~1 min on CPU):
+python -m sim3d.train --steps 1500 --episode-steps 6 --run-id smoke
+
+# Real run on a MoonBoard problem:
+python -m sim3d.train --moonboard data/moonboard/sample-problems.json \
+                     --problem 19215 --steps 200_000 --run-id mb_v4
+
+# View the run.
+ls data/runs/sim3d/mb_v4/
+#   ├── config.json
+#   ├── episode_stats.csv      # one row per episode
+#   ├── tb/                    # tensorboard --logdir <this>
+#   └── model.zip
+
+# Replay the trained policy in the native MuJoCo viewer:
+python -m sim3d --play data/runs/sim3d/mb_v4/model.zip \
+               --moonboard data/moonboard/sample-problems.json --problem 19215
+```
+
 See [`sim3d/README.md`](sim3d/README.md) for the body model, wall
-angle convention, and tuning notes.
+angle convention, training tips, and the MoonBoard
+vertical-projection flag.
 
 ---
 
