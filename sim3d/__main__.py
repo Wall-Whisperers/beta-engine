@@ -239,6 +239,27 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         model = sb3.PPO.load(args.play)
+        model_obs_shape = getattr(model.observation_space, "shape", None)
+        env_obs_shape = getattr(env.observation_space, "shape", None)
+        if model_obs_shape != env_obs_shape:
+            expected = model_obs_shape[0] if model_obs_shape else model_obs_shape
+            actual = env_obs_shape[0] if env_obs_shape else env_obs_shape
+            raise SystemExit(
+                "Saved policy is incompatible with the replay environment: "
+                f"model expects observation shape {model_obs_shape}, but "
+                f"--wall {wall.wall_id!r} produces {env_obs_shape}.\n"
+                "For this env, observation size changes with the number of holds "
+                "(four limb-on-hold one-hot vectors), climber model/action mode, "
+                "and other training config. Replay with the exact wall/config used "
+                "for training, or retrain the model. "
+                f"Observed dimensions: model={expected}, replay_env={actual}."
+            )
+        if getattr(model.action_space, "n", None) != getattr(env.action_space, "n", None):
+            raise SystemExit(
+                "Saved policy action space is incompatible with the replay "
+                f"environment: model={model.action_space}, env={env.action_space}. "
+                "Replay with the exact training env or retrain."
+            )
         print(f"Loaded policy from {args.play}")
         print(f"Wall: {wall.name} ({len(wall.holds)} holds)")
         print("Native viewer running. Each policy action takes "

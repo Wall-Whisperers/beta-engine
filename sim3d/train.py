@@ -215,8 +215,14 @@ def train(cfg: TrainConfig) -> Path:
     print(f"  episode CSV:  {out_dir / 'episode_stats.csv'}")
     if tb_log:
         print(f"  tensorboard:  tensorboard --logdir {out_dir / 'tb'}")
-    print(f"  replay:       python -m sim3d --play {out_dir / 'model.zip'} "
-          f"--wall {cfg.wall}")
+    replay_cmd = f"python -m sim3d --play {out_dir / 'model.zip'}"
+    if cfg.moonboard_file:
+        replay_cmd += f" --moonboard {cfg.moonboard_file}"
+        if cfg.moonboard_problem_id is not None:
+            replay_cmd += f" --problem {cfg.moonboard_problem_id}"
+    else:
+        replay_cmd += f" --wall {cfg.wall}"
+    print(f"  replay:       {replay_cmd}")
     return out_dir / "model.zip"
 
 

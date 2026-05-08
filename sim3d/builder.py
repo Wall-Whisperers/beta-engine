@@ -352,14 +352,13 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
 
     # Plate half-sizes (X=along-wall, Y=thickness, Z=up-the-wall).
     plate_half = (plate_w / 2.0, cfg.WALL_THICKNESS_M / 2.0, plate_h / 2.0)
-    plate_xml = f"""
+    plate_open_xml = f"""
     <body name="wall_plate" pos="{cx:.5f} {cy:.5f} {cz:.5f}" axisangle="{plate_axisangle}">
         <geom name="g_wall" type="box"
               size="{plate_half[0]:.4f} {plate_half[1]:.4f} {plate_half[2]:.4f}"
               rgba="0.85 0.82 0.75 1"
               friction="{fric[0]} {fric[1]} {fric[2]}"
               contype="1" conaffinity="1"/>
-    </body>
     """
 
     # ── Holds — children of the wall plate. ──────────────────────────
@@ -441,7 +440,13 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
             "is_foothold_only": (h.hold_type == "foothold"),
         })
 
-    return plate_xml + "\n".join(hold_geoms), hold_meta
+    # Hold geoms must be children of the rotated wall body. If they are
+    # emitted as worldbody siblings, MuJoCo interprets their positions in
+    # world coordinates, so the renderer shows them floating in the wrong
+    # place even though hold_meta still points limb constraints at the
+    # intended wall-space locations.
+    wall_xml = plate_open_xml + "\n".join(hold_geoms) + "\n    </body>"
+    return wall_xml, hold_meta
 
 
 # ─── Mocap targets + equality constraints ─────────────────────────────────
