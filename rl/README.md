@@ -84,9 +84,9 @@ Add `gymnasium.wrappers.TimeLimit`, `Monitor`, `VecEnv` etc. as
 usual; the env doesn't do anything weird that would break those
 wrappers.
 
-We deliberately *don't* depend on Stable-Baselines3 in
-`requirements.txt` — keeping the docker image small. Add it manually
-when you're ready to train (`pip install stable-baselines3[extra]`).
+Stable-Baselines3 is pinned in the project `requirements.txt` now, so the
+snippet above works after `pip install -r requirements.txt`. If you want SB3's
+extra Atari/video tooling, install `stable-baselines3[extra]` in your own venv.
 
 ---
 
@@ -102,14 +102,15 @@ when you're ready to train (`pip install stable-baselines3[extra]`).
 
 ## Future work
 
-- **Train** something real: even masked random hits the finish ~80 %
-  of the time on the 13-hold example. PPO should crush it.
+- **Train** something real: the env is SB3-compatible, but this package still
+  ships only smoke-test/random-policy helpers. Use the snippet above as the
+  starting point for a 2D PPO experiment.
 - **Continuous actions**: today the action space is discrete
   `(limb, hold)`. Real climbing is continuous (target velocity, grip
   force, body shift). Switch to `Box` observations once dynamic moves
   are modelled.
 - **Procedural walls**: the agent currently overfits to one wall.
-  Train on synthetic walls (a Phase-4 generator) for a policy that
+  Train on synthetic or MoonBoard-derived walls for a policy that
   generalises to unseen routes.
 - **Self-play / curriculum**: increasing wall difficulty, varying
   climber profiles (different reach, strength).

@@ -30,12 +30,49 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 from typing import Iterable
 
 from solver.wall import load_wall
 from sim3d import Climb3DWorld, ClimberProfile
 from sim3d.body import LIMBS
 
+
+def replay_command_from_run_config(model_path: str) -> str | None:
+    """Return a replay command reconstructed from a training run config.
+
+    Older training output could suggest replaying a MoonBoard-trained model
+    with ``--wall``. When the model lives beside ``config.json``, use that
+    config to show the wall/source and profile that match the saved policy.
+    """
+    cfg_path = Path(model_path).with_name("config.json")
+    if not cfg_path.exists():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    cmd = f"python -m sim3d --play {model_path}"
+    if cfg.get("moonboard_file"):
+        cmd += f" --moonboard {cfg['moonboard_file']}"
+        if cfg.get("moonboard_problem_id") is not None:
+            cmd += f" --problem {cfg['moonboard_problem_id']}"
+    else:
+        cmd += f" --wall {cfg.get('wall', 'example-v2-boulder')}"
+
+    for arg, key in (
+        ("height", "height_cm"),
+        ("wingspan", "wingspan_cm"),
+        ("mass", "mass_kg"),
+    ):
+        if key in cfg:
+            cmd += f" --{arg} {cfg[key]}"
+    if cfg.get("move_mode"):
+        cmd += f" --move-mode {cfg['move_mode']}"
+    if cfg.get("move_frames"):
+        cmd += f" --play-frames {cfg['move_frames']}"
+    return cmd
 
 def parse_beta(tokens: Iterable[str]) -> list[tuple[str, str]]:
     """Parse the --beta argument into a list of (limb, hold_id) moves.
@@ -105,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         "--play", metavar="MODEL.zip",
         help="Run a saved SB3 PPO model in the viewer instead of "
              "manual controls. Pair with --wall or --moonboard. "
-             "Requires `pip install stable-baselines3`.",
+             "Installed by `pip install -r requirements.txt`.",
     )
     p.add_argument(
         "--play-frames", type=int, default=120,
@@ -239,6 +276,33 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         model = sb3.PPO.load(args.play)
+        model_obs_shape = getattr(model.observation_space, "shape", None)
+        env_obs_shape = getattr(env.observation_space, "shape", None)
+        if model_obs_shape != env_obs_shape:
+            expected = model_obs_shape[0] if model_obs_shape else model_obs_shape
+            actual = env_obs_shape[0] if env_obs_shape else env_obs_shape
+            hint = replay_command_from_run_config(args.play)
+            hint_msg = f"\nTry the saved run config replay command:\n  {hint}" if hint else ""
+            raise SystemExit(
+                "Saved policy is incompatible with the replay environment: "
+                f"model expects observation shape {model_obs_shape}, but "
+                f"the selected wall/config produces {env_obs_shape}.\n"
+                "For this env, observation size changes with the number of holds "
+                "(four limb-on-hold one-hot vectors), climber model/action mode, "
+                "and other training config. Replay with the exact wall/config used "
+                "for training, or retrain the model. "
+                f"Observed dimensions: model={expected}, replay_env={actual}."
+                f"{hint_msg}"
+            )
+        if getattr(model.action_space, "n", None) != getattr(env.action_space, "n", None):
+            hint = replay_command_from_run_config(args.play)
+            hint_msg = f" Try: {hint}" if hint else ""
+            raise SystemExit(
+                "Saved policy action space is incompatible with the replay "
+                f"environment: model={model.action_space}, env={env.action_space}. "
+                "Replay with the exact training env or retrain."
+                f"{hint_msg}"
+            )
         print(f"Loaded policy from {args.play}")
         print(f"Wall: {wall.name} ({len(wall.holds)} holds)")
         print("Native viewer running. Each policy action takes "
