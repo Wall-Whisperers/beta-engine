@@ -34,6 +34,11 @@ docker compose exec beta-engine python -m physics --wall example-v2-boulder \
 # Different climber — height/wingspan/mass change which holds are reachable
 docker compose exec beta-engine python -m physics --wall example-v2-boulder \
   --height-cm 190 --wingspan-cm 185 --mass-kg 80 --gif
+
+# MoonBoard smoke test — load one problem and add arbitrary fake moves
+docker compose exec beta-engine python -m physics \
+  --moonboard-file moonboard_data/moonboard1.json --moonboard-problem-id 19215 \
+  --demo-moves --gif
 ```
 
 Outputs land in `./data/runs/`:
@@ -51,6 +56,9 @@ data/runs/
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--wall <id\|path>` | — | wall_id or path to a JSON file |
+| `--moonboard-file <path>` | — | MoonBoard problem JSON to adapt into a physics wall |
+| `--moonboard-problem-id <id>` | first problem | problem id inside `--moonboard-file` |
+| `--moonboard-vertical-projection` | off | display MoonBoard row spacing as vertical photo-like spacing |
 | `--height-cm` | 175 | climber height |
 | `--wingspan-cm` | 175 | climber wingspan |
 | `--mass-kg` | 70 | climber mass — affects gravity load on each limb |
@@ -60,6 +68,7 @@ data/runs/
 | `--gif` | off | render an animated GIF instead of a PNG |
 | `--solve` | off | plan a beta with `solver.astar` and play it through physics |
 | `--moves` | — | comma-separated `LIMB:hold_id` pairs; lets you script a beta directly |
+| `--demo-moves` | off | use arbitrary route holds as a quick movement smoke test |
 
 ---
 

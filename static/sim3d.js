@@ -227,6 +227,7 @@ function buildWallAndHolds(pose) {
     // rotating around X by -theta (sends +Y → (0, cosθ, -sinθ) which
     // is exactly the wall outward normal in our convention).
     holdMeshes = {};
+    holdRings = {};
     for (const [hid, info] of Object.entries(pose.static.holds)) {
         const radius = info.radius;
         const colorHex = info.color || '#888888';
@@ -267,6 +268,7 @@ function buildWallAndHolds(pose) {
             // Because RingGeometry's "front face" is +Z, rotating around X by
             // (-theta + π/2) puts the disc parallel to the wall surface.
             scene.add(ring);
+            holdRings[hid] = ring;
         }
     }
 
@@ -303,6 +305,7 @@ function quatThreeFromMujoco(q) {
 }
 
 function applyPose(pose) {
+    if (session) session.pose = pose;
     for (const [name, mesh] of Object.entries(bodyMeshes)) {
         const data = pose.bodies[name];
         if (!data) continue;
@@ -340,7 +343,22 @@ async function loadWallList() {
         opt.textContent = wid;
         sel.appendChild(opt);
     }
-    if (j.walls.length === 0) {
+
+    const mr = await fetch('/sim3d/api/moonboard');
+    if (mr.ok) {
+        const mj = await mr.json();
+        for (const file of mj.files ?? []) {
+            if (file.error) continue;
+            for (const problem of file.sample ?? []) {
+                const opt = document.createElement('option');
+                opt.value = `moonboard:${file.file}:${problem.id}`;
+                opt.textContent = `MoonBoard ${file.file} · ${problem.name} (${problem.grade})`;
+                sel.appendChild(opt);
+            }
+        }
+    }
+
+    if (sel.options.length === 0) {
         sel.innerHTML = '<option>(no walls — create one in the editor)</option>';
     }
 }
@@ -352,17 +370,26 @@ async function startSession() {
         // Tear down old meshes
         for (const m of Object.values(bodyMeshes)) scene.remove(m);
         for (const m of Object.values(holdMeshes)) scene.remove(m);
+        for (const m of Object.values(holdRings)) scene.remove(m);
         bodyMeshes = {};
         holdMeshes = {};
+        holdRings = {};
     }
 
+    const selectedWall = document.getElementById('wall-select').value;
     const payload = {
-        wall_id: document.getElementById('wall-select').value,
+        wall_id: selectedWall,
         height_cm: parseFloat(document.getElementById('height').value),
         wingspan_cm: parseFloat(document.getElementById('wingspan').value),
         mass_kg: parseFloat(document.getElementById('mass').value),
         seed: true,
     };
+    if (selectedWall.startsWith('moonboard:')) {
+        const [, moonboardFile, moonboardProblemId] = selectedWall.split(':');
+        payload.moonboard_file = moonboardFile;
+        payload.moonboard_problem_id = parseInt(moonboardProblemId, 10);
+        payload.moonboard_vertical_projection = true;
+    }
     const r = await fetch('/sim3d/api/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -383,6 +410,7 @@ async function startSession() {
 
     populateLimbControls(j.pose);
     document.getElementById('reset-btn').disabled = false;
+    document.getElementById('demo-btn').disabled = false;
 }
 
 function populateLimbControls(pose) {
@@ -414,6 +442,33 @@ function populateLimbControls(pose) {
     }
 }
 
+async function moveLimb(limb, holdId, mode = 'reach') {
+    if (!session) return;
+    const r = await fetch(`/sim3d/api/session/${session.id}/move`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ limb, hold_id: holdId, mode }),
+    });
+    if (r.ok) applyPose(await r.json());
+}
+
+async function demoFakeMoves() {
+    if (!session) return;
+    const pose = session.pose;
+    const starts = new Set(Object.values(pose.limbs).filter(Boolean));
+    const targets = Object.keys(pose.holds).filter(hid => !starts.has(hid)).sort();
+    const script = [
+        ['RH', targets[0]],
+        ['LH', targets[1] ?? targets[0]],
+        ['RF', targets[2] ?? targets[0]],
+        ['LF', targets[3] ?? targets[1] ?? targets[0]],
+    ].filter(([, hid]) => hid);
+    for (const [limb, holdId] of script) {
+        await moveLimb(limb, holdId, 'reach');
+        await step(18);
+    }
+}
+
 async function step(frames) {
     if (!session) return;
     const r = await fetch(`/sim3d/api/session/${session.id}/step`, {
@@ -425,6 +480,7 @@ async function step(frames) {
 }
 
 document.getElementById('start-btn').onclick = startSession;
+document.getElementById('demo-btn').onclick = demoFakeMoves;
 document.getElementById('step1').onclick = () => step(6);    // 0.1 s
 document.getElementById('step10').onclick = () => step(60);  // 1.0 s
 document.getElementById('reset-btn').onclick = async () => {

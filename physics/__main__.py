@@ -27,7 +27,7 @@ from physics.body import ClimberProfile
 from physics.render import render_animation, render_still
 from physics.world import ClimbWorld
 from solver.body import BodyModel
-from solver.wall import load_wall
+from solver.wall import Wall, load_wall
 
 
 def _runs_dir() -> Path:
@@ -78,10 +78,59 @@ def _starting_holds(wall) -> tuple[Optional[str], Optional[str], Optional[str], 
     return lh, rh, lf, rf
 
 
+def _load_moonboard_wall(
+    moonboard_file: str,
+    *,
+    problem_id: int | None = None,
+    vertical_projection: bool = False,
+) -> Wall:
+    from sim3d.moonboard import (
+        find_problem,
+        load_moonboard_problems,
+        moonboard_problem_to_wall,
+    )
+
+    problems = load_moonboard_problems(moonboard_file)
+    problem = (
+        find_problem(problems, id=problem_id)
+        if problem_id is not None else None
+    )
+    if problem is None:
+        problem = problems[0] if problems else None
+    if problem is None:
+        raise FileNotFoundError(f"no MoonBoard problems found in {moonboard_file}")
+    print(f"MoonBoard: {Path(moonboard_file).name} problem={problem.id} {problem.name!r}")
+    return moonboard_problem_to_wall(problem, vertical_projection=vertical_projection)
+
+
+def _demo_moves_for_wall(wall: Wall) -> list[tuple[str, str]]:
+    """Build a tiny arbitrary beta from route holds so smoke-test GIFs move."""
+    starts = {h.hold_id for h in wall.starts()}
+    route_holds = [h for h in wall.holds if h.hold_id not in starts]
+    route_holds.sort(key=lambda h: (h.y_cm, h.x_cm))
+    hand_targets = [h.hold_id for h in route_holds if h.usable_for_hand()]
+    foot_targets = [h.hold_id for h in route_holds if h.usable_for_foot()]
+
+    moves: list[tuple[str, str]] = []
+    for limb, hid in zip(
+        ("RH", "LH", "RF", "LF", "RH", "LH"),
+        hand_targets + foot_targets,
+    ):
+        moves.append((limb, hid))
+    return moves
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="physics", description=__doc__)
-    p.add_argument("--wall", required=True,
+    p.add_argument("--wall", default=None,
                    help="wall_id or path to a JSON file")
+    p.add_argument("--moonboard-file",
+                   help="MoonBoard problem JSON to adapt into a physics wall, "
+                        "e.g. moonboard_data/moonboard1.json")
+    p.add_argument("--moonboard-problem-id", type=int, default=None,
+                   help="problem id inside --moonboard-file; defaults to first problem")
+    p.add_argument("--moonboard-vertical-projection", action="store_true",
+                   help="display MoonBoard row spacing as vertical photo-like spacing")
     p.add_argument("--height-cm", type=float, default=175.0)
     p.add_argument("--wingspan-cm", type=float, default=175.0)
     p.add_argument("--mass-kg", type=float, default=70.0)
@@ -99,11 +148,22 @@ def main(argv: list[str] | None = None) -> int:
                         "'RF:h_005,LF:h_007,RH:h_008,LH:h_006,RH:h_013'. "
                         "Lets you script a beta directly; useful when "
                         "the solver can't find one yet.")
+    p.add_argument("--demo-moves", action="store_true",
+                   help="use arbitrary route holds as a quick movement smoke test")
     p.add_argument("--frames-per-move", type=int, default=20,
                    help="how many rendered frames each move occupies")
     args = p.parse_args(argv)
 
-    wall = load_wall(args.wall, cell_size_cm=args.cell_size_cm)
+    if args.moonboard_file:
+        wall = _load_moonboard_wall(
+            args.moonboard_file,
+            problem_id=args.moonboard_problem_id,
+            vertical_projection=args.moonboard_vertical_projection,
+        )
+    elif args.wall:
+        wall = load_wall(args.wall, cell_size_cm=args.cell_size_cm)
+    else:
+        p.error("provide either --wall or --moonboard-file")
     body_model = BodyModel(height_cm=args.height_cm, wingspan_cm=args.wingspan_cm)
     profile = ClimberProfile(body=body_model, mass_kg=args.mass_kg)
 
@@ -130,6 +190,9 @@ def main(argv: list[str] | None = None) -> int:
             limb, hid = tok.split(":")
             move_plan.append((limb.strip(), hid.strip()))
         print(f"using --moves: {len(move_plan)} hand-rolled steps.")
+    elif args.demo_moves:
+        move_plan = _demo_moves_for_wall(wall)
+        print(f"using --demo-moves: {len(move_plan)} arbitrary smoke-test steps.")
     elif args.solve:
         from solver.astar import solve_astar
         result = solve_astar(wall, body_model)
