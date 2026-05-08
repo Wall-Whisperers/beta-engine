@@ -10,3 +10,4 @@ data/walls/
 
 # Solver outputs (PNG/GIF beta visualizations).
 data/runs/
+temp

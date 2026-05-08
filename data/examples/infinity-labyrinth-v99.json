@@ -1,0 +1,185 @@
+{
+  "wall_id": "infinity-labyrinth-v99",
+  "grid": {
+    "cols": 25,
+    "rows": 40
+  },
+  "holds":[
+    {
+      "hold_id": "h_001",
+      "grid_x": 1,
+      "grid_y": 0,
+      "hold_type": "foothold",
+      "orientation_deg": 0,
+      "size": "small",
+      "color": "#ff1493",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_002",
+      "grid_x": 23,
+      "grid_y": 0,
+      "hold_type": "foothold",
+      "orientation_deg": 0,
+      "size": "small",
+      "color": "#ff1493",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_003",
+      "grid_x": 0,
+      "grid_y": 2,
+      "hold_type": "sloper",
+      "orientation_deg": 270,
+      "size": "large",
+      "color": "#39ff14",
+      "is_start": true,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_004",
+      "grid_x": 24,
+      "grid_y": 2,
+      "hold_type": "crimp",
+      "orientation_deg": 90,
+      "size": "small",
+      "color": "#39ff14",
+      "is_start": true,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_005",
+      "grid_x": 5,
+      "grid_y": 8,
+      "hold_type": "pinch",
+      "orientation_deg": 180,
+      "size": "small",
+      "color": "#000000",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_006",
+      "grid_x": 19,
+      "grid_y": 8,
+      "hold_type": "pinch",
+      "orientation_deg": 180,
+      "size": "small",
+      "color": "#000000",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_007",
+      "grid_x": 12,
+      "grid_y": 12,
+      "hold_type": "jug",
+      "orientation_deg": 0,
+      "size": "large",
+      "color": "#ffff00",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_008",
+      "grid_x": 8,
+      "grid_y": 20,
+      "hold_type": "sloper",
+      "orientation_deg": 180,
+      "size": "large",
+      "color": "#8a0303",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_009",
+      "grid_x": 16,
+      "grid_y": 20,
+      "hold_type": "sloper",
+      "orientation_deg": 180,
+      "size": "large",
+      "color": "#8a0303",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_010",
+      "grid_x": 12,
+      "grid_y": 23,
+      "hold_type": "foothold",
+      "orientation_deg": 0,
+      "size": "small",
+      "color": "#8a0303",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_011",
+      "grid_x": 6,
+      "grid_y": 26,
+      "hold_type": "crimp",
+      "orientation_deg": 270,
+      "size": "small",
+      "color": "#8a0303",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_012",
+      "grid_x": 18,
+      "grid_y": 26,
+      "hold_type": "crimp",
+      "orientation_deg": 90,
+      "size": "small",
+      "color": "#8a0303",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_013",
+      "grid_x": 9,
+      "grid_y": 28,
+      "hold_type": "crimp",
+      "orientation_deg": 315,
+      "size": "small",
+      "color": "#8a0303",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_014",
+      "grid_x": 15,
+      "grid_y": 28,
+      "hold_type": "crimp",
+      "orientation_deg": 45,
+      "size": "small",
+      "color": "#8a0303",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_015",
+      "grid_x": 12,
+      "grid_y": 29,
+      "hold_type": "sloper",
+      "orientation_deg": 180,
+      "size": "large",
+      "color": "#8a0303",
+      "is_start": false,
+      "is_finish": false
+    },
+    {
+      "hold_id": "h_016",
+      "grid_x": 12,
+      "grid_y": 39,
+      "hold_type": "crimp",
+      "orientation_deg": 180,
+      "size": "small",
+      "color": "#ffffff",
+      "is_start": false,
+      "is_finish": true
+    }
+  ]
+}
