@@ -77,16 +77,17 @@ everything downstream depends on.
 {
   "wall_id": "my-wall",
   "name": "optional display name",
-  "grid": { "cols": 10, "rows": 14 },
+  "grid": { "cols": 10, "rows": 14, "cell_size_cm": 20.0 },
+  "wall_angle_deg": 0.0,
+  "surface_friction": 0.7,
   "holds": [ ]
 }
 ```
 
 `wall_id` must match `^[A-Za-z0-9_\-]{1,64}$` — it doubles as the filename.
-
-> **Note:** `cell_size_cm` is not in the schema yet. The solver defaults to
-> 20 cm per cell with a warning. This is a Phase 3 prerequisite — see
-> [`planning-gabe.md`](../planning-gabe.md) for the open discussion.
+`grid.cell_size_cm` is optional for older files; loaders default to 20 cm and
+warn if it is absent. `wall_angle_deg` and `surface_friction` are optional
+physics/sim3d fields used by the downstream simulators.
 
 ---
 
