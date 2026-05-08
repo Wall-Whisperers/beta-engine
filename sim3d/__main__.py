@@ -142,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         "--play", metavar="MODEL.zip",
         help="Run a saved SB3 PPO model in the viewer instead of "
              "manual controls. Pair with --wall or --moonboard. "
-             "Requires `pip install stable-baselines3`.",
+             "Installed by `pip install -r requirements.txt`.",
     )
     p.add_argument(
         "--play-frames", type=int, default=120,

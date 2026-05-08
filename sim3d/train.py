@@ -4,10 +4,9 @@ Wraps Stable-Baselines3 PPO around `Climbing3DEnv`, logs episode
 stats to CSV + TensorBoard, and saves the trained policy to a run
 directory you can later replay in the viewer.
 
-Stable-Baselines3 is an **optional** dependency — install it with
-`pip install stable-baselines3` (it's intentionally NOT in
-requirements.txt to keep the base install lean). If missing, this
-module raises a clear ImportError with the install command.
+Stable-Baselines3 is pinned in the project requirements because this module
+is the supported PPO training entry point. If it is missing, this module raises
+a clear ImportError with the install command.
 
 Run directory layout:
 
@@ -43,8 +42,7 @@ def _require_sb3():
     except ImportError as e:
         raise ImportError(
             "sim3d.train requires stable-baselines3. "
-            "Install with:  pip install stable-baselines3\n"
-            "(kept out of requirements.txt so the base install stays small)"
+            "Install project dependencies with:  pip install -r requirements.txt"
         ) from e
 
 
@@ -222,6 +220,13 @@ def train(cfg: TrainConfig) -> Path:
             replay_cmd += f" --problem {cfg.moonboard_problem_id}"
     else:
         replay_cmd += f" --wall {cfg.wall}"
+    replay_cmd += (
+        f" --height {cfg.height_cm}"
+        f" --wingspan {cfg.wingspan_cm}"
+        f" --mass {cfg.mass_kg}"
+        f" --move-mode {cfg.move_mode}"
+        f" --play-frames {cfg.move_frames}"
+    )
     print(f"  replay:       {replay_cmd}")
     return out_dir / "model.zip"
 

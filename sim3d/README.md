@@ -45,7 +45,7 @@ sim3d/
 │                    #   continuous-reach Cartesian-impedance controller
 ├── env.py           # Climbing3DEnv — Gymnasium wrapper for RL training
 ├── moonboard.py     # MoonBoard problem JSON → Wall adapter
-├── train.py         # PPO trainer (optional SB3 dep) + episode CSV logger
+├── train.py         # PPO trainer (SB3) + episode CSV logger
 ├── viewer.py        # native MuJoCo viewer wrapper
 ├── web.py           # Flask blueprint for the three.js front-end
 └── __main__.py      # `python -m sim3d` CLI demo (incl. --play <model>)
@@ -342,7 +342,7 @@ limb-tip positions + per-limb on-hold one-hot + distance-to-finish.
 Drop-in compatible with Stable-Baselines3:
 
 ```python
-from stable_baselines3 import PPO  # `pip install stable-baselines3` separately
+from stable_baselines3 import PPO  # installed by requirements.txt
 model = PPO("MlpPolicy", Climbing3DEnv(wall), verbose=1)
 model.learn(total_timesteps=100_000)
 ```
@@ -352,17 +352,14 @@ model.learn(total_timesteps=100_000)
 The included `sim3d.train` module wraps PPO + episode-stat logging:
 
 ```bash
-# 1. Install SB3 (optional dep, kept out of requirements.txt to keep base small)
-pip install stable-baselines3 tensorboard
-
-# 2. Train. Defaults to the example wall, ~100k timesteps, mode=reach.
+# 1. Train. Defaults to the example wall, ~100k timesteps, mode=reach.
 python -m sim3d.train --steps 100_000
 
 # Or train on a MoonBoard problem with vertical projection:
 python -m sim3d.train --moonboard data/moonboard/sample-problems.json \
                      --problem 19215 --steps 200_000
 
-# 3. View results.
+# 2. View results.
 ls data/runs/sim3d/run_<timestamp>/
 #   ├── config.json         # hyperparams + wall + climber profile
 #   ├── episode_stats.csv   # one row per episode (reward, length, outcome, com_z, slips)
@@ -374,7 +371,7 @@ tensorboard --logdir data/runs/sim3d/run_<timestamp>/tb
 # or just grep the CSV:
 column -ts, data/runs/sim3d/run_<timestamp>/episode_stats.csv | head -20
 
-# 4. Replay the policy in the native MuJoCo viewer:
+# 3. Replay the policy in the native MuJoCo viewer:
 python -m sim3d --play data/runs/sim3d/run_<timestamp>/model.zip
 ```
 
