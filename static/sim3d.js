@@ -168,11 +168,11 @@ function buildClimberMeshes(profile) {
         meshes[`${side}_forearm`] = foreG;
 
         const handG = new THREE.Group();
-        const handBox = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.05, 0.12), hMat(skin));
-        // Match MJCF: hand body origin is at the wrist, while the box is
-        // centred 6 cm down the local -Z axis and the contact site is on
-        // the lower face. Without this offset, the rendered hand appears
-        // to miss the hold even when the physics tip is attached.
+        const handBox = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.05, 0.12), hMat(skin));
+        // The server streams the MuJoCo hand body origin at the wrist. In the
+        // MJCF, the visible hand box is centered 6 cm down local -Z and the
+        // fingertip/contact site is on the lower face. Mirror that offset so
+        // a physically attached hand does not look like it is missing the hold.
         handBox.position.z = -0.06;
         handG.add(handBox);
         meshes[`${side}_hand`] = handG;

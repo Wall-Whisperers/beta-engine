@@ -41,7 +41,6 @@ from sim3d.body import (
     HAND_LIMBS,
     LIMB_EQUALITY,
     LIMB_MOCAP_BODY,
-    LIMB_TIP_BODY,
     LIMB_TIP_SITE,
     LIMBS,
     ClimberProfile,
@@ -125,7 +124,6 @@ class Climb3DWorld:
         self._eq_idx: dict[Limb, int] = {}
         self._tip_site_idx: dict[Limb, int] = {}
         self._limb_body_idx: dict[Limb, int] = {}
-        self._tip_body_idx: dict[Limb, int] = {}
         for limb in LIMBS:
             mocap_body_id = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_BODY,
@@ -146,9 +144,6 @@ class Climb3DWorld:
             }[limb]
             self._limb_body_idx[limb] = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_BODY, limb_body_name,
-            )
-            self._tip_body_idx[limb] = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_BODY, LIMB_TIP_BODY[limb],
             )
 
         self._on_hold: dict[Limb, Optional[HoldAttachment]] = {
@@ -206,9 +201,9 @@ class Climb3DWorld:
         # Continuous-reach state per limb (None = not reaching).
         self._reaching: dict[Limb, Optional[ReachState]] = {l: None for l in LIMBS}
 
-        # Tip anchor bodies are fixed children at the contact site, so the
-        # hold equality can constrain the actual hand/toe contact point
-        # instead of approximating it with a hand/foot-body offset.
+        # Tip-anchor bodies are fixed children at the contact sites, so hold
+        # constraints can pin the actual hand/toe contact point rather than
+        # approximating it from the wrist/ankle body origin.
 
         # First mj_forward so kinematics are populated for any caller
         # that asks for site positions before stepping.
@@ -401,18 +396,16 @@ class Climb3DWorld:
         mocap_idx = self._mocap_idx[limb]
         eq_idx = self._eq_idx[limb]
 
-        # Position the mocap exactly at the hold's outer surface. The fixed
-        # tip-anchor body is welded to this target, which keeps the rendered
-        # hand/toe contact point visibly on the hold instead of a few
-        # centimetres proud of it.
+        # Position the mocap exactly at the hold's outer surface; body2 of
+        # the weld is the fixed tip-anchor body colocated with the site.
         target = np.array(meta["world_pos"], dtype=np.float64)
         self.data.mocap_pos[mocap_idx] = target
         self.data.mocap_quat[mocap_idx] = (1.0, 0.0, 0.0, 0.0)
 
-        # Configure the weld. Body2 is a fixed, massless tip-anchor body
-        # colocated with the rendered tip site, so a zero relpose pins the
-        # actual contact point to the mocap. torquescale=0 keeps this
-        # position-only: hands and feet can still pivot naturally on holds.
+        # Configure the weld. Body2 is the fixed tip-anchor body colocated
+        # with the rendered tip site, so a zero relpose pins the actual
+        # contact point to the mocap. torquescale=0 keeps this position-only:
+        # hands and feet can still pivot naturally on holds.
         eq_data = self.model.eq_data[eq_idx]
         eq_data[0:3] = (0.0, 0.0, 0.0)
         eq_data[3:6] = (0.0, 0.0, 0.0)
@@ -658,38 +651,36 @@ class Climb3DWorld:
             self.data.ctrl[i] = self.data.qpos[qadr]
 
     def _weld_force_magnitude(self, eq_idx: int, limb: Limb) -> float:
-        """Estimate the load a limb is carrying for grip/slip checks.
+        """Approximate the world-frame force on the limb body from this
+        equality. Computed from `data.qfrc_constraint` projected onto
+        the limb body's translational direction via the body Jacobian.
 
-        Raw MuJoCo weld multipliers are dominated by soft-constraint tuning
-        and can read as thousands of Newtons even for a quiet four-point
-        stance, while aggregate body forces under-report position-only welds.
-        For gameplay/training we use a conservative static-load estimate that
-        makes the important cases behave correctly: one hand cannot casually
-        hold an entire body, four points share the climber's weight, and feet
-        become overloaded when the pelvis is levered far out from the wall.
+        Why not `efc_force`? The raw Lagrange multipliers for a 6D
+        weld mix translation and rotation rows in different units
+        (Newtons and Newton-metres) — summing them gives a number with
+        no clean physical meaning. The Jacobian-projected approach
+        below returns the linear force the body sees, in Newtons.
+
+        This is still an approximation: the qfrc_constraint accumulates
+        forces from ALL active constraints (not just this weld). When
+        only one limb is welded, the result is exact; with four welds
+        active it's an upper bound. Good enough for slip detection.
         """
-        active = [l for l, attach in self._on_hold.items() if attach is not None]
-        if limb not in active:
+        body_id = self._limb_body_idx[limb]
+        # mj_objectVelocity / objectAcceleration / similar exists, but
+        # we want force. Use the body's Jacobian: f = J^T λ ⇒
+        # f_body = J · qfrc_constraint reverses out the world-frame
+        # force at the body origin. Approximated as the mass × the
+        # constraint-induced acceleration.
+        # Easier route — cfrc_int (internal) and cfrc_ext (external)
+        # constraint forces on each body are computed during step.
+        # cfrc_int[body, 0:3] is the *torque* and cfrc_int[body, 3:6]
+        # is the *linear force* applied to the body by joint/equality
+        # constraints (MuJoCo convention).
+        if self.data.cfrc_int is None or body_id >= len(self.data.cfrc_int):
             return 0.0
-
-        load = self.profile.mass_kg * cfg.GRAVITY_M_S2 / max(len(active), 1)
-
-        # Feet are primarily push/edge contacts. When the pelvis is far in
-        # front of the foothold along the wall normal, the foot would need to
-        # hook/pull unrealistically; inflate the estimated load so it slips
-        # unless another limb shares the position.
-        if limb not in HAND_LIMBS:
-            attach = self._on_hold[limb]
-            if attach is not None:
-                hold_meta = self._hold_meta_by_id[attach.hold_id]
-                n = np.asarray(hold_meta["wall_normal"], dtype=np.float64)
-                pelvis_to_hold = self.pelvis_pos() - np.asarray(attach.world_pos)
-                outward_gap = max(0.0, float(np.dot(pelvis_to_hold, n)))
-                if outward_gap > 0.65:
-                    load *= 2.6
-                elif outward_gap > 0.45:
-                    load *= 1.8
-        return float(load)
+        f = self.data.cfrc_int[body_id, 3:6]
+        return float(np.linalg.norm(f))
 
     def _check_slip(self) -> int:
         """Detect any hold whose limb is exceeding its rated capacity

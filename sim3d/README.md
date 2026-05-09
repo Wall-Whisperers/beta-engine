@@ -391,6 +391,43 @@ python grid_editor/server.py
 # paste data/runs/sim3d/run_<timestamp>/ into "RL policy replay"
 ```
 
+
+### Faster training: GPU, parallel CPU workers, and Colab
+
+`sim3d.train` now exposes the Stable-Baselines3/PyTorch device and the
+number of parallel MuJoCo rollout workers:
+
+```bash
+# Use CUDA for PPO neural-network updates when your PyTorch install sees a GPU.
+# MuJoCo environment stepping is still CPU-bound, so pair this with workers.
+python -m sim3d.train --steps 200_000 --device cuda --n-envs 8
+
+# If CUDA is not available, keep device=auto/cpu and scale rollout workers.
+python -m sim3d.train --steps 200_000 --device auto --n-envs 8
+```
+
+Important caveat: this project uses Stable-Baselines3 PPO with a MuJoCo
+Python environment. The policy network can train on GPU, but physics rollout
+still happens on CPU. For this codebase, `--n-envs` is usually the bigger
+speedup than GPU unless you also increase `--steps`, `--n-steps`, or network
+size enough for PPO updates to dominate runtime.
+
+A simple Google Colab workflow is:
+
+```bash
+# In a Colab notebook after enabling a GPU runtime:
+!git clone https://github.com/Wall-Whisperers/beta-engine.git
+%cd beta-engine
+!pip install -r requirements.txt
+!python -m sim3d.train --steps 200000 --device cuda --n-envs 2 --run-id colab_gpu
+
+# Download or archive data/runs/sim3d/colab_gpu/, then replay model.zip locally
+# or paste the run directory into the browser viewer's RL policy replay field.
+```
+
+If Colab runs out of RAM, reduce `--n-envs`; if GPU utilization is low, that is
+expected for CPU-bound MuJoCo rollouts.
+
 **What you should see in the CSV during training:**
 - Early episodes have rewards around 0–2 (mostly per-step penalties).
 - Successful episodes show `outcome=completed` with reward > 100.

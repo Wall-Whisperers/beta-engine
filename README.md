@@ -191,6 +191,9 @@ python -m sim3d.train --steps 1500 --episode-steps 6 --run-id smoke
 python -m sim3d.train --moonboard data/moonboard/sample-problems.json \
                      --problem 19215 --steps 200_000 --run-id mb_v4
 
+# Faster rollout collection on multi-core CPUs / Colab GPU runtimes:
+python -m sim3d.train --steps 200_000 --n-envs 8 --device auto --run-id fast
+
 # View the run.
 ls data/runs/sim3d/mb_v4/
 #   ├── config.json

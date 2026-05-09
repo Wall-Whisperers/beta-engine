@@ -143,20 +143,20 @@ JOINT_PASSIVE = {
 # brief said to "think about muscles" and we explicitly chose to model
 # them as torque-limited PD servos rather than Hill-type muscles, which
 # would 5× the simulator complexity for marginal RL benefit.
-ACTUATOR_KP = 95.0
-ACTUATOR_KV = 7.0
+ACTUATOR_KP = 120.0
+ACTUATOR_KV = 8.0
 
-# Per-joint torque cap (Nm). These are deliberately below elite peak
-# strength so the default climber cannot plank horizontally from one
-# hand or drive feet straight out normal to the wall without slipping.
+# Per-joint torque cap (Nm). Real climber peak ≈ 60–150 Nm shoulder,
+# 80 Nm spine, 200 Nm hip, 150 Nm knee. We keep these generous so failure
+# modes are geometric (out-of-reach), not actuator saturation.
 TORQUE_CAP_NM = {
-    "shoulder": 125.0,
-    "elbow":     85.0,
-    "wrist":     22.0,
-    "spine":     95.0,
-    "hip":      165.0,
-    "knee":     125.0,
-    "ankle":     55.0,
+    "shoulder": 180.0,
+    "elbow":    120.0,
+    "wrist":     30.0,
+    "spine":    120.0,
+    "hip":      220.0,
+    "knee":     180.0,
+    "ankle":     90.0,
 }
 
 # ─── Hold attachment ────────────────────────────────────────────────────────
@@ -176,10 +176,10 @@ HOLD_CONSTRAINT_SOLIMP = (0.95, 0.99, 0.001, 0.5, 2)
 # rather than teleport. Tuned by hand: enough force to overcome gravity
 # on the limb segment plus the actuator stiffness; not so much that the
 # tip overshoots.
-REACH_KP_HAND = 520.0      # N / m  — proportional gain pulling hand to target
-REACH_KD_HAND = 65.0       # N·s / m — velocity damping
-REACH_KP_FOOT = 500.0
-REACH_KD_FOOT = 70.0
+REACH_KP_HAND = 600.0      # N / m  — proportional gain pulling hand to target
+REACH_KD_HAND = 60.0       # N·s / m — velocity damping
+REACH_KP_FOOT = 800.0
+REACH_KD_FOOT = 80.0
 
 # Distance (m) at which the reach controller engages the weld. ~5 cm
 # matches the visual hold radius — when the hand is "on" the hold.
@@ -192,17 +192,18 @@ REACH_TIMEOUT_S = 1.5
 # Dyno: explosive whole-body extension when the moving limb is too far
 # for a static reach. We boost legs / hips toward extension and fly the
 # limb forward.
-DYNO_KP_BOOST = 2.0         # multiplier on REACH_KP for moving limb
-DYNO_LEG_PUSH_NM = 70.0     # extra Nm on knee+hip during dyno
+DYNO_KP_BOOST = 2.5         # multiplier on REACH_KP for moving limb
+DYNO_LEG_PUSH_NM = 100.0    # extra Nm on knee+hip during dyno
 DYNO_DURATION_S = 0.35
 
 # Slip model. We don't trust raw weld constraints to model breakaway —
-# the weld is rigid until released. Instead, every step estimates the
-# load each attached limb is carrying, and if it exceeds the hold's
+# the weld is rigid until released. Instead, every step we read the
+# constraint force on each active weld, and if it exceeds the hold's
 # capacity (max_force_n × this slack factor) we deactivate the weld.
 # Setting > 1.0 gives the climber more grip than the hold's rated
-# capacity; setting < 1.0 makes them slip more easily.
-SLIP_FORCE_SLACK = 1.0
+# capacity (real climbers do peak above hold-rated forces in dynos);
+# setting < 1.0 makes them slip more easily.
+SLIP_FORCE_SLACK = 1.25
 
 # Friction on the bare wall surface (used for slab smearing). Holds
 # carry their own per-hold friction patch.

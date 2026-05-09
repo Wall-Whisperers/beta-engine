@@ -141,12 +141,11 @@ class ClimberProfile:
     name: str = "average-climber"
 
     # Strength caps — used to compute attach max-force when grabbing
-    # holds. Keep one-hand capacity below a 70 kg bodyweight (≈686 N) so
-    # the simulator does not learn unrealistic one-arm hangs by default.
-    # Feet are weaker because the toe constraint mostly represents edging
-    # pressure, not a magic hook that can suspend the climber.
-    grip_force_n: float = 650.0
-    foot_push_force_n: float = 420.0
+    # holds. Real numbers from training literature: average climber
+    # can hang one-handed on a jug at body weight (≈700 N), so a 1.5×
+    # safety factor lets two hands easily hold body weight.
+    grip_force_n: float = 1100.0
+    foot_push_force_n: float = 1500.0
 
     @property
     def segments(self) -> Segments:
@@ -172,8 +171,8 @@ LIMB_TIP_SITE = {
 }
 
 # Fixed child bodies whose origins are colocated with the contact tip sites.
-# Equality constraints attach these bodies, not the hand/foot body origins, so
-# hands and toes visibly land on hold centres even as wrists/ankles rotate.
+# Equality constraints attach these bodies, not hand/foot body origins, so
+# the physical contact point lands on the hold while wrists/ankles can pivot.
 LIMB_TIP_BODY = {
     "LH": "tip_body_lh",
     "RH": "tip_body_rh",
