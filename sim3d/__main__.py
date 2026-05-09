@@ -58,6 +58,8 @@ def replay_command_from_run_config(model_path: str) -> str | None:
         cmd += f" --moonboard {cfg['moonboard_file']}"
         if cfg.get("moonboard_problem_id") is not None:
             cmd += f" --problem {cfg['moonboard_problem_id']}"
+        else:
+            cmd += " --moonboard-full-board"
     else:
         cmd += f" --wall {cfg.get('wall', 'example-v2-boulder')}"
 
@@ -70,6 +72,8 @@ def replay_command_from_run_config(model_path: str) -> str | None:
             cmd += f" --{arg} {cfg[key]}"
     if cfg.get("move_mode"):
         cmd += f" --move-mode {cfg['move_mode']}"
+    if cfg.get("start_mode") and cfg.get("start_mode") != "seed":
+        cmd += f" --start-mode {cfg['start_mode']}"
     if cfg.get("move_frames"):
         cmd += f" --play-frames {cfg['move_frames']}"
     return cmd
@@ -118,6 +122,10 @@ def main(argv: list[str] | None = None) -> int:
              "First match wins. Use this if you don't have the id.",
     )
     p.add_argument(
+        "--moonboard-full-board", action="store_true",
+        help="MoonBoard: include all 198 T-nut positions. Required to replay generalized split-trained policies.",
+    )
+    p.add_argument(
         "--vertical-projection", action="store_true",
         help="MoonBoard: lay holds out so each row's WORLD-Z spacing "
              "equals the cell size — looks like the photo of a vertical "
@@ -151,6 +159,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--move-mode", default="reach", choices=("snap", "reach", "dyno"),
         help="Limb-move mode for scripted betas and policy replay.",
+    )
+    p.add_argument(
+        "--start-mode", default="seed", choices=("seed", "ground-reach"),
+        help="seed = start welded on route holds; ground-reach = start on floor and reach to start hand holds.",
     )
     p.add_argument("--height", type=float, default=175.0,
                    help="Climber total height in cm.")
@@ -200,7 +212,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"(picked first problem: #{problem.id} {problem.name!r}; "
                   f"use --problem ID or --problem-name to choose)")
         wall = moonboard_problem_to_wall(
-            problem, vertical_projection=args.vertical_projection,
+            problem,
+            include_full_board=args.moonboard_full_board,
+            vertical_projection=args.vertical_projection,
         )
         proj_note = " (vertical-projection)" if args.vertical_projection else ""
         print(f"MoonBoard: \"{problem.name}\" by {problem.setter} — V{problem.grade}{proj_note}")
@@ -213,21 +227,45 @@ def main(argv: list[str] | None = None) -> int:
     )
     world = Climb3DWorld(wall, profile)
 
-    starts = wall.starts()
-    foots = [h for h in wall.holds if h.hold_type == "foothold"][:2]
-    if len(starts) >= 2 and len(foots) >= 2:
-        world.seed_pose(
-            lh=starts[0].hold_id, rh=starts[1].hold_id,
-            lf=foots[0].hold_id, rf=foots[1].hold_id,
-        )
+    def _start_hand_targets() -> tuple[str | None, str | None]:
+        starts = sorted(wall.starts(), key=lambda h: h.x_cm)
+        if len(starts) >= 2:
+            return starts[0].hold_id, starts[-1].hold_id
+        if len(starts) == 1:
+            return starts[0].hold_id, starts[0].hold_id
+        hand_low = sorted(
+            [h for h in wall.holds if h.usable_for_hand()],
+            key=lambda h: (h.y_cm, h.x_cm),
+        )[:2]
+        if len(hand_low) >= 2:
+            return hand_low[0].hold_id, hand_low[-1].hold_id
+        if len(hand_low) == 1:
+            return hand_low[0].hold_id, hand_low[0].hold_id
+        return None, None
+
+    if args.start_mode == "ground-reach":
+        lh, rh = _start_hand_targets()
+        world._sync_actuator_targets_to_pose()
+        if lh is not None:
+            world.move_limb("LH", lh, mode=args.move_mode)
+        if rh is not None:
+            world.move_limb("RH", rh, mode=args.move_mode)
     else:
-        # No starts marked — just hang at the bottom-most two holds.
-        bottom = sorted(wall.holds, key=lambda h: h.y_cm)[:4]
-        if len(bottom) >= 4:
+        starts = wall.starts()
+        foots = [h for h in wall.holds if h.hold_type == "foothold"][:2]
+        if len(starts) >= 2 and len(foots) >= 2:
             world.seed_pose(
-                lh=bottom[2].hold_id, rh=bottom[3].hold_id,
-                lf=bottom[0].hold_id, rf=bottom[1].hold_id,
+                lh=starts[0].hold_id, rh=starts[1].hold_id,
+                lf=foots[0].hold_id, rf=foots[1].hold_id,
             )
+        else:
+            # No starts marked — just hang at the bottom-most two holds.
+            bottom = sorted(wall.holds, key=lambda h: h.y_cm)[:4]
+            if len(bottom) >= 4:
+                world.seed_pose(
+                    lh=bottom[2].hold_id, rh=bottom[3].hold_id,
+                    lf=bottom[0].hold_id, rf=bottom[1].hold_id,
+                )
 
     if args.snapshot:
         snap = world.pose_snapshot()
@@ -265,12 +303,13 @@ def main(argv: list[str] | None = None) -> int:
         # Replay a trained policy in the native viewer.
         from sim3d.env import Climbing3DEnv, EnvConfig
         from sim3d.train import _require_sb3
-        sb3, _, _ = _require_sb3()
+        sb3, _, _, _ = _require_sb3()
         env = Climbing3DEnv(
             wall, profile,
             config=EnvConfig(
                 max_steps=30,
                 move_mode=args.move_mode,
+                start_mode=args.start_mode,
                 move_frames=args.play_frames,
                 enable_slip=args.slip,
             ),

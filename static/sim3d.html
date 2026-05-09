@@ -46,6 +46,11 @@
     <input type="number" id="wingspan" value="175" step="1" min="120" max="240" />
     <label>Mass (kg)</label>
     <input type="number" id="mass" value="70" step="1" min="30" max="150" />
+    <label>Start mode</label>
+    <select id="start-mode">
+      <option value="seed">Seed on start holds</option>
+      <option value="ground-reach">Ground → reach start hands</option>
+    </select>
 
     <button id="start-btn">Start session</button>
     <button class="secondary" id="reset-btn" disabled>Re-seed pose</button>

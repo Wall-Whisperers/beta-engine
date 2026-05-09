@@ -1075,3 +1075,27 @@ Next chunks:
    release commands, keeping the existing discrete move mode as a debug baseline.
 3. Upgrade the finish condition from action-count frames to an explicit 2-second
    controlled timer with body-velocity stability checks.
+
+### Chunk 1b — Ground-level start visualization and generalized replay fix
+
+Status: **completed**.
+
+Implemented pieces:
+
+- Added `start_mode="ground-reach"` to start the body from its ground-level
+  default pose and immediately begin continuous left/right hand reaches to the
+  official start hold(s), instead of welding the body directly onto the route.
+- Exposed the start mode through the training CLI, native simulator CLI, and web
+  viewer start controls.
+- Added full-board MoonBoard replay support so generalized split-trained models
+  can be replayed with the same 198-hold action/observation dimensions they were
+  trained with.
+
+Testable boundary:
+
+- Headless native sim can verify that `ground-reach` starts with no welded limbs
+  and active reaches to the MoonBoard start hand holds.
+- Tiny PPO runs now print replay commands containing `--moonboard-full-board`
+  for generalized MoonBoard split policies.
+- The browser viewer can start a session in either seeded mode or ground-reach
+  mode via the **Start mode** dropdown.

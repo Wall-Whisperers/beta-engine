@@ -76,6 +76,7 @@ class EnvConfig:
     enable_slip: bool = True                     # hold-overload model on by default for training
     seed_pose: bool = True
     seed_kwargs: dict = field(default_factory=dict)
+    start_mode: str = "seed"                    # "seed" | "ground-reach"
     official_route_only: bool = False          # MoonBoard: reject off-route hand/foot contacts
     invalid_action_penalty: float = 0.25       # small repeated-attempt penalty for masked holds
 
@@ -117,6 +118,8 @@ class Climbing3DEnv(gym.Env):
 
         if self.cfg_env.action_mode not in ("discrete-move", "continuous-joint"):
             raise ValueError(f"unknown action_mode: {self.cfg_env.action_mode}")
+        if self.cfg_env.start_mode not in ("seed", "ground-reach"):
+            raise ValueError(f"unknown start_mode: {self.cfg_env.start_mode}")
 
         self.world = Climb3DWorld(wall, self.profile)
         self._hold_ids: list[str] = list(self.world._hold_meta_by_id.keys())
@@ -197,49 +200,13 @@ class Climbing3DEnv(gym.Env):
         super().reset(seed=seed)
         self.world.reset()
         if self.cfg_env.seed_pose:
-            kw = dict(self.cfg_env.seed_kwargs)
-            if not kw:
-                # Auto-seed from start holds + best two feet candidates.
-                # MoonBoard problems have no `foothold`-typed holds, so we
-                # fall back to the LOWEST two non-start holds (or the start
-                # holds themselves if that's all there is). Real climbers
-                # do exactly this: any decent hold becomes a foothold when
-                # you need one.
-                starts = self.wall.starts()
-                if len(starts) >= 2:
-                    kw["lh"] = starts[0].hold_id
-                    kw["rh"] = starts[1].hold_id
-                elif len(starts) == 1:
-                    kw["lh"] = kw["rh"] = starts[0].hold_id
-
-                feet_candidates = sorted(
-                    (h for h in self.wall.holds
-                     if h.hold_type == "foothold"
-                     and self._is_official_route_hold(h.hold_id)),
-                    key=lambda h: h.y_cm,
-                )
-                if len(feet_candidates) < 2:
-                    # Fallback: any non-start, non-finish hold sorted
-                    # by height (lowest first), splitting left/right by x.
-                    used_for_hands = {kw.get("lh"), kw.get("rh")}
-                    extras = sorted(
-                        (h for h in self.wall.holds
-                         if h.hold_id not in used_for_hands
-                         and not h.is_finish
-                         and self._is_official_route_hold(h.hold_id)),
-                        key=lambda h: h.y_cm,
-                    )
-                    feet_candidates = (feet_candidates or []) + extras
-                if len(feet_candidates) >= 2:
-                    # Pick the lowest left-side and lowest right-side hold.
-                    left = next((h for h in feet_candidates if h.grid_x <= self.wall.cols / 2), None)
-                    right = next((h for h in feet_candidates if h.grid_x > self.wall.cols / 2), None)
-                    if left is None: left = feet_candidates[0]
-                    if right is None or right is left:
-                        right = feet_candidates[1]
-                    kw["lf"] = left.hold_id
-                    kw["rf"] = right.hold_id
-            self.world.seed_pose(**kw)
+            if self.cfg_env.start_mode == "ground-reach":
+                self._begin_ground_reach_start()
+            else:
+                kw = dict(self.cfg_env.seed_kwargs)
+                if not kw:
+                    kw = self._default_seed_kwargs()
+                self.world.seed_pose(**kw)
         else:
             # Reset and let the climber dangle from gravity.
             pass
@@ -248,6 +215,78 @@ class Climbing3DEnv(gym.Env):
         self._finish_streak = 0
         self._prev_com_z = float(self.world.com()[2])
         return self._obs(), self._info()
+
+    def _default_seed_kwargs(self) -> dict[str, str]:
+        """Choose a stable debug/curriculum pose on route holds."""
+        kw: dict[str, str] = {}
+        starts = self.wall.starts()
+        if len(starts) >= 2:
+            kw["lh"] = starts[0].hold_id
+            kw["rh"] = starts[1].hold_id
+        elif len(starts) == 1:
+            kw["lh"] = kw["rh"] = starts[0].hold_id
+
+        feet_candidates = sorted(
+            (h for h in self.wall.holds
+             if h.hold_type == "foothold"
+             and self._is_official_route_hold(h.hold_id)),
+            key=lambda h: h.y_cm,
+        )
+        if len(feet_candidates) < 2:
+            # Fallback: any non-start, non-finish route hold sorted by height.
+            used_for_hands = {kw.get("lh"), kw.get("rh")}
+            extras = sorted(
+                (h for h in self.wall.holds
+                 if h.hold_id not in used_for_hands
+                 and not h.is_finish
+                 and self._is_official_route_hold(h.hold_id)),
+                key=lambda h: h.y_cm,
+            )
+            feet_candidates = (feet_candidates or []) + extras
+        if len(feet_candidates) >= 2:
+            # Pick the lowest left-side and lowest right-side hold.
+            left = next((h for h in feet_candidates if h.grid_x <= self.wall.cols / 2), None)
+            right = next((h for h in feet_candidates if h.grid_x > self.wall.cols / 2), None)
+            if left is None:
+                left = feet_candidates[0]
+            if right is None or right is left:
+                right = feet_candidates[1]
+            kw["lf"] = left.hold_id
+            kw["rf"] = right.hold_id
+        return kw
+
+    def _start_hand_targets(self) -> tuple[str | None, str | None]:
+        """Return route start holds for LH/RH, duplicating one start if needed."""
+        starts = sorted(self.wall.starts(), key=lambda h: h.x_cm)
+        if len(starts) >= 2:
+            return starts[0].hold_id, starts[-1].hold_id
+        if len(starts) == 1:
+            return starts[0].hold_id, starts[0].hold_id
+        hand_low = sorted(
+            [h for h in self.wall.holds
+             if h.usable_for_hand() and self._is_official_route_hold(h.hold_id)],
+            key=lambda h: (h.y_cm, h.x_cm),
+        )[:2]
+        if len(hand_low) >= 2:
+            return hand_low[0].hold_id, hand_low[-1].hold_id
+        if len(hand_low) == 1:
+            return hand_low[0].hold_id, hand_low[0].hold_id
+        return None, None
+
+    def _begin_ground_reach_start(self) -> None:
+        """Start at the model's ground-level default pose, then reach to starts.
+
+        This is useful for visual/debug simulations where we want to see the
+        body initiate the climb instead of being welded directly onto the route.
+        No welds are pre-attached here; stepping the world runs the existing
+        continuous reach controller toward the official start hand hold(s).
+        """
+        self.world._sync_actuator_targets_to_pose()
+        lh, rh = self._start_hand_targets()
+        if lh is not None:
+            self.world.move_limb("LH", lh, mode=self.cfg_env.move_mode)
+        if rh is not None:
+            self.world.move_limb("RH", rh, mode=self.cfg_env.move_mode)
 
     def step(self, action) -> tuple[np.ndarray, float, bool, bool, dict]:
         self._step_count += 1
@@ -402,4 +441,5 @@ class Climbing3DEnv(gym.Env):
             "com": tuple(float(v) for v in self.world.com()),
             "limbs": {l: self.world.on_hold(l) for l in LIMBS},
             "step": self._step_count,
+            "start_mode": self.cfg_env.start_mode,
         }

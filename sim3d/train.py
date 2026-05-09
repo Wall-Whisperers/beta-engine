@@ -66,6 +66,7 @@ class TrainConfig:
     gamma: float = 0.99
     seed: int = 42
     move_mode: str = "reach"            # snap is faster but less realistic
+    start_mode: str = "seed"            # seed | ground-reach
     move_frames: int = 24               # shorter for snap, longer for reach
     max_episode_steps: int = 30
     enable_slip: bool = True
@@ -176,6 +177,7 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
     )
     env_cfg = EnvConfig(
         move_mode=cfg.move_mode,
+        start_mode=cfg.start_mode,
         move_frames=cfg.move_frames,
         max_steps=cfg.max_episode_steps,
         enable_slip=cfg.enable_slip,
@@ -293,9 +295,11 @@ def train(cfg: TrainConfig) -> Path:
             replay_cmd += f" --problem {cfg.moonboard_problem_id}"
         elif moonboard_splits is not None:
             first = moonboard_splits[cfg.moonboard_split][0]
-            replay_cmd += f" --problem {first.id}"
+            replay_cmd += f" --problem {first.id} --moonboard-full-board"
         if cfg.moonboard_vertical_projection:
             replay_cmd += " --vertical-projection"
+        if cfg.start_mode != "seed":
+            replay_cmd += f" --start-mode {cfg.start_mode}"
     else:
         replay_cmd += f" --wall {cfg.wall}"
     replay_cmd += (
@@ -349,6 +353,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--move-mode", default="reach", choices=("snap", "reach", "dyno"))
+    p.add_argument("--start-mode", default="seed", choices=("seed", "ground-reach"),
+                   help="seed starts welded on route holds; ground-reach starts on the floor and reaches to start hands.")
     p.add_argument("--move-frames", type=int, default=24)
     p.add_argument("--episode-steps", type=int, default=30)
     p.add_argument("--no-slip", action="store_true")
@@ -382,6 +388,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         gamma=args.gamma,
         seed=args.seed,
         move_mode=args.move_mode,
+        start_mode=args.start_mode,
         move_frames=args.move_frames,
         max_episode_steps=args.episode_steps,
         enable_slip=not args.no_slip,
