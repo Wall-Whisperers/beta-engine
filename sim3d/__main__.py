@@ -59,6 +59,16 @@ def replay_command_from_run_config(model_path: str) -> str | None:
         if cfg.get("moonboard_problem_id") is not None:
             cmd += f" --problem {cfg['moonboard_problem_id']}"
         else:
+            split_path = cfg_path.with_name("moonboard_splits.json")
+            if split_path.exists():
+                try:
+                    splits = json.loads(split_path.read_text(encoding="utf-8"))
+                    split_name = str(cfg.get("moonboard_split", "train"))
+                    selected = splits.get(split_name) or splits.get("train") or []
+                    if selected:
+                        cmd += f" --problem {selected[0]['id']}"
+                except (OSError, KeyError, TypeError, json.JSONDecodeError):
+                    pass
             cmd += " --moonboard-full-board"
     else:
         cmd += f" --wall {cfg.get('wall', 'example-v2-boulder')}"
@@ -283,7 +293,9 @@ def main(argv: list[str] | None = None) -> int:
             config=EnvConfig(
                 max_steps=30,
                 move_mode=args.move_mode,
+                start_mode=args.start_mode,
                 enable_slip=args.slip,
+                official_route_only=args.moonboard_full_board,
             ),
         )
         for ep in range(args.gym_episodes):
@@ -312,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
                 start_mode=args.start_mode,
                 move_frames=args.play_frames,
                 enable_slip=args.slip,
+                official_route_only=args.moonboard_full_board,
             ),
         )
         model = sb3.PPO.load(args.play)

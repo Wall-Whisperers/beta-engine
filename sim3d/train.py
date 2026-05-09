@@ -357,7 +357,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="seed starts welded on route holds; ground-reach starts on the floor and reaches to start hands.")
     p.add_argument("--move-frames", type=int, default=24)
     p.add_argument("--episode-steps", type=int, default=30)
-    p.add_argument("--no-slip", action="store_true")
+    p.add_argument("--no-slip", "--no_slip", dest="no_slip", action="store_true")
     p.add_argument("--body-intersection-penalty", type=float, default=2.0,
                    help="Reward penalty per limb-vs-torso/pelvis intersection contact.")
     p.add_argument("--out-dir", default="data/runs/sim3d")
