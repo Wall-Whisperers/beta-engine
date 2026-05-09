@@ -51,6 +51,11 @@ class TrainConfig:
     wall: str = "example-v2-boulder"
     moonboard_file: Optional[str] = None
     moonboard_problem_id: Optional[int] = None
+    moonboard_split: str = "train"            # train | validation | test when sampling a corpus
+    split_seed: int = 42
+    train_fraction: float = 0.80
+    validation_fraction: float = 0.10
+    moonboard_vertical_projection: bool = False
     height_cm: float = 175.0
     wingspan_cm: float = 175.0
     mass_kg: float = 70.0
@@ -61,6 +66,7 @@ class TrainConfig:
     gamma: float = 0.99
     seed: int = 42
     move_mode: str = "reach"            # snap is faster but less realistic
+    start_mode: str = "seed"            # seed | ground-reach
     move_frames: int = 24               # shorter for snap, longer for reach
     max_episode_steps: int = 30
     enable_slip: bool = True
@@ -139,35 +145,75 @@ class _EpisodeStatsCallback:
         return outer._impl
 
 
-def _make_env_factory(cfg: TrainConfig):
+def _moonboard_splits_for_config(cfg: TrainConfig):
+    if not cfg.moonboard_file or cfg.moonboard_problem_id is not None:
+        return None
+    from sim3d.moonboard import load_moonboard_corpus, split_moonboard_problems
+
+    corpus = load_moonboard_corpus(cfg.moonboard_file)
+    splits = split_moonboard_problems(
+        corpus,
+        seed=cfg.split_seed,
+        train_fraction=cfg.train_fraction,
+        validation_fraction=cfg.validation_fraction,
+    )
+    if cfg.moonboard_split not in splits:
+        raise ValueError(
+            f"unknown MoonBoard split {cfg.moonboard_split!r}; "
+            f"expected one of {sorted(splits)}"
+        )
+    if not splits[cfg.moonboard_split]:
+        raise ValueError(f"MoonBoard split {cfg.moonboard_split!r} is empty")
+    return splits
+
+
+def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
     """Returns a Gymnasium env factory for SB3's vec-env wrappers."""
+
+    profile = ClimberProfile(
+        height_cm=cfg.height_cm,
+        wingspan_cm=cfg.wingspan_cm,
+        mass_kg=cfg.mass_kg,
+    )
+    env_cfg = EnvConfig(
+        move_mode=cfg.move_mode,
+        start_mode=cfg.start_mode,
+        move_frames=cfg.move_frames,
+        max_steps=cfg.max_episode_steps,
+        enable_slip=cfg.enable_slip,
+        body_intersection_penalty=cfg.body_intersection_penalty,
+    )
 
     def _factory():
         if cfg.moonboard_file:
             from sim3d.moonboard import (
                 load_moonboard_problems, moonboard_problem_to_wall, find_problem,
             )
-            problems = load_moonboard_problems(cfg.moonboard_file)
-            problem = (
-                find_problem(problems, id=cfg.moonboard_problem_id)
-                if cfg.moonboard_problem_id is not None
-                else problems[0]
+            if cfg.moonboard_problem_id is not None:
+                problems = load_moonboard_problems(cfg.moonboard_file)
+                problem = find_problem(problems, id=cfg.moonboard_problem_id)
+                if problem is None:
+                    raise ValueError(
+                        f"problem id {cfg.moonboard_problem_id} not found in "
+                        f"{cfg.moonboard_file}"
+                    )
+                wall = moonboard_problem_to_wall(
+                    problem,
+                    vertical_projection=cfg.moonboard_vertical_projection,
+                )
+                return Climbing3DEnv(wall, profile=profile, config=env_cfg)
+
+            from sim3d.moonboard_env import MoonboardClimbing3DEnv
+
+            assert moonboard_splits is not None
+            return MoonboardClimbing3DEnv(
+                moonboard_splits[cfg.moonboard_split],
+                profile=profile,
+                config=env_cfg,
+                vertical_projection=cfg.moonboard_vertical_projection,
             )
-            wall = moonboard_problem_to_wall(problem)
-        else:
-            wall = load_wall(cfg.wall)
-        profile = ClimberProfile(
-            height_cm=cfg.height_cm,
-            wingspan_cm=cfg.wingspan_cm,
-            mass_kg=cfg.mass_kg,
-        )
-        env_cfg = EnvConfig(
-            move_mode=cfg.move_mode,
-            move_frames=cfg.move_frames,
-            max_steps=cfg.max_episode_steps,
-            enable_slip=cfg.enable_slip,
-            body_intersection_penalty=cfg.body_intersection_penalty,
-        )
+
+        wall = load_wall(cfg.wall)
         return Climbing3DEnv(wall, profile=profile, config=env_cfg)
 
     return _factory
@@ -186,7 +232,14 @@ def train(cfg: TrainConfig) -> Path:
     with open(out_dir / "config.json", "w") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    factory = _make_env_factory(cfg)
+    moonboard_splits = _moonboard_splits_for_config(cfg)
+    if moonboard_splits is not None:
+        from sim3d.moonboard import moonboard_split_manifest
+
+        with open(out_dir / "moonboard_splits.json", "w", encoding="utf-8") as f:
+            json.dump(moonboard_split_manifest(moonboard_splits), f, indent=2)
+
+    factory = _make_env_factory(cfg, moonboard_splits)
 
     def _make_monitored_env(rank: int):
         def _init():
@@ -240,6 +293,13 @@ def train(cfg: TrainConfig) -> Path:
         replay_cmd += f" --moonboard {cfg.moonboard_file}"
         if cfg.moonboard_problem_id is not None:
             replay_cmd += f" --problem {cfg.moonboard_problem_id}"
+        elif moonboard_splits is not None:
+            first = moonboard_splits[cfg.moonboard_split][0]
+            replay_cmd += f" --problem {first.id} --moonboard-full-board"
+        if cfg.moonboard_vertical_projection:
+            replay_cmd += " --vertical-projection"
+        if cfg.start_mode != "seed":
+            replay_cmd += f" --start-mode {cfg.start_mode}"
     else:
         replay_cmd += f" --wall {cfg.wall}"
     replay_cmd += (
@@ -271,7 +331,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="python -m sim3d.train")
     p.add_argument("--wall", default="example-v2-boulder")
     p.add_argument("--moonboard", dest="moonboard_file")
-    p.add_argument("--problem", dest="moonboard_problem_id", type=int)
+    p.add_argument("--problem", dest="moonboard_problem_id", type=int,
+                   help="Train on one MoonBoard problem id. Omit to sample a deterministic split.")
+    p.add_argument("--moonboard-split", default="train", choices=("train", "validation", "test"),
+                   help="MoonBoard corpus split to sample when --problem is omitted.")
+    p.add_argument("--split-seed", type=int, default=42,
+                   help="Deterministic MoonBoard train/validation/test split seed.")
+    p.add_argument("--train-fraction", type=float, default=0.80)
+    p.add_argument("--validation-fraction", type=float, default=0.10)
+    p.add_argument("--vertical-projection", action="store_true",
+                   help="Use MoonBoard vertical-projection geometry.")
     p.add_argument("--height", type=float, default=175.0)
     p.add_argument("--wingspan", type=float, default=175.0)
     p.add_argument("--mass", type=float, default=70.0)
@@ -284,9 +353,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--move-mode", default="reach", choices=("snap", "reach", "dyno"))
+    p.add_argument("--start-mode", default="seed", choices=("seed", "ground-reach"),
+                   help="seed starts welded on route holds; ground-reach starts on the floor and reaches to start hands.")
     p.add_argument("--move-frames", type=int, default=24)
     p.add_argument("--episode-steps", type=int, default=30)
-    p.add_argument("--no-slip", action="store_true")
+    p.add_argument("--no-slip", "--no_slip", dest="no_slip", action="store_true")
     p.add_argument("--body-intersection-penalty", type=float, default=2.0,
                    help="Reward penalty per limb-vs-torso/pelvis intersection contact.")
     p.add_argument("--out-dir", default="data/runs/sim3d")
@@ -302,6 +373,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         wall=args.wall,
         moonboard_file=args.moonboard_file,
         moonboard_problem_id=args.moonboard_problem_id,
+        moonboard_split=args.moonboard_split,
+        split_seed=args.split_seed,
+        train_fraction=args.train_fraction,
+        validation_fraction=args.validation_fraction,
+        moonboard_vertical_projection=args.vertical_projection,
         height_cm=args.height,
         wingspan_cm=args.wingspan,
         mass_kg=args.mass,
@@ -312,6 +388,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         gamma=args.gamma,
         seed=args.seed,
         move_mode=args.move_mode,
+        start_mode=args.start_mode,
         move_frames=args.move_frames,
         max_episode_steps=args.episode_steps,
         enable_slip=not args.no_slip,

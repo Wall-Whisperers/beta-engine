@@ -332,3 +332,75 @@ def find_problem(
             continue
         return p
     return None
+
+# ─── Corpus splitting for MoonBoard-generalized training ────────────────────
+def load_moonboard_corpus(source_dir: str | Path = "moonboard_data") -> list[MoonboardProblem]:
+    """Load all usable MoonBoard problems from a directory or single JSON file.
+
+    A usable problem has at least one start hold and one finish hold. Files are
+    read in sorted path order so repeated runs see the same corpus order before
+    shuffling/splitting.
+    """
+    root = Path(source_dir)
+    paths = [root] if root.is_file() else sorted(root.glob("*.json"))
+    problems: list[MoonboardProblem] = []
+    for path in paths:
+        for problem in load_moonboard_problems(path):
+            if problem.start_holds and problem.end_holds:
+                problems.append(problem)
+    return problems
+
+
+def split_moonboard_problems(
+    problems: Iterable[MoonboardProblem],
+    *,
+    seed: int = 42,
+    train_fraction: float = 0.80,
+    validation_fraction: float = 0.10,
+) -> dict[str, list[MoonboardProblem]]:
+    """Deterministically split a MoonBoard corpus into train/val/test lists."""
+    import random
+
+    items = list(problems)
+    if not items:
+        return {"train": [], "validation": [], "test": []}
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError("train_fraction must be between 0 and 1")
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1")
+    if train_fraction + validation_fraction >= 1.0:
+        raise ValueError("train_fraction + validation_fraction must be < 1")
+
+    rng = random.Random(seed)
+    rng.shuffle(items)
+    n_total = len(items)
+    n_train = max(1, int(n_total * train_fraction))
+    n_validation = int(n_total * validation_fraction)
+    if n_total >= 3 and n_validation == 0:
+        n_validation = 1
+    if n_train + n_validation >= n_total and n_total >= 2:
+        n_train = n_total - n_validation - 1
+    return {
+        "train": items[:n_train],
+        "validation": items[n_train:n_train + n_validation],
+        "test": items[n_train + n_validation:],
+    }
+
+
+def moonboard_split_manifest(splits: dict[str, list[MoonboardProblem]]) -> dict[str, list[dict]]:
+    """JSON-serializable split metadata saved beside training runs."""
+    return {
+        split: [
+            {
+                "id": problem.id,
+                "name": problem.name,
+                "grade": problem.grade,
+                "setter": problem.setter,
+                "start_holds": problem.start_holds,
+                "mid_holds": problem.mid_holds,
+                "end_holds": problem.end_holds,
+            }
+            for problem in problems
+        ]
+        for split, problems in splits.items()
+    }

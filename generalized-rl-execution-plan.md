@@ -1029,3 +1029,73 @@ Option B is the right middle path:
 Option A remains the long-term research path. Once Option B proves the task,
 reward, observation, and MoonBoard generalization design, the project can move
 toward lower-level joint-target or torque policies with a much better foundation.
+
+---
+
+## 24. Implementation Chunk Log
+
+This section tracks work completed against the plan so future chunks can be
+reviewed and tested independently.
+
+### Chunk 1 — MoonBoard corpus sampling and official-route mask
+
+Status: **completed**.
+
+Implemented pieces:
+
+- Added deterministic MoonBoard corpus loading from a directory or single JSON
+  source.
+- Added deterministic train / validation / test splitting with saved run
+  manifests.
+- Added a MoonBoard-generalized Gymnasium wrapper that samples a new problem on
+  reset while keeping fixed 11×18 MoonBoard action and observation dimensions by
+  building each sampled wall with all 198 T-nut positions.
+- Added official-route-only contact masking for full-board MoonBoard episodes.
+  Off-route holds remain present as fixed-index placeholders, but hand and foot
+  move actions targeting them are rejected and lightly penalized.
+- Wired `sim3d.train` so `--moonboard PATH` without `--problem ID` trains on the
+  selected deterministic split, while `--problem ID` preserves single-problem
+  training.
+- Saved `moonboard_splits.json` beside generalized MoonBoard training runs so
+  each run records exactly which problems were used for train / validation /
+  test.
+
+Testable boundary:
+
+- Corpus helpers can be tested without MuJoCo training.
+- `MoonboardClimbing3DEnv` can be reset and stepped independently.
+- A tiny PPO smoke run can be executed against `data/moonboard/sample-problems.json`
+  with a 1-step episode and 2 total PPO steps.
+
+Next chunks:
+
+1. Add the fixed 11×18 route-state tensor channels from Section 11 to the
+   observation instead of relying only on the existing flat hold one-hot state.
+2. Add the first true Option B continuous reach-vector action mode with grip and
+   release commands, keeping the existing discrete move mode as a debug baseline.
+3. Upgrade the finish condition from action-count frames to an explicit 2-second
+   controlled timer with body-velocity stability checks.
+
+### Chunk 1b — Ground-level start visualization and generalized replay fix
+
+Status: **completed**.
+
+Implemented pieces:
+
+- Added `start_mode="ground-reach"` to start the body from its ground-level
+  default pose and immediately begin continuous left/right hand reaches to the
+  official start hold(s), instead of welding the body directly onto the route.
+- Exposed the start mode through the training CLI, native simulator CLI, and web
+  viewer start controls.
+- Added full-board MoonBoard replay support so generalized split-trained models
+  can be replayed with the same 198-hold action/observation dimensions they were
+  trained with.
+
+Testable boundary:
+
+- Headless native sim can verify that `ground-reach` starts with no welded limbs
+  and active reaches to the MoonBoard start hand holds.
+- Tiny PPO runs now print replay commands containing `--moonboard-full-board`
+  for generalized MoonBoard split policies.
+- The browser viewer can start a session in either seeded mode or ground-reach
+  mode via the **Start mode** dropdown.

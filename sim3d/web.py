@@ -147,6 +147,7 @@ def _load_wall_from_request(payload: dict[str, Any]) -> tuple[Wall, dict[str, An
     moonboard_file = payload.get("moonboard_file")
     moonboard_problem_id = payload.get("moonboard_problem_id")
     moonboard_vertical = bool(payload.get("moonboard_vertical_projection", False))
+    moonboard_full_board = bool(payload.get("moonboard_full_board", False))
 
     if moonboard_file is not None:
         target = _find_moonboard_file(str(moonboard_file))
@@ -159,13 +160,16 @@ def _load_wall_from_request(payload: dict[str, Any]) -> tuple[Wall, dict[str, An
         if problem is None:
             raise FileNotFoundError("no problems in MoonBoard file")
         wall = moonboard_problem_to_wall(
-            problem, vertical_projection=moonboard_vertical,
+            problem,
+            include_full_board=moonboard_full_board,
+            vertical_projection=moonboard_vertical,
         )
         return wall, {
             "kind": "moonboard",
             "moonboard_file": target.name,
             "moonboard_problem_id": problem.id,
             "moonboard_vertical_projection": moonboard_vertical,
+            "moonboard_full_board": moonboard_full_board,
             "selected_value": f"moonboard:{target.name}:{problem.id}",
         }
 
@@ -177,19 +181,58 @@ def _load_wall_from_request(payload: dict[str, Any]) -> tuple[Wall, dict[str, An
     }
 
 
-def _load_wall_from_train_config(cfg: dict[str, Any]) -> tuple[Wall, dict[str, Any]]:
+def _load_wall_from_train_config(
+    cfg: dict[str, Any], run_path: Path | None = None,
+) -> tuple[Wall, dict[str, Any]]:
     if cfg.get("moonboard_file"):
+        problem_id = cfg.get("moonboard_problem_id")
+        full_board = problem_id is None
+        if problem_id is None and run_path is not None:
+            split_path = run_path / "moonboard_splits.json" if run_path.is_dir() else run_path.parent / "moonboard_splits.json"
+            if split_path.exists():
+                splits = json.loads(split_path.read_text(encoding="utf-8"))
+                split_name = str(cfg.get("moonboard_split", "train"))
+                selected = splits.get(split_name) or splits.get("train") or []
+                if selected:
+                    problem_id = selected[0].get("id")
         return _load_wall_from_request({
             "moonboard_file": cfg["moonboard_file"],
-            "moonboard_problem_id": cfg.get("moonboard_problem_id"),
+            "moonboard_problem_id": problem_id,
             "moonboard_vertical_projection": bool(
                 cfg.get("moonboard_vertical_projection", False)
             ),
+            "moonboard_full_board": full_board,
         })
     return _load_wall_from_request({"wall_id": cfg.get("wall", "example-v2-boulder")})
 
 
-def _seed_world(wall: Wall, world: Climb3DWorld) -> None:
+def _start_hand_targets(wall: Wall) -> tuple[str | None, str | None]:
+    starts = sorted(wall.starts(), key=lambda h: h.x_cm)
+    if len(starts) >= 2:
+        return starts[0].hold_id, starts[-1].hold_id
+    if len(starts) == 1:
+        return starts[0].hold_id, starts[0].hold_id
+    hand_low = sorted(
+        [h for h in wall.holds if h.usable_for_hand()],
+        key=lambda h: (h.y_cm, h.x_cm),
+    )[:2]
+    if len(hand_low) >= 2:
+        return hand_low[0].hold_id, hand_low[-1].hold_id
+    if len(hand_low) == 1:
+        return hand_low[0].hold_id, hand_low[0].hold_id
+    return None, None
+
+
+def _seed_world(wall: Wall, world: Climb3DWorld, *, start_mode: str = "seed") -> None:
+    if start_mode == "ground-reach":
+        world._sync_actuator_targets_to_pose()
+        lh, rh = _start_hand_targets(wall)
+        if lh is not None:
+            world.move_limb("LH", lh, mode="reach")
+        if rh is not None:
+            world.move_limb("RH", rh, mode="reach")
+        return
+
     starts = sorted(wall.starts(), key=lambda h: h.x_cm)
     foots = sorted(
         [h for h in wall.holds if h.usable_for_foot()],
@@ -200,14 +243,7 @@ def _seed_world(wall: Wall, world: Climb3DWorld) -> None:
     elif len(starts) == 1:
         lh = rh = starts[0].hold_id
     else:
-        hand_low = sorted(
-            [h for h in wall.holds if h.usable_for_hand()],
-            key=lambda h: (h.y_cm, h.x_cm),
-        )[:2]
-        lh, rh = (
-            (hand_low[0].hold_id, hand_low[-1].hold_id)
-            if hand_low else (None, None)
-        )
+        lh, rh = _start_hand_targets(wall)
     if lh is not None and rh is not None and len(foots) >= 2:
         l_foot, r_foot = sorted(foots, key=lambda h: h.x_cm)
         world.seed_pose(
@@ -292,6 +328,9 @@ def create_session():
     wingspan_cm = float(payload.get("wingspan_cm", 175))
     mass_kg = float(payload.get("mass_kg", 70))
     seed = bool(payload.get("seed", True))
+    start_mode = str(payload.get("start_mode", "seed"))
+    if start_mode not in ("seed", "ground-reach"):
+        abort(400, description="start_mode must be 'seed' or 'ground-reach'")
 
     try:
         wall, source = _load_wall_from_request(payload)
@@ -306,7 +345,7 @@ def create_session():
     world = Climb3DWorld(wall, profile)
 
     if seed:
-        _seed_world(wall, world)
+        _seed_world(wall, world, start_mode=start_mode)
 
     sid = uuid.uuid4().hex[:12]
     session = _Session(world=world, wall=wall, profile=profile, source=source)
@@ -382,7 +421,7 @@ def load_policy(sid: str):
     try:
         run_path, model_path, config_path = _resolve_run_path(run_text)
         cfg = json.loads(config_path.read_text(encoding="utf-8"))
-        wall, source = _load_wall_from_train_config(cfg)
+        wall, source = _load_wall_from_train_config(cfg, run_path)
     except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError) as e:
         abort(400, description=str(e))
 
@@ -397,12 +436,14 @@ def load_policy(sid: str):
 
         env_cfg = EnvConfig(
             move_mode=str(cfg.get("move_mode", "reach")),
+            start_mode=str(cfg.get("start_mode", "seed")),
             move_frames=int(cfg.get("move_frames", 24)),
             max_steps=int(cfg.get("max_episode_steps", 30)),
             enable_slip=bool(cfg.get("enable_slip", True)),
             body_intersection_penalty=float(
                 cfg.get("body_intersection_penalty", 2.0)
             ),
+            official_route_only=bool(source.get("moonboard_full_board", False)),
         )
         model = PPO.load(str(model_path))
         env = Climbing3DEnv(wall, profile=profile, config=env_cfg)
@@ -475,10 +516,18 @@ def clear_policy(sid: str):
 def seed_pose(sid: str):
     s = _get(sid)
     payload = request.get_json(silent=True) or {}
+    start_mode = payload.get("start_mode")
     kwargs = {k: payload.get(k) for k in ("lh", "rh", "lf", "rf")}
     with s.lock:
         try:
-            s.world.seed_pose(**kwargs)
+            if start_mode is not None:
+                start_mode = str(start_mode)
+                if start_mode not in ("seed", "ground-reach"):
+                    abort(400, description="start_mode must be 'seed' or 'ground-reach'")
+                s.world.reset()
+                _seed_world(s.wall, s.world, start_mode=start_mode)
+            else:
+                s.world.seed_pose(**kwargs)
         except KeyError as e:
             abort(400, description=str(e))
         s.policy = None
