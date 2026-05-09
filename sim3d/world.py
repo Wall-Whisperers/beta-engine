@@ -180,6 +180,20 @@ class Climb3DWorld:
                     self._limb_actuator_ids[limb].append(i)
                     break
 
+        # Geom groups used by RL reward shaping. MuJoCo's contact solver
+        # tells us when a limb geom penetrates the torso/pelvis; we turn
+        # those contacts into a soft penalty instead of pretending that
+        # impossible self-intersecting poses are valid climbing beta.
+        self._body_intersection_torso_geom_ids = self._geom_ids(
+            "g_pelvis", "g_chest",
+        )
+        self._body_intersection_limb_geom_ids = self._geom_ids(
+            "g_l_upperarm", "g_l_forearm", "g_l_hand",
+            "g_r_upperarm", "g_r_forearm", "g_r_hand",
+            "g_l_thigh", "g_l_shin", "g_l_foot",
+            "g_r_thigh", "g_r_shin", "g_r_foot",
+        )
+
         # Track slips for diagnostics / RL reward shaping.
         self.slip_events: list[SlipEvent] = []
         self._max_slip_log = 200
@@ -203,6 +217,56 @@ class Climb3DWorld:
         # that asks for site positions before stepping.
         mujoco.mj_forward(self.model, self.data)
         self._sync_actuator_targets_to_pose()
+
+    def _geom_ids(self, *names: str) -> set[int]:
+        """Resolve geom names to ids, ignoring missing names so old MJCFs
+        or experiments can still run."""
+        ids: set[int] = set()
+        for name in names:
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            if gid >= 0:
+                ids.add(int(gid))
+        return ids
+
+    def body_intersection_contacts(self) -> list[dict]:
+        """Return current limb-vs-torso/pelvis penetration contacts.
+
+        This is intentionally diagnostic/reward-shaping only. We do not
+        terminate episodes or modify physics here; MuJoCo has already
+        advanced the state, and the RL environment can decide how much to
+        penalize impossible self-intersections.
+        """
+        contacts: list[dict] = []
+        torso = self._body_intersection_torso_geom_ids
+        limbs = self._body_intersection_limb_geom_ids
+        for i in range(int(self.data.ncon)):
+            c = self.data.contact[i]
+            g1 = int(c.geom1)
+            g2 = int(c.geom2)
+            if c.dist > 0:
+                continue
+            if g1 in torso and g2 in limbs:
+                torso_gid, limb_gid = g1, g2
+            elif g2 in torso and g1 in limbs:
+                torso_gid, limb_gid = g2, g1
+            else:
+                continue
+            torso_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, torso_gid,
+            )
+            limb_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, limb_gid,
+            )
+            contacts.append({
+                "torso_geom": torso_name or str(torso_gid),
+                "limb_geom": limb_name or str(limb_gid),
+                "penetration_m": float(max(0.0, -c.dist)),
+            })
+        return contacts
+
+    def body_intersection_count(self) -> int:
+        """Number of current limb-vs-body intersection contacts."""
+        return len(self.body_intersection_contacts())
 
     # ─── Pose seeding ─────────────────────────────────────────────────
     def seed_pose(
@@ -765,25 +829,31 @@ class Climb3DWorld:
                     "world_pos": list(meta["world_pos"]),
                     "wall_normal": list(meta["wall_normal"]),
                     "radius": radius,
+                    "protrude": _cfg.HOLD_PROTRUDE_M,
                     "is_start": meta["is_start"],
                     "is_finish": meta["is_finish"],
                     "color": self.wall.by_id(meta["hold_id"]).color,
                 }
 
-            # Plate centre needs to match the builder's lift-for-floor
-            # logic, so re-derive from the actual hold positions.
-            cz_base = (plate_h / 2.0) * math.cos(theta)
+            # Plate centre must exactly match builder._build_wall_xml.
+            # If this drifts, especially on 40° MoonBoard overhangs, the
+            # browser shows the wall on one diagonal while MuJoCo/body/holds
+            # occupy another. Keep this math in lockstep with the MJCF.
             cy_base = (plate_h / 2.0) * math.sin(theta)
-            min_hold_z = min(
-                (h["world_pos"][2] for h in self._hold_meta_by_id.values()),
-                default=0.0,
-            )
-            # The lift offset in the builder is added to cz only.
-            # Approximating: the plate's bottom-near corner sits at the
-            # lowest point on the wall surface; the lowest hold sits
-            # slightly above that. The exact offset isn't critical for
-            # rendering — the holds drive correctness, the plate is
-            # just a visual backdrop sized to match.
+            cz_base = (plate_h / 2.0) * math.cos(theta)
+            if self.wall.holds:
+                cos_t0 = math.cos(theta)
+                sin_t0 = math.sin(theta)
+                local_y_tip0 = _cfg.WALL_THICKNESS_M / 2.0 + _cfg.HOLD_PROTRUDE_M
+                min_world_z = min(
+                    cz_base - local_y_tip0 * sin_t0
+                    + ((h.y_cm / 100.0) - plate_h / 2.0) * cos_t0
+                    for h in self.wall.holds
+                )
+                deficit = _cfg.FLOOR_Z + _cfg.HOLD_FLOOR_CLEARANCE - min_world_z
+                if deficit > 0:
+                    cz_base += deficit
+
             snap["static"] = {
                 "wall": {
                     "width_m": width_m,

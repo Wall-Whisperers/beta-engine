@@ -58,6 +58,14 @@
     <button class="secondary" id="step10">Step 1.0 s</button>
     <button class="secondary" id="play">▶ Live (60 Hz)</button>
 
+    <h2>RL policy replay</h2>
+    <label>Run directory or model.zip</label>
+    <input type="text" id="policy-path" placeholder="data/runs/sim3d/run_..." />
+    <button class="secondary" id="policy-load">Load trained run</button>
+    <button class="secondary" id="policy-step" disabled>Step policy once</button>
+    <button class="secondary" id="policy-play" disabled>▶ Play policy</button>
+    <button class="secondary" id="policy-clear" disabled>Clear policy</button>
+
     <h2>Status</h2>
     <div class="status" id="status">No session.</div>
   </div>

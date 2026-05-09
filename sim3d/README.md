@@ -145,6 +145,13 @@ limb doesn't *collide* with them (grabbing is mediated by the weld);
 the wall surface is `contype=1` and the limb tips can press against
 it for slab smearing or to balance against an overhang.
 
+**Self-intersection penalty.** The MuJoCo body can still discover poses
+where an arm or leg passes through the torso/pelvis. That is physically
+impossible beta, so the Gym env scans MuJoCo contacts after each step and
+subtracts `body_intersection_penalty` for every limb-vs-body penetration.
+Tune it with `--body-intersection-penalty` in `sim3d.train`; set it to
+`0` if you want to disable this shaping term for debugging.
+
 **Coordinate convention.** `+X` along the wall, `+Y` away from the wall
 (toward the climber/camera), `+Z` up. Gravity is fixed at world `-Z`;
 slab/overhang is implemented by tilting the wall, not gravity. The
@@ -218,6 +225,10 @@ The 3D viewer page lets you:
 - set climber height / wingspan / mass,
 - start a session, step 0.1 s / 1 s, or play live at 60 Hz,
 - move any limb to any hold via dropdowns,
+- load a trained `sim3d.train` run directory or `model.zip`, which
+  reconfigures the session to the wall/profile stored in that run's
+  `config.json`, then step/play the PPO policy in the browser,
+- clear the loaded policy and return to manual browser control,
 - watch the climber rendered in three.js (so the GPU stays in your
   browser, not in the container).
 
@@ -362,7 +373,7 @@ python -m sim3d.train --moonboard data/moonboard/sample-problems.json \
 # 2. View results.
 ls data/runs/sim3d/run_<timestamp>/
 #   ├── config.json         # hyperparams + wall + climber profile
-#   ├── episode_stats.csv   # one row per episode (reward, length, outcome, com_z, slips)
+#   ├── episode_stats.csv   # one row per episode (reward, length, outcome, com_z, slips, intersections)
 #   ├── tb/                 # TensorBoard event files
 #   └── model.zip           # trained PPO policy
 
@@ -371,8 +382,13 @@ tensorboard --logdir data/runs/sim3d/run_<timestamp>/tb
 # or just grep the CSV:
 column -ts, data/runs/sim3d/run_<timestamp>/episode_stats.csv | head -20
 
-# 3. Replay the policy in the native MuJoCo viewer:
+# 3a. Replay the policy in the native MuJoCo viewer:
 python -m sim3d --play data/runs/sim3d/run_<timestamp>/model.zip
+
+# 3b. Or replay in the browser:
+python grid_editor/server.py
+# open http://localhost:8000/sim3d/
+# paste data/runs/sim3d/run_<timestamp>/ into "RL policy replay"
 ```
 
 **What you should see in the CSV during training:**
@@ -383,6 +399,9 @@ python -m sim3d --play data/runs/sim3d/run_<timestamp>/model.zip
 - The `slips` column tells you how often the policy is over-gripping
   beyond hold capacity — high values mean the slip-aware reward is
   saturating and you may want to lower `slip_penalty`.
+- `body_intersections` in the Gym `info` dict counts limb-vs-torso/pelvis
+  penetration contacts; each one is penalized during training so the
+  policy avoids impossible arms/legs-through-body poses.
 
 **Viewer integration**: when `--play` is set, the native MuJoCo
 viewer opens and the policy drives the climber in real-time. Each
@@ -412,10 +431,10 @@ to the next hold rather than teleporting.
 - Train policies that complete unseen MoonBoard problems with high
   reliability — the env runs, but procedural curriculum (random
   walls of increasing difficulty) is needed to get there.
-- Web-side "play policy" button — the CLI replay (`--play`) works
-  through the native viewer; the browser viewer doesn't yet pick up
-  saved models directly. Open one of the moonboard sessions, train,
-  then replay through the desktop viewer to see learning land.
+- Train policies that generalize to arbitrary unseen walls from a
+  single saved `MlpPolicy` — browser replay now works, but the current
+  observation shape still depends on hold count, so a saved policy is
+  wall/config specific.
 
 ---
 

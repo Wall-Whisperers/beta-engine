@@ -22,9 +22,11 @@ const LIMBS = ['LH', 'RH', 'LF', 'RF'];
 let bodyMeshes = {};
 let holdMeshes = {};
 let holdRings = {};       // start/finish markers
-let session = null;       // {id, wall, profile, holdsByID}
+let wallPlate = null;
+let session = null;       // {id, wall, profile, pose, policy}
 let pollTimer = null;
 let liveTimer = null;
+let policyTimer = null;
 
 // ─── three.js scene ────────────────────────────────────────────────────────
 const canvas = document.getElementById('canvas');
@@ -198,7 +200,7 @@ function buildClimberMeshes(profile) {
 //     }
 //
 //     pose.static.holds = {
-//       hold_id: { world_pos, wall_normal, radius, is_start, is_finish, color }
+//       hold_id: { world_pos, wall_normal, radius, protrude, is_start, is_finish, color }
 //     }
 //
 // We DO NOT recompute the geometry on the JS side any more — that's
@@ -217,9 +219,12 @@ function buildWallAndHolds(pose) {
     );
     plate.receiveShadow = true;
     plate.position.set(...wallStatic.centre);
-    // Rotate around X by +theta. Three.js Object3D.rotation is intrinsic
-    // Tait-Bryan XYZ; setting only x is fine when the others are 0.
-    plate.rotation.x = theta;
+    // Three.js uses a Y-up-style right-handed X rotation matrix:
+    // local +Z maps to (0, -sin(a), cos(a)). MuJoCo's wall local +Z
+    // maps to (0, +sin(theta), cos(theta)), so the browser rotation is
+    // the negative of the MJCF axis-angle. Using +theta makes 40°
+    // MoonBoards render as an X: wall one way, body/holds the other.
+    plate.rotation.x = -theta;
     scene.add(plate);
 
     // Holds. Each hold is a small protruding cylinder. Cylinder default
@@ -232,16 +237,25 @@ function buildWallAndHolds(pose) {
         const radius = info.radius;
         const colorHex = info.color || '#888888';
 
-        // Cylinder body — colored as in the editor.
+        // Cylinder body — colored as in the editor. Server world_pos is
+        // the OUTER FACE/tip used for limb attachment; three.js wants the
+        // cylinder centre, so move back half the protrusion along the wall
+        // normal. Without this, holds float in front of steep walls.
         const mat = new THREE.MeshStandardMaterial({
             color: new THREE.Color(colorHex),
             roughness: 0.5,
         });
+        const protrude = info.protrude ?? 0.04;
+        const n = info.wall_normal;
         const cyl = new THREE.Mesh(
-            new THREE.CylinderGeometry(radius, radius, 0.04, 16),
+            new THREE.CylinderGeometry(radius, radius, protrude, 16),
             mat,
         );
-        cyl.position.set(...info.world_pos);
+        cyl.position.set(
+            info.world_pos[0] - n[0] * protrude * 0.5,
+            info.world_pos[1] - n[1] * protrude * 0.5,
+            info.world_pos[2] - n[2] * protrude * 0.5,
+        );
         cyl.rotation.x = -theta;
         cyl.castShadow = true;
         scene.add(cyl);
@@ -256,17 +270,15 @@ function buildWallAndHolds(pose) {
             );
             // Position the ring at the hold's base on the wall surface.
             // Move it back along the wall normal a tiny amount.
-            const n = info.wall_normal;
             ring.position.set(
-                info.world_pos[0] - n[0] * 0.025,
-                info.world_pos[1] - n[1] * 0.025,
-                info.world_pos[2] - n[2] * 0.025,
+                info.world_pos[0] - n[0] * (protrude + 0.001),
+                info.world_pos[1] - n[1] * (protrude + 0.001),
+                info.world_pos[2] - n[2] * (protrude + 0.001),
             );
-            // Ring lies in its local XY-plane, normal +Z. Rotate so its
-            // normal aligns with the wall outward normal.
-            ring.rotation.x = -theta + Math.PI / 2;
-            // Because RingGeometry's "front face" is +Z, rotating around X by
-            // (-theta + π/2) puts the disc parallel to the wall surface.
+            // RingGeometry's normal is local +Z. Rotate it to the wall
+            // outward normal (0, cosθ, -sinθ). For three.js X rotations
+            // that is -theta - π/2.
+            ring.rotation.x = -theta - Math.PI / 2;
             scene.add(ring);
             holdRings[hid] = ring;
         }
@@ -327,8 +339,69 @@ function applyPose(pose) {
     // Update status panel
     const com = pose.bodies.pelvis ? pose.bodies.pelvis.pos : [0, 0, 0];
     const limbStr = LIMBS.map(l => `${l}: ${pose.limbs[l] ?? '·'}`).join('\n');
+    const policyStr = session?.policy
+        ? `\npolicy = ${session.policy.done ? 'done/reset on next step' : 'loaded'}\nrun = ${session.policy.run_path}`
+        : '';
     document.getElementById('status').textContent =
-        `t = ${pose.t.toFixed(2)} s\npelvis = (${com.map(v => v.toFixed(2)).join(', ')})\n${limbStr}`;
+        `t = ${pose.t.toFixed(2)} s\npelvis = (${com.map(v => v.toFixed(2)).join(', ')})\n${limbStr}${policyStr}`;
+}
+
+function clearSceneMeshes() {
+    for (const m of Object.values(bodyMeshes)) scene.remove(m);
+    for (const m of Object.values(holdMeshes)) scene.remove(m);
+    for (const m of Object.values(holdRings)) scene.remove(m);
+    if (wallPlate) scene.remove(wallPlate);
+    bodyMeshes = {};
+    holdMeshes = {};
+    holdRings = {};
+    wallPlate = null;
+}
+
+function setPolicyButtons(loaded) {
+    document.getElementById('policy-step').disabled = !loaded;
+    document.getElementById('policy-play').disabled = !loaded;
+    document.getElementById('policy-clear').disabled = !loaded;
+}
+
+function syncWallSelect(source) {
+    if (!source?.selected_value) return;
+    const sel = document.getElementById('wall-select');
+    let opt = [...sel.options].find(o => o.value === source.selected_value);
+    if (!opt) {
+        opt = document.createElement('option');
+        opt.value = source.selected_value;
+        opt.textContent = source.kind === 'moonboard'
+            ? `MoonBoard ${source.moonboard_file} · #${source.moonboard_problem_id}`
+            : source.selected_value;
+        sel.appendChild(opt);
+    }
+    sel.value = source.selected_value;
+}
+
+function applySessionState(j, sessionId = session?.id) {
+    session = {
+        id: sessionId,
+        wall: j.wall,
+        source: j.source,
+        profile: j.profile,
+        pose: j.pose,
+        policy: j.policy,
+    };
+    syncWallSelect(j.source);
+    document.getElementById('height').value = j.profile.height_cm;
+    document.getElementById('wingspan').value = j.profile.wingspan_cm;
+    document.getElementById('mass').value = j.profile.mass_kg;
+
+    clearSceneMeshes();
+    bodyMeshes = buildClimberMeshes(j.profile);
+    for (const m of Object.values(bodyMeshes)) scene.add(m);
+    wallPlate = buildWallAndHolds(j.pose);
+    applyPose(j.pose);
+    frameCamera(j.pose);
+    populateLimbControls(j.pose);
+    setPolicyButtons(Boolean(j.policy));
+    document.getElementById('reset-btn').disabled = false;
+    document.getElementById('demo-btn').disabled = false;
 }
 
 // ─── Wall list ────────────────────────────────────────────────────────────
@@ -365,15 +438,14 @@ async function loadWallList() {
 
 // ─── Session control ──────────────────────────────────────────────────────
 async function startSession() {
+    if (policyTimer) {
+        clearInterval(policyTimer);
+        policyTimer = null;
+        document.getElementById('policy-play').textContent = '▶ Play policy';
+    }
     if (session) {
         await fetch(`/sim3d/api/session/${session.id}`, { method: 'DELETE' });
-        // Tear down old meshes
-        for (const m of Object.values(bodyMeshes)) scene.remove(m);
-        for (const m of Object.values(holdMeshes)) scene.remove(m);
-        for (const m of Object.values(holdRings)) scene.remove(m);
-        bodyMeshes = {};
-        holdMeshes = {};
-        holdRings = {};
+        clearSceneMeshes();
     }
 
     const selectedWall = document.getElementById('wall-select').value;
@@ -400,17 +472,7 @@ async function startSession() {
         return;
     }
     const j = await r.json();
-    session = { id: j.session_id, wall: j.wall, profile: j.profile, pose: j.pose };
-
-    bodyMeshes = buildClimberMeshes(j.profile);
-    for (const m of Object.values(bodyMeshes)) scene.add(m);
-    buildWallAndHolds(j.pose);
-    applyPose(j.pose);
-    frameCamera(j.pose);
-
-    populateLimbControls(j.pose);
-    document.getElementById('reset-btn').disabled = false;
-    document.getElementById('demo-btn').disabled = false;
+    applySessionState(j, j.session_id);
 }
 
 function populateLimbControls(pose) {
@@ -435,7 +497,11 @@ function populateLimbControls(pose) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ limb, hold_id: sel.value, mode: 'reach' }),
             });
-            if (r.ok) applyPose(await r.json());
+            if (r.ok) {
+                if (session) session.policy = null;
+                setPolicyButtons(false);
+                applyPose(await r.json());
+            }
         };
         row.appendChild(sel);
         ctrls.appendChild(row);
@@ -449,7 +515,11 @@ async function moveLimb(limb, holdId, mode = 'reach') {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ limb, hold_id: holdId, mode }),
     });
-    if (r.ok) applyPose(await r.json());
+    if (r.ok) {
+        if (session) session.policy = null;
+        setPolicyButtons(false);
+        applyPose(await r.json());
+    }
 }
 
 async function demoFakeMoves() {
@@ -479,6 +549,66 @@ async function step(frames) {
     if (r.ok) applyPose(await r.json());
 }
 
+
+async function ensureSession() {
+    if (!session) await startSession();
+    return Boolean(session);
+}
+
+async function loadPolicy() {
+    if (!(await ensureSession())) return;
+    const runPath = document.getElementById('policy-path').value.trim();
+    if (!runPath) {
+        document.getElementById('status').textContent = 'Enter a run directory or model.zip path first.';
+        return;
+    }
+    const r = await fetch(`/sim3d/api/session/${session.id}/policy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_path: runPath }),
+    });
+    if (!r.ok) {
+        document.getElementById('status').textContent = `Policy load failed: ${await r.text()}`;
+        return;
+    }
+    const j = await r.json();
+    applySessionState(j, session.id);
+}
+
+async function stepPolicy() {
+    if (!session?.policy) return;
+    const r = await fetch(`/sim3d/api/session/${session.id}/policy/step`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deterministic: true }),
+    });
+    if (!r.ok) {
+        document.getElementById('status').textContent = `Policy step failed: ${await r.text()}`;
+        return;
+    }
+    const j = await r.json();
+    session.wall = j.wall;
+    session.source = j.source;
+    session.profile = j.profile;
+    session.policy = j.policy;
+    applyPose(j.pose);
+}
+
+async function clearPolicy() {
+    if (!session) return;
+    if (policyTimer) {
+        clearInterval(policyTimer);
+        policyTimer = null;
+        document.getElementById('policy-play').textContent = '▶ Play policy';
+    }
+    const r = await fetch(`/sim3d/api/session/${session.id}/policy`, { method: 'DELETE' });
+    document.getElementById('policy-path').value = '';
+    if (r.ok) {
+        const j = await r.json();
+        applySessionState(j, session.id);
+    }
+}
+
 document.getElementById('start-btn').onclick = startSession;
 document.getElementById('demo-btn').onclick = demoFakeMoves;
 document.getElementById('step1').onclick = () => step(6);    // 0.1 s
@@ -490,7 +620,11 @@ document.getElementById('reset-btn').onclick = async () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
     });
-    if (r.ok) applyPose(await r.json());
+    if (r.ok) {
+        if (session) session.policy = null;
+        setPolicyButtons(false);
+        applyPose(await r.json());
+    }
 };
 
 const playBtn = document.getElementById('play');
@@ -504,6 +638,21 @@ playBtn.onclick = () => {
     playBtn.textContent = '⏸ Pause';
     // 6 frames per request, ~10 requests/sec → ~real-time at 60 Hz sim.
     liveTimer = setInterval(() => step(6), 100);
+};
+
+const policyPlayBtn = document.getElementById('policy-play');
+document.getElementById('policy-load').onclick = loadPolicy;
+document.getElementById('policy-step').onclick = stepPolicy;
+document.getElementById('policy-clear').onclick = clearPolicy;
+policyPlayBtn.onclick = () => {
+    if (policyTimer) {
+        clearInterval(policyTimer);
+        policyTimer = null;
+        policyPlayBtn.textContent = '▶ Play policy';
+        return;
+    }
+    policyPlayBtn.textContent = '⏸ Pause policy';
+    policyTimer = setInterval(stepPolicy, 900);
 };
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
