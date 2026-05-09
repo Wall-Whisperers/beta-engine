@@ -169,6 +169,16 @@ LIMB_TIP_SITE = {
     "LF": "site_lf_tip",
     "RF": "site_rf_tip",
 }
+
+# Fixed child bodies whose origins are colocated with the contact tip sites.
+# Equality constraints attach these bodies, not hand/foot body origins, so
+# the physical contact point lands on the hold while wrists/ankles can pivot.
+LIMB_TIP_BODY = {
+    "LH": "tip_body_lh",
+    "RH": "tip_body_rh",
+    "LF": "tip_body_lf",
+    "RF": "tip_body_rf",
+}
 LIMB_MOCAP_BODY = {
     "LH": "mocap_lh",
     "RH": "mocap_rh",

@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/static/style.css" />
   <style>
     body { margin: 0; background: #0e1117; color: #e6edf3; font-family: ui-sans-serif, system-ui, sans-serif; }
-    .layout { display: grid; grid-template-columns: 320px 1fr; height: 100vh; }
-    .panel { padding: 16px; background: #161b22; border-right: 1px solid #30363d; overflow-y: auto; }
+    .layout { display: grid; grid-template-columns: 320px 1fr; height: 100vh; overflow: hidden; }
+    .panel { min-height: 0; height: 100vh; padding: 16px; background: #161b22; border-right: 1px solid #30363d; overflow-y: auto; }
+    .viewer { position: sticky; top: 0; min-width: 0; height: 100vh; overflow: hidden; }
     .panel h1 { font-size: 18px; margin: 0 0 16px; }
     .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: #8b949e; margin: 18px 0 8px; }
     .panel label { display: block; font-size: 12px; color: #8b949e; margin-top: 8px; }
@@ -20,7 +21,7 @@
     .moves { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
     .moves button { margin: 0; padding: 8px 4px; font-size: 12px; }
     .status { margin-top: 12px; padding: 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; font-size: 11px; color: #8b949e; line-height: 1.5; font-family: ui-monospace, Menlo, monospace; }
-    #canvas { width: 100%; height: 100vh; display: block; }
+    #canvas { width: 100%; height: 100%; display: block; }
     .limb-row { display: grid; grid-template-columns: 36px 1fr; gap: 4px; align-items: center; margin-top: 4px; font-size: 12px; }
     .limb-row span { font-family: ui-monospace, Menlo, monospace; color: #8b949e; }
     .limb-row select { padding: 4px 6px; }
@@ -69,7 +70,9 @@
     <h2>Status</h2>
     <div class="status" id="status">No session.</div>
   </div>
-  <canvas id="canvas"></canvas>
+  <div class="viewer">
+    <canvas id="canvas"></canvas>
+  </div>
 </div>
 
 <script type="importmap">

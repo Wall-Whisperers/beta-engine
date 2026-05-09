@@ -19,7 +19,7 @@ equality constraint:
     2. The weld equality is created at compile time, initially inactive.
     3. To attach: position the mocap at the hold, set eq_active[i]=1
        and update eq_data so the weld's relative pose snaps the limb's
-       hand/foot body to the mocap.
+       fixed tip-anchor body to the mocap.
     4. To release: set eq_active[i]=0.
 
 Why mocap+weld rather than connect with sites? `connect` needs two
@@ -201,17 +201,9 @@ class Climb3DWorld:
         # Continuous-reach state per limb (None = not reaching).
         self._reaching: dict[Limb, Optional[ReachState]] = {l: None for l in LIMBS}
 
-        # ── Tip-site offsets (in limb-body local frame) ────────────
-        # The weld snaps the limb body origin to the mocap. To make
-        # the actual *tip* site sit on the hold, we encode the body→site
-        # offset into the weld's relpose. Without this, hands end up
-        # with the wrist on the hold and fingers dangling 12 cm below.
-        self._tip_site_offset: dict[Limb, np.ndarray] = {}
-        for limb in LIMBS:
-            site_id = self._tip_site_idx[limb]
-            self._tip_site_offset[limb] = np.array(
-                self.model.site_pos[site_id], dtype=np.float64,
-            )
+        # Tip-anchor bodies are fixed children at the contact sites, so hold
+        # constraints can pin the actual hand/toe contact point rather than
+        # approximating it from the wrist/ankle body origin.
 
         # First mj_forward so kinematics are populated for any caller
         # that asks for site positions before stepping.
@@ -390,7 +382,7 @@ class Climb3DWorld:
     # ─── Attach / release ─────────────────────────────────────────────
     def attach_limb(self, limb: Limb, hold_id: str) -> None:
         """Activate the per-limb weld between the hold (mocap) and the
-        limb's tip body (l_hand / r_hand / l_foot / r_foot).
+        limb's fixed tip-anchor body.
 
         On attach we:
             1. Set the mocap to the hold's world position.
@@ -404,42 +396,19 @@ class Climb3DWorld:
         mocap_idx = self._mocap_idx[limb]
         eq_idx = self._eq_idx[limb]
 
-        # Position the mocap at the hold's outer surface, slightly
-        # offset along the wall normal so the limb doesn't sink in.
-        wp = np.array(meta["world_pos"])
-        n = np.array(meta["wall_normal"])
-        target = wp + n * 0.02
+        # Position the mocap exactly at the hold's outer surface; body2 of
+        # the weld is the fixed tip-anchor body colocated with the site.
+        target = np.array(meta["world_pos"], dtype=np.float64)
         self.data.mocap_pos[mocap_idx] = target
         self.data.mocap_quat[mocap_idx] = (1.0, 0.0, 0.0, 0.0)
 
-        # Configure the weld.
-        # eq_data layout for mjEQ_WELD is
-        #     [anchor(3) | relpos(3) | relquat(4) | torquescale(1)]
-        # and the constraint enforces
-        #     body2_world = body1_world ⊕ relpose
-        # i.e. body2 (limb) sits at body1 (mocap) plus the relative pose.
-        #
-        # We want the *tip site* of body2 to coincide with body1's
-        # origin. The site is offset by `s` from body2's origin
-        # (in body2-local coords). So:
-        #     site_world = body2_world + R(body2_quat) · s
-        #                = body1_world + R(body1_quat) · relpos
-        #                  + R(body1_quat · relquat) · s
-        # Setting relquat = identity (free rotation, see torquescale=0)
-        # and assuming body1 (mocap) is roughly identity-rotated, the
-        # condition site_world = body1_world reduces to
-        #     relpos + s = 0   →   relpos = -s
-        # which puts body2 origin "behind" the mocap by the site offset,
-        # so the tip itself lands on the mocap.
-        #
-        # torquescale=0 turns off rotation locking — the limb can still
-        # rotate freely on the hold (a real hand can pivot around a
-        # crimp). Without this, every weld also welds the hand's
-        # orientation rigidly, which produces unnatural torso twists.
-        s = self._tip_site_offset[limb]
+        # Configure the weld. Body2 is the fixed tip-anchor body colocated
+        # with the rendered tip site, so a zero relpose pins the actual
+        # contact point to the mocap. torquescale=0 keeps this position-only:
+        # hands and feet can still pivot naturally on holds.
         eq_data = self.model.eq_data[eq_idx]
         eq_data[0:3] = (0.0, 0.0, 0.0)
-        eq_data[3:6] = -s
+        eq_data[3:6] = (0.0, 0.0, 0.0)
         eq_data[6:10] = (1.0, 0.0, 0.0, 0.0)
         if eq_data.shape[0] >= 11:
             eq_data[10] = 0.0
@@ -447,7 +416,7 @@ class Climb3DWorld:
         self.data.eq_active[eq_idx] = 1
         self._on_hold[limb] = HoldAttachment(
             hold_id=hold_id,
-            world_pos=tuple(target),
+            world_pos=tuple(float(v) for v in target),
             max_force_n=self._max_force_for(limb, meta),
         )
 
