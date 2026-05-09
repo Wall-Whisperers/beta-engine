@@ -126,10 +126,17 @@ class VideoRolloutCallback(BaseCallback):
         self._last_save = 0
         os.makedirs(_VIDEO_DIR, exist_ok=True)
 
+    def _on_training_start(self) -> None:
+        """Save a video of the initial (untrained) policy."""
+        self._save_video()
+
     def _on_step(self) -> bool:
         if self.num_timesteps - self._last_save < self._eval_freq:
             return True
+        self._save_video()
+        return True
 
+    def _save_video(self) -> None:
         self._last_save = self.num_timesteps
         mp4_path = os.path.join(_VIDEO_DIR, f"smoke_{self.num_timesteps}.mp4")
 
@@ -137,7 +144,7 @@ class VideoRolloutCallback(BaseCallback):
             import imageio
         except ImportError:
             print("[VideoRolloutCallback] imageio not installed — skipping video.")
-            return True
+            return
 
         # Build a fresh eval env with rgb_array rendering.
         eval_env = MoonBoardEnv(
@@ -182,7 +189,6 @@ class VideoRolloutCallback(BaseCallback):
             imageio.mimwrite(mp4_path, frames, fps=30)
             if self.verbose:
                 print(f"[VideoRolloutCallback] saved {len(frames)} frames → {mp4_path}")
-        return True
 
 
 
@@ -218,8 +224,12 @@ def main() -> None:
     print(f"TensorBoard log: {_TB_LOGDIR}")
     print(f"Videos:          {_VIDEO_DIR}")
     print(f"Checkpoint:      {_CKPT_DIR}/smoke_final.zip")
-    print("\nTo monitor training:")
     print(f"  tensorboard --logdir {_TB_LOGDIR}\n")
+
+    # ── Save initial model ────────────────────────────────────────────────────
+    initial_path = os.path.join(_CKPT_DIR, "smoke_initial")
+    model.save(initial_path)
+    print(f"Initial model saved → {initial_path}.zip")
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     callbacks = [
