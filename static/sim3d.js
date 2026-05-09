@@ -460,6 +460,7 @@ async function startSession() {
         height_cm: parseFloat(document.getElementById('height').value),
         wingspan_cm: parseFloat(document.getElementById('wingspan').value),
         mass_kg: parseFloat(document.getElementById('mass').value),
+        start_mode: document.getElementById('start-mode').value,
         seed: true,
     };
     if (selectedWall.startsWith('moonboard:')) {
@@ -624,7 +625,7 @@ document.getElementById('reset-btn').onclick = async () => {
     const r = await fetch(`/sim3d/api/session/${session.id}/seed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ start_mode: document.getElementById('start-mode').value }),
     });
     if (r.ok) {
         if (session) session.policy = null;
