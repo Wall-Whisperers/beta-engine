@@ -1,14 +1,29 @@
-"""Gymnasium environment for MoonBoard climbing RL (Day 4).
+"""Gymnasium environment for MoonBoard climbing RL.
 
 Wraps a MuJoCo scene (wall + humanoid + grip constraints) as a standard
 Gymnasium Env compatible with all standard RL libraries including SB3.
 
-Observation  : flat Box of shape (133,), dtype float32
+Observation  : flat Box of shape (139,), dtype float32
 Action       : flat Box of shape (21,), dtype float32
                  first 17 — joint position targets (ctrlrange bounded)
                  last  4  — continuous grip intent signals in [-1, 1]
 
-Day 4 target : env.reset() + env.step() pass check_env with zero errors/warnings.
+Observation layout (139 total):
+  Stream 1 — Proprioception [0 : 65]:
+    [0  : 17]  joint positions          (17)
+    [17 : 34]  joint velocities         (17)
+    [34 : 37]  pelvis world pos         ( 3)
+    [37 : 43]  pelvis rot6d             ( 6)
+    [43 : 46]  pelvis linear vel        ( 3)
+    [46 : 49]  pelvis angular vel       ( 3)
+    [49 : 61]  4 limb sites in pelvis   (12)
+    [61 : 65]  grip state               ( 4)
+  Stream 2 — Exteroception [65 : 121]:
+    8 nearest holds × (3 rel_pos + 3 role_onehot + 1 gripping) (56)
+  Stream 3 — Goal [121 : 133]:
+    4 × (target_world − site_world)                            (12)
+  Stream 4 — Foot proximity [133 : 139]:
+    2 feet × (kickboard_hold_pos − foot_site_pos) in pelvis    ( 6)
 """
 
 from __future__ import annotations
@@ -28,80 +43,59 @@ if _PROJECT_ROOT not in sys.path:
 
 from src.parsers.canonical import Route
 from src.xml_gen.scene import build_scene_xml, LIMB_SITE_NAMES
-from src.xml_gen.wall import hold_body_name, hold_position_world
+from src.xml_gen.wall import (
+    hold_body_name, hold_position_world,
+    kickboard_hold_positions_world, KICKBOARD_HOLD_NAMES,
+)
 from src.xml_gen.holds import RADIUS, _NY, _NZ
 import src.grip.grip_manager as _gm_mod
 from src.grip.grip_manager import GripManager
 
-# ── Observation stream dimensions (derived from model at runtime) ──────────────
-# Stream 1 — Proprioception:  17 + 17 + 3 + 6 + 3 + 3 + 12 + 4  = 65
-# Stream 2 — Exteroception:   8 holds × 7 values                  = 56
-# Stream 3 — Goal:            4 limbs × 3 values                  = 12
-# Grand total                                                      = 133
+# ── Observation stream dimensions ─────────────────────────────────────────────
 _NUM_NEAR_HOLDS: int = 8
-_HOLD_OBS_DIM: int = 7  # 3 rel_pos + 3 role_onehot + 1 gripping_flag
+_HOLD_OBS_DIM: int = 7   # 3 rel_pos + 3 role_onehot + 1 gripping_flag
 
-# Reset pose constants — place humanoid with both hands close to the start hold
-# (hold_5_5, sphere centre ≈ (0.0, -0.955, 0.887)).
-# Grid-search confirmed lhand dist=0.167 m, rhand dist=0.178 m from start hold.
-# Proximity threshold is temporarily relaxed to 0.20 during reset (see reset()).
+# Reset pose constants — place humanoid with both hands close to the start hold.
 _RESET_TORSO_X: float = 0.35
 _RESET_TORSO_Y: float = -0.95
 _RESET_TORSO_Z: float = 0.80
-# Quaternion [w, x, y, z] for 180° rotation about Z (torso faces −Y, toward wall).
 _RESET_QUAT: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
 
-# Proximity threshold to use temporarily during reset so the default A-pose
-# (arms not raised) can engage both start-hold grips.
+# Relaxed thresholds used only during reset to engage grips from A-pose.
 _RESET_PROXIMITY: float = 0.20
 _RESET_ALIGNMENT: float = -1.0
+# Foot snap distance: set to 1.0 m so kickboard holds at x=±0.61 m engage even
+# when the IK only partially converges.  The connect constraint closes the gap
+# during warmup; check_slip() is not called during warmup steps.
+_RESET_PROXIMITY_FEET: float = 1.0
 
-# Foot proximity is very relaxed because legs in A-pose hang ~0.5 m below the
-# lowest holds on typical V4 routes.  The constraint snaps the foot to the hold
-# during the second warmup phase; slip detection is bypassed during warmup.
-_RESET_PROXIMITY_FEET: float = 0.50
-
-# qpos indices for the hip / knee joints used to set the climbing start pose.
-# The freejoint occupies qpos[0:7]; hinge joints start at qpos[7] in the order
-# they appear in humanoid.xml:
+# qpos indices for hip/knee joints (freejoint occupies qpos[0:7]).
 #   [7]=abdomen_z  [8]=abdomen_y  [9]=abdomen_x
 #   [10]=right_hip_x  [11]=right_hip_z  [12]=right_hip_y  [13]=right_knee
 #   [14]=left_hip_x   [15]=left_hip_z   [16]=left_hip_y   [17]=left_knee
-#   [18..20]=right_shoulder/elbow  [21..23]=left_shoulder/elbow
-_QI_RIGHT_HIP_Y: int = 12   # range −110° to  20°
-_QI_RIGHT_KNEE:  int = 13   # range −160° to  −2°
-_QI_LEFT_HIP_Y:  int = 16   # range −110° to  20°
-_QI_LEFT_KNEE:   int = 17   # range −160° to  −2°
+_QI_RIGHT_HIP_Z: int = 11   # internal/external rotation, range −60° to +35°
+_QI_RIGHT_HIP_Y: int = 12   # flexion/extension, range −110° to +20°
+_QI_RIGHT_KNEE:  int = 13   # flexion, range −160° to −2°
+_QI_LEFT_HIP_Z:  int = 15
+_QI_LEFT_HIP_Y:  int = 16
+_QI_LEFT_KNEE:   int = 17
 
-# Hip flex and knee bend applied at reset to bring feet up toward the wall.
-# −80° is within the joint range for both joints and raises the foot site by
-# ≈ 0.1–0.2 m relative to A-pose, reducing the constraint snap distance.
-_RESET_HIP_Y: float = np.radians(-80.0)
-_RESET_KNEE:  float = np.radians(-80.0)
+# Initial hip/knee angles (starting guess before IK refinement).
+# −60° hip flex (forward) brings the thigh toward the wall face.
+# hip_z=0 is neutral; IK will rotate hip_z to achieve the lateral spread.
+_INIT_HIP_Z: float = np.radians(0.0)
+_INIT_HIP_Y: float = np.radians(-60.0)
+_INIT_KNEE:  float = np.radians(-60.0)
 
-# Physics steps (at model.opt.timestep resolution) to run after engaging grips
-# at reset so the constraint forces settle before the policy sees the first obs.
-# Without this, activating a connect constraint with a ~0.17 m hand-to-hold gap
-# creates a violent impulse that launches the humanoid on the very first step.
-# 50 steps × 2 ms timestep = 100 ms = 5 × the constraint time-constant (20 ms)
-# → 99% settled.  More steps slow down resets with no physical benefit.
+# Warmup steps after engaging grips (50 × 2 ms = 100 ms ≈ 5 × time constant).
 _RESET_WARMUP_STEPS: int = 50
 
 # Fall detection thresholds.
-# Torso z < this → fallen to the floor.
-# After warmup, a valid hanging torso sits at z ≈ 0.49 m (hands gripped at
-# z = 0.86 m, limp arms, gravity).  0.30 m leaves headroom for dynamic moves
-# while still catching a genuine fall (floor stops body at z ≈ 0.10 m).
 _FALL_Z_THRESHOLD: float = 0.30
-# Torso y > this → launched away from the wall face.
-# A hanging climber swings to y ≈ -0.4; the threshold is set to +1.0 so only
-# a clear forward launch (> 1 m past the hold face) triggers this condition.
 _FALL_Y_THRESHOLD: float = 1.0
 
-# Multiplier for high-water-mark height reward.
+# Reward coefficients.
 _HWM_HEIGHT_SCALE: float = 5.0
-
-# Energy penalty coefficient (applied to squared joint targets each step).
 _ENERGY_PENALTY_COEFF: float = 0.01
 
 
@@ -110,8 +104,8 @@ class MoonBoardEnv(gym.Env):
 
     A MuJoCo humanoid is controlled by joint position targets and must climb a
     MoonBoard wall by gripping holds in sequence.  The episode terminates when
-    the humanoid falls (pelvis z < 0.2 m) or successfully grips the finish hold
-    with both hands for 10 consecutive steps.
+    the humanoid falls (pelvis z < 0.30 m) or grips the finish hold with both
+    hands for 10 consecutive steps.
 
     Args:
         route: Route object from any MoonBoard parser.
@@ -128,15 +122,10 @@ class MoonBoardEnv(gym.Env):
         self,
         route: Route,
         humanoid_xml_path: str,
-        sim_substeps: int = 10,
+        sim_substeps: int = 7,
         max_episode_steps: int = 2000,
         render_mode: str | None = None,
     ) -> None:
-        """Construct the environment and validate the MuJoCo model.
-
-        Performs the Step 1 model inspection during construction: prints nq,
-        nv, actuator names, and the computed policy period.
-        """
         super().__init__()
         import mujoco as _mj
         self._mj = _mj
@@ -146,12 +135,12 @@ class MoonBoardEnv(gym.Env):
         self._max_episode_steps = max_episode_steps
         self.render_mode = render_mode
 
-        # ── Build and load the scene XML ──────────────────────────────────────
+        # ── Build and load scene XML ───────────────────────────────────────────
         xml_str = build_scene_xml(route, humanoid_xml_path)
         self._model = _mj.MjModel.from_xml_string(xml_str)
         self._data = _mj.MjData(self._model)
 
-        # ── Policy period validation (Step 1) ─────────────────────────────────
+        # ── Policy period validation ───────────────────────────────────────────
         policy_period = float(self._model.opt.timestep) * sim_substeps
         if not (0.02 <= policy_period <= 0.04):
             print(
@@ -179,7 +168,7 @@ class MoonBoardEnv(gym.Env):
                 )
             self._site_ids.append(sid)
 
-        # ── Hold lookup dicts (for GripManager) ──────────────────────────────
+        # ── Hold lookup dicts (for GripManager + goal vector) ────────────────
         self._hold_positions: dict[str, np.ndarray] = {}
         self._hold_body_ids: dict[str, int] = {}
         for h in route.holds:
@@ -194,25 +183,37 @@ class MoonBoardEnv(gym.Env):
             )
             self._hold_body_ids[bname] = bid
 
+        # Add kickboard holds so they are accessible for goal-vector computation.
+        _kb_pos = kickboard_hold_positions_world()
+        for kb_name in KICKBOARD_HOLD_NAMES:
+            bid = _mj.mj_name2id(self._model, _mj.mjtObj.mjOBJ_BODY, kb_name)
+            if bid >= 0:
+                self._hold_positions[kb_name] = _kb_pos[kb_name]
+                self._hold_body_ids[kb_name] = bid
+
+        # Cache kickboard world positions for fast lookup during obs/IK.
+        self._kb_positions: dict[str, np.ndarray] = kickboard_hold_positions_world()
+
         # ── Role-sorted hold lists ────────────────────────────────────────────
         self._start_holds = [h for h in route.holds if h.role == "start"]
         self._mid_holds = [h for h in route.holds if h.role == "mid"]
         self._end_holds = [h for h in route.holds if h.role == "end"]
 
-        # Indices into route.holds for each role group.
         self._start_holds_ri: list[int] = [route.holds.index(h) for h in self._start_holds]
         self._mid_holds_ri: list[int] = [route.holds.index(h) for h in self._mid_holds]
         self._end_holds_ri: list[int] = [route.holds.index(h) for h in self._end_holds]
 
-        # Name → Hold lookup (for exteroception stream).
         self._name_to_hold = {
             hold_body_name(h.col, h.row): h for h in route.holds
         }
 
         # ── GripManager ───────────────────────────────────────────────────────
+        # GripManager augments hold_positions / hold_body_ids with kickboard holds
+        # in its __init__, so no extra wiring needed here.
         self._grip_manager = GripManager(
             self._model, self._data,
             self._hold_positions, self._hold_body_ids,
+            verbose=False,
         )
 
         # ── Action space ──────────────────────────────────────────────────────
@@ -245,9 +246,8 @@ class MoonBoardEnv(gym.Env):
         self._act_lo = act_lo
         self._act_hi = act_hi
 
-        # Grip intent: 4 continuous signals in [-1, 1]; > 0 means attempt grip.
         grip_lo = np.full(4, -1.0, dtype=np.float32)
-        grip_hi = np.full(4, 1.0, dtype=np.float32)
+        grip_hi = np.full(4,  1.0, dtype=np.float32)
 
         self.action_space = spaces.Box(
             low=np.concatenate([act_lo, grip_lo]),
@@ -256,54 +256,44 @@ class MoonBoardEnv(gym.Env):
         )
 
         # ── Observation space ─────────────────────────────────────────────────
-        nj_pos = int(self._model.nq) - 7   # skip freejoint 7 DOF
-        nj_vel = int(self._model.nv) - 6   # skip freejoint 6 DOF
+        nj_pos = int(self._model.nq) - 7
+        nj_vel = int(self._model.nv) - 6
         self._nj_pos = nj_pos
         self._nj_vel = nj_vel
 
-        # [0 : nj_pos]                   joint positions        (17)
-        # [nj_pos : nj_pos+nj_vel]       joint velocities       (17)
-        # [34 : 37]                       pelvis world pos       ( 3)
-        # [37 : 43]                       pelvis rot6d           ( 6)
-        # [43 : 46]                       pelvis linear vel      ( 3)
-        # [46 : 49]                       pelvis angular vel     ( 3)
-        # [49 : 61]                       4 limb sites (pelvis)  (12)
-        # [61 : 65]                       grip state             ( 4)
-        self._stream1_dim = nj_pos + nj_vel + 3 + 6 + 3 + 3 + 12 + 4  # 65
-
-        # [65 : 121]  8 nearest holds × 7 values                        (56)
+        self._stream1_dim = nj_pos + nj_vel + 3 + 6 + 3 + 3 + 12 + 4   # 65
         self._stream2_dim = _NUM_NEAR_HOLDS * _HOLD_OBS_DIM             # 56
-
-        # [121 : 133]  4 limb goal vectors × 3 values                   (12)
         self._stream3_dim = 4 * 3                                        # 12
+        self._stream4_dim = 2 * 3                                        # 6 — foot→kickboard
 
-        self._obs_dim = self._stream1_dim + self._stream2_dim + self._stream3_dim  # 133
+        self._obs_dim = (
+            self._stream1_dim + self._stream2_dim +
+            self._stream3_dim + self._stream4_dim
+        )  # 139
 
-        # Wide bounds avoid check_env complaints from large velocity/force values.
         self.observation_space = spaces.Box(
             low=-1e6, high=1e6,
             shape=(self._obs_dim,),
             dtype=np.float32,
         )
 
-        # ── Foot hold selection (computed once from route, reused every reset) ──
+        # ── Foot hold selection (recomputed in reset) ─────────────────────────
+        # _select_foot_holds() always returns the two upper kickboard holds.
         self._foot_hold_names: tuple[str, str] = self._select_foot_holds()
 
-        # ── Episode state (values set in reset) ───────────────────────────────
-        self._reset_pelvis_z: float = 0.0   # pelvis z after warmup
-        self._max_pelvis_z: float = 0.0     # high-water mark for height reward (Fix 2)
+        # Per-foot current target hold names (may advance during episode).
+        # Index 0 = left foot (slot 2), index 1 = right foot (slot 3).
+        self._foot_target_hold_names: list[str] = list(self._foot_hold_names)
+
+        # ── Episode state ─────────────────────────────────────────────────────
+        self._reset_pelvis_z: float = 0.0
+        self._max_pelvis_z: float = 0.0
         self._step_count: int = 0
         self._consec_finish_count: int = 0
-        # Route-holds index of the current target hold for each limb slot.
         self._target_hold_indices: list[int] = [0, 0, 0, 0]
-        # True if slot i was gripping its target hold on the previous step.
-        # Used for rising-edge detection in the hold-match reward.
         self._prev_grip_target_state: list[bool] = [False, False, False, False]
-        # Per-hand pointer into self._mid_holds_ri (which mid hold each hand targets).
         self._hand_mid_ptr: list[int] = [0, 0]
-        # Ordered history of mid-hold pointers for foot lag computation.
         self._hand_mid_history: list[list[int]] = [[], []]
-        # Holds gripped for the first time this episode (yo-yo guard, Fix 3).
         self._holds_matched_this_episode: set[str] = set()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -315,14 +305,19 @@ class MoonBoardEnv(gym.Env):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict]:
-        """Reset the environment to an initial climbing state.
+        """Reset the environment to a 4-point kickboard start.
 
-        Places the humanoid near the start hold, engages both hand grips on
-        the start hold, and resets all episode counters and target pointers.
-
-        Alignment threshold is temporarily set to -1.0 and proximity to 0.20
-        so the default A-pose can engage grips without requiring RSI.
-        TODO (Week 2): replace hardcoded pose with Reference State Initialization.
+        Flow:
+          1. Release any previous grips.
+          2. Set torso position and initial hip/knee angles.
+          3. Phase 1: engage hand grips on start hold (relaxed thresholds).
+          4. Warmup 50 steps (hands only).
+          5. DLS IK for feet: 30-iteration damped-least-squares on hip_z+hip_y+knee,
+             run in the settled post-Phase-1 body configuration.
+          6. Phase 2: engage foot grips on kickboard upper holds.
+          7. Warmup 50 steps (4-point contact).
+          8. Zero qvel, settle 20 steps, mj_forward.
+          9. Assert ≥ 3 grips active (RuntimeError if not).
 
         Args:
             seed: RNG seed forwarded to super().reset() for reproducibility.
@@ -332,33 +327,34 @@ class MoonBoardEnv(gym.Env):
             Tuple of (observation, info_dict).
 
         Raises:
-            RuntimeError: If both hand slots fail to engage on the start hold,
-                with diagnostic printout of site and hold world positions.
+            RuntimeError: If fewer than 3 grips are active after reset.
         """
         super().reset(seed=seed)
 
-        # Release any grips from the previous episode so GripManager._active_holds
-        # is clean (mj_resetData handles data.eq_active, but not the Python dict).
+        # Release any grips from the previous episode.
         for slot in range(4):
             self._grip_manager.release_grip(slot)
 
         # ── Physics reset ─────────────────────────────────────────────────────
         self._mj.mj_resetData(self._model, self._data)
 
-        # Starting pose: torso near wall in A-pose.
-        # TODO (Week 2): replace with Reference State Initialization (RSI) using
-        #   hip_y/knee angles to lift feet toward foot holds (requires route-specific IK).
+        # Initial pose: torso in front of wall, hip/knee pre-flexed as IK start.
         q = np.zeros(self._model.nq, dtype=np.float64)
         q[0] = _RESET_TORSO_X
         q[1] = _RESET_TORSO_Y
         q[2] = _RESET_TORSO_Z
-        q[3], q[4], q[5], q[6] = _RESET_QUAT          # 180° around Z
+        q[3], q[4], q[5], q[6] = _RESET_QUAT
+        q[_QI_LEFT_HIP_Z]  = _INIT_HIP_Z
+        q[_QI_LEFT_HIP_Y]  = _INIT_HIP_Y
+        q[_QI_LEFT_KNEE]   = _INIT_KNEE
+        q[_QI_RIGHT_HIP_Z] = _INIT_HIP_Z
+        q[_QI_RIGHT_HIP_Y] = _INIT_HIP_Y
+        q[_QI_RIGHT_KNEE]  = _INIT_KNEE
         self._data.qpos[:] = q
+
         self._mj.mj_forward(self._model, self._data)
 
-        # ── Phase 1: engage hand grips, warmup ──────────────────────────────
-        # Thresholds relaxed: A-pose hands are ~0.17 m from the start hold and
-        # the arm Z-axis does not yet face the wall.
+        # ── Phase 1: engage hand grips, warmup ───────────────────────────────
         orig_prox  = _gm_mod.PROXIMITY_THRESHOLD
         orig_align = _gm_mod.ALIGNMENT_THRESHOLD
         _gm_mod.PROXIMITY_THRESHOLD = _RESET_PROXIMITY
@@ -385,23 +381,31 @@ class MoonBoardEnv(gym.Env):
                 f"{[self._hold_positions[n] for n in start_names if n in self._hold_positions]}\n"
             )
 
-        # Settle the body with only hands gripped so the feet find their natural
-        # resting position before the foot constraints are added.
         self._data.ctrl[:] = 0.0
         for _ in range(_RESET_WARMUP_STEPS):
             self._mj.mj_step(self._model, self._data)
 
-        # ── Phase 2: engage foot grips, warmup ──────────────────────────────
-        # Foot proximity is very relaxed (0.50 m) because the legs hang well
-        # below the lowest route holds.  The constraint closes the gap during
-        # phase-2 warmup; check_slip() is NOT called during mj_step here, so
-        # transient high forces don't auto-release the grip.
-        lfoot_hold, rfoot_hold = self._foot_hold_names
+        # ── IK after Phase 1: bring feet near kickboard holds ─────────────────
+        # Now that the body has settled into its hanging configuration (hands
+        # gripped, gravity balanced), the hip–foot kinematics are accurate.
+        # Run IK in this settled state to minimise the snap distance at Phase 2.
+        self._ik_feet_to_kickboard()
+        self._mj.mj_forward(self._model, self._data)
+
+        # ── Phase 2: engage kickboard foot grips, warmup ──────────────────────
+        # Always use kickboard upper holds — they are at z ≈ 0.270 m.
+        # PROXIMITY_THRESHOLD is relaxed to 1.0 m; check_slip() is not called
+        # during warmup so large transient snap forces are tolerated.
+        lfoot_hold, rfoot_hold = self._foot_hold_names   # "kb_hold_KB_LU", "kb_hold_KB_RU"
         _gm_mod.PROXIMITY_THRESHOLD = _RESET_PROXIMITY_FEET
         _gm_mod.ALIGNMENT_THRESHOLD = _RESET_ALIGNMENT
         try:
-            self._grip_manager.try_grip(2, lfoot_hold)   # left foot
-            self._grip_manager.try_grip(3, rfoot_hold)   # right foot
+            # snap_to_center=True: the constraint spring pulls the foot TO the
+            # hold centre during the 50-step warmup, regardless of how far the
+            # foot started.  This is reset-only behaviour; episode grips use
+            # snap_to_center=False to preserve the foot's contact position.
+            self._grip_manager.try_grip(2, lfoot_hold, snap_to_center=True)
+            self._grip_manager.try_grip(3, rfoot_hold, snap_to_center=True)
         finally:
             _gm_mod.PROXIMITY_THRESHOLD = orig_prox
             _gm_mod.ALIGNMENT_THRESHOLD = orig_align
@@ -409,24 +413,24 @@ class MoonBoardEnv(gym.Env):
         for _ in range(_RESET_WARMUP_STEPS):
             self._mj.mj_step(self._model, self._data)
 
-        # Zero residual velocities, then re-settle so the constraint is at
-        # true static equilibrium before the policy takes its first step.
-        # Without the re-settle, zeroing qvel while the body is mid-oscillation
-        # creates a zero-velocity / non-equilibrium state; the first mj_step
-        # then produces a constraint-force spike (>4000 N observed) that triggers
-        # check_slip() and releases the grip on step 1.
+        # Zero residual velocities; re-settle to true static equilibrium.
         self._data.qvel[:] = 0.0
         for _ in range(20):
             self._mj.mj_step(self._model, self._data)
         self._mj.mj_forward(self._model, self._data)
 
-        # Verify active grips.  Feet may not engage if the route has no holds
-        # within the relaxed threshold; warn but don't crash.
+        # ── Verify grip count ─────────────────────────────────────────────────
         active = self._grip_manager.get_active_hold_ids()
         n_active = len(active)
+        if n_active < 3:
+            raise RuntimeError(
+                f"[MoonBoardEnv] reset(): only {n_active}/4 grips active after warmup. "
+                f"Active slots: {sorted(active.keys())}. "
+                "Check kickboard IK and foot proximity threshold."
+            )
         if n_active < 4:
             print(
-                f"[MoonBoardEnv] WARNING: reset() achieved only {n_active}/4 grips "
+                f"[MoonBoardEnv] WARNING: reset() achieved {n_active}/4 grips "
                 f"(active slots: {sorted(active.keys())}).  "
                 f"Foot holds '{lfoot_hold}'/'{rfoot_hold}' may be out of reach."
             )
@@ -434,37 +438,25 @@ class MoonBoardEnv(gym.Env):
         # ── Reset episode counters ────────────────────────────────────────────
         self._step_count = 0
         self._consec_finish_count = 0
-        self._holds_matched_this_episode = set()   # Fix 3: yo-yo guard
+        self._holds_matched_this_episode = set()
 
-        # ── Target hold sequencing init ───────────────────────────────────────
-        # TODO (Week 2): replace with beta planner.
         self._hand_mid_ptr = [0, 0]
         self._hand_mid_history = [[], []]
         first_mid_ri = self._mid_holds_ri[0] if self._mid_holds_ri else 0
 
-        # Foot slots target the selected foot hold (by route index).
-        lfoot_ri = next(
-            (i for i, h in enumerate(self._route.holds)
-             if hold_body_name(h.col, h.row) == lfoot_hold),
-            first_mid_ri,
-        )
-        rfoot_ri = next(
-            (i for i, h in enumerate(self._route.holds)
-             if hold_body_name(h.col, h.row) == rfoot_hold),
-            first_mid_ri,
-        )
         self._target_hold_indices = [
             first_mid_ri,   # slot 0 (lhand) → first mid hold
             first_mid_ri,   # slot 1 (rhand) → first mid hold
-            lfoot_ri,       # slot 2 (lfoot) → selected foot hold
-            rfoot_ri,       # slot 3 (rfoot) → selected foot hold
+            first_mid_ri,   # slot 2 (lfoot) — unused; feet use _foot_target_hold_names
+            first_mid_ri,   # slot 3 (rfoot) — unused; feet use _foot_target_hold_names
         ]
+        # Foot targets always start on kickboard upper holds.
+        self._foot_target_hold_names = list(self._foot_hold_names)
         self._prev_grip_target_state = [False, False, False, False]
 
-        # Post-warmup pelvis z as the height baseline for this episode.
         pelvis_pos = np.array(self._data.xpos[self._torso_id])
         self._reset_pelvis_z = float(pelvis_pos[2])
-        self._max_pelvis_z   = self._reset_pelvis_z   # Fix 2: HWM init
+        self._max_pelvis_z   = self._reset_pelvis_z
 
         obs = self._get_obs()
         return obs, {}
@@ -474,22 +466,19 @@ class MoonBoardEnv(gym.Env):
     ) -> tuple[np.ndarray, float, bool, bool, dict]:
         """Advance the simulation by one policy step.
 
-        Applies joint targets and grip intents for sim_substeps physics steps,
-        then checks slips, advances target holds on rising-edge grips, computes
-        reward, and checks termination / truncation.
+        For hand slots: tries the scripted route-hold target.
+        For foot slots: tries the current foot target hold first; if that fails,
+        searches all holds registered for that slot (including kickboard holds)
+        and grips the first within proximity.
 
         Args:
             action: Flat float32 array of shape (nu + 4,).
-                First nu values are joint position targets.
-                Last 4 are grip intent signals (> 0.0 → attempt grip).
 
         Returns:
-            (obs, reward, terminated, truncated, info) where info contains
-            every reward component as an individual float.
+            (obs, reward, terminated, truncated, info) with per-component rewards.
         """
         joint_targets, grip_intents = self._parse_action(action)
 
-        # Apply joint targets and advance physics.
         self._data.ctrl[:] = joint_targets
         for _ in range(self._sim_substeps):
             self._mj.mj_step(self._model, self._data)
@@ -497,8 +486,20 @@ class MoonBoardEnv(gym.Env):
         # ── Process grip intents ──────────────────────────────────────────────
         for slot in range(4):
             if grip_intents[slot] > 0.0:
-                th = self._route.holds[self._target_hold_indices[slot]]
-                self._grip_manager.try_grip(slot, hold_body_name(th.col, th.row))
+                if slot in (0, 1):
+                    # Hand: scripted route-hold target only.
+                    th = self._route.holds[self._target_hold_indices[slot]]
+                    scripted_target = hold_body_name(th.col, th.row)
+                    self._grip_manager.try_grip(slot, scripted_target)
+                else:
+                    # Foot: try scripted kickboard/route target first, then fallback.
+                    scripted_target = self._foot_target_hold_names[slot - 2]
+                    success = self._grip_manager.try_grip(slot, scripted_target)
+                    if not success:
+                        # Fallback: search all valid holds for this slot.
+                        for hold_name in self._grip_manager.get_available_holds_for_slot(slot):
+                            if self._grip_manager.try_grip(slot, hold_name):
+                                break
             else:
                 self._grip_manager.release_grip(slot)
 
@@ -509,10 +510,12 @@ class MoonBoardEnv(gym.Env):
         active = self._grip_manager.get_active_hold_ids()
         curr_grip_target: list[bool] = [False, False, False, False]
         for slot in range(4):
-            th = self._route.holds[self._target_hold_indices[slot]]
-            curr_grip_target[slot] = (
-                active.get(slot) == hold_body_name(th.col, th.row)
-            )
+            if slot in (0, 1):
+                th = self._route.holds[self._target_hold_indices[slot]]
+                target_name = hold_body_name(th.col, th.row)
+            else:
+                target_name = self._foot_target_hold_names[slot - 2]
+            curr_grip_target[slot] = (active.get(slot) == target_name)
 
         # ── Advance target holds on rising edge ───────────────────────────────
         for slot in range(4):
@@ -525,18 +528,13 @@ class MoonBoardEnv(gym.Env):
 
         # ── Reward ────────────────────────────────────────────────────────────
         reward, info = self._compute_reward(curr_grip_target, joint_targets)
-
-        # Update grip-target history after computing reward (rising-edge uses prev).
         self._prev_grip_target_state = list(curr_grip_target)
 
         # ── Termination ───────────────────────────────────────────────────────
         pelvis_pos = np.array(self._data.xpos[self._torso_id])
-        # Two fall conditions:
-        # 1. Torso dropped to floor level (z < 0.5 m).
-        # 2. Torso launched away from wall face (y > -0.40 m).
-        #    The wall face at start-hold level is y ≈ -0.99 m; anything above
-        #    -0.40 m is clearly off the wall and in free space.
-        fell = bool(pelvis_pos[2] < _FALL_Z_THRESHOLD or pelvis_pos[1] > _FALL_Y_THRESHOLD)
+        fell = bool(
+            pelvis_pos[2] < _FALL_Z_THRESHOLD or pelvis_pos[1] > _FALL_Y_THRESHOLD
+        )
 
         both_on_finish = False
         if self._end_holds_ri:
@@ -544,9 +542,7 @@ class MoonBoardEnv(gym.Env):
                 self._route.holds[self._end_holds_ri[0]].col,
                 self._route.holds[self._end_holds_ri[0]].row,
             )
-            lh_finish = (active.get(0) == finish_name)
-            rh_finish = (active.get(1) == finish_name)
-            if lh_finish and rh_finish:
+            if active.get(0) == finish_name and active.get(1) == finish_name:
                 self._consec_finish_count += 1
             else:
                 self._consec_finish_count = 0
@@ -566,6 +562,12 @@ class MoonBoardEnv(gym.Env):
         else:
             info["finish_bonus"] = 0.0
 
+        # ── Foot hold info ────────────────────────────────────────────────────
+        info["foot_hold_names"] = [
+            self._grip_manager.get_gripped_hold(2),
+            self._grip_manager.get_gripped_hold(3),
+        ]
+
         # ── Truncation ────────────────────────────────────────────────────────
         self._step_count += 1
         truncated = (self._step_count >= self._max_episode_steps)
@@ -578,25 +580,15 @@ class MoonBoardEnv(gym.Env):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _get_obs(self) -> np.ndarray:
-        """Build and return the flat observation vector.
+        """Build and return the flat observation vector (139 dimensions).
 
-        Index map (nj_pos=17, nj_vel=17):
-        Stream 1 — Proprioception [0 : 65]:
-          [0  : 17]   joint positions (qpos[7:])            (17)
-          [17 : 34]   joint velocities (qvel[6:])           (17)
-          [34 : 37]   pelvis world position                  ( 3)
-          [37 : 43]   pelvis orientation 6D (rot mat cols)  ( 6)
-          [43 : 46]   pelvis linear velocity (world frame)  ( 3)
-          [46 : 49]   pelvis angular velocity (world frame) ( 3)
-          [49 : 61]   4 limb sites in pelvis frame (4×3)    (12)
-          [61 : 65]   grip state (4 binary floats)          ( 4)
-        Stream 2 — Exteroception [65 : 121]:
-          8 nearest holds × (3 rel_pos + 3 role_onehot + 1 gripping) (56)
-        Stream 3 — Goal [121 : 133]:
-          4 × (target_world − site_world)                           (12)
+        Stream 4 appends 6 new dims: for each foot (slots 2 and 3), the relative
+        XYZ from the foot site to the nearest kickboard hold, expressed in the
+        pelvis (torso) frame.  These give the policy a direct signal for foot
+        placement on the kickboard without searching the exteroception stream.
 
         Returns:
-            Float32 array of shape (133,).
+            Float32 array of shape (139,).
 
         Raises:
             RuntimeError: If any NaN or Inf is detected, identifying the stream.
@@ -604,25 +596,25 @@ class MoonBoardEnv(gym.Env):
         data = self._data
 
         # ── Stream 1: Proprioception ──────────────────────────────────────────
-        joint_pos = np.array(data.qpos[7:], dtype=np.float32)          # 17
+        joint_pos = np.array(data.qpos[7:], dtype=np.float32)
 
-        joint_vel = np.array(data.qvel[6:], dtype=np.float32)          # 17
+        joint_vel = np.array(data.qvel[6:], dtype=np.float32)
 
-        pelvis_world = np.array(data.xpos[self._torso_id], dtype=np.float32)  # 3
+        pelvis_world = np.array(data.xpos[self._torso_id], dtype=np.float32)
 
         pelvis_mat = np.array(data.xmat[self._torso_id]).reshape(3, 3)
-        rot6d = pelvis_mat[:, :2].flatten().astype(np.float32)          # 6
+        rot6d = pelvis_mat[:, :2].flatten().astype(np.float32)
 
-        linvel = np.array(data.qvel[0:3], dtype=np.float32)            # 3
-        angvel = np.array(data.qvel[3:6], dtype=np.float32)            # 3
+        linvel = np.array(data.qvel[0:3], dtype=np.float32)
+        angvel = np.array(data.qvel[3:6], dtype=np.float32)
 
-        site_in_pelvis = np.empty(12, dtype=np.float32)                 # 12
+        site_in_pelvis = np.empty(12, dtype=np.float32)
         for k, sid in enumerate(self._site_ids):
             site_world = np.array(data.site_xpos[sid])
             rel = site_world - pelvis_world.astype(np.float64)
             site_in_pelvis[k * 3: k * 3 + 3] = (pelvis_mat.T @ rel).astype(np.float32)
 
-        grip_state = self._grip_manager.get_grip_state()                # 4
+        grip_state = self._grip_manager.get_grip_state()
 
         stream1 = np.concatenate([
             joint_pos, joint_vel, pelvis_world, rot6d,
@@ -633,10 +625,15 @@ class MoonBoardEnv(gym.Env):
         active = self._grip_manager.get_active_hold_ids()
         active_hold_names: set[str] = set(active.values())
 
-        # Sort all holds by distance from pelvis; take the 8 nearest.
         pelvis_64 = pelvis_world.astype(np.float64)
+        # Only sort main-wall holds for nearest-hold display; kickboard holds
+        # appear in stream4 instead.
+        main_hold_items = [
+            (n, p) for n, p in self._hold_positions.items()
+            if not n.startswith("kb_hold_")
+        ]
         sorted_holds = sorted(
-            self._hold_positions.items(),
+            main_hold_items,
             key=lambda kv: float(np.linalg.norm(kv[1] - pelvis_64)),
         )
         nearest = sorted_holds[:_NUM_NEAR_HOLDS]
@@ -660,30 +657,55 @@ class MoonBoardEnv(gym.Env):
         # ── Stream 3: Goal vectors ────────────────────────────────────────────
         stream3 = np.zeros(12, dtype=np.float32)
         for slot in range(4):
-            ri = self._target_hold_indices[slot]
-            if 0 <= ri < len(self._route.holds):
-                th = self._route.holds[ri]
-                tname = hold_body_name(th.col, th.row)
-                if tname in self._hold_positions:
-                    target_world = self._hold_positions[tname]
+            if slot in (0, 1):
+                ri = self._target_hold_indices[slot]
+                if 0 <= ri < len(self._route.holds):
+                    th = self._route.holds[ri]
+                    tname = hold_body_name(th.col, th.row)
+                    if tname in self._hold_positions:
+                        target_world = self._hold_positions[tname]
+                        site_world = np.array(data.site_xpos[self._site_ids[slot]])
+                        stream3[slot * 3: slot * 3 + 3] = (
+                            (target_world - site_world).astype(np.float32)
+                        )
+            else:
+                # Foot: goal vector toward current foot target hold.
+                fname = self._foot_target_hold_names[slot - 2]
+                if fname in self._hold_positions:
+                    target_world = self._hold_positions[fname]
                     site_world = np.array(data.site_xpos[self._site_ids[slot]])
                     stream3[slot * 3: slot * 3 + 3] = (
                         (target_world - site_world).astype(np.float32)
                     )
-            # If no valid target, leave as zero vector.
-            # TODO (Week 3): replace zero-vector with a sentinel (e.g. large constant)
-            # to avoid ambiguity with "limb is exactly at target."
 
-        obs = np.concatenate([stream1, stream2, stream3]).astype(np.float32)
+        # ── Stream 4: Foot → nearest kickboard hold (in pelvis frame) ────────
+        # 3 dims per foot × 2 feet = 6 dims total.
+        # Gives the policy a direct, stable proximity signal for foot placement
+        # on the kickboard without needing to search stream2.
+        stream4 = np.zeros(6, dtype=np.float32)
+        # Nearest kickboard hold for each foot (by Euclidean distance from site).
+        for k, foot_slot in enumerate((2, 3)):
+            site_world = np.array(data.site_xpos[self._site_ids[foot_slot]])
+            nearest_kb = min(
+                self._kb_positions.values(),
+                key=lambda p: float(np.linalg.norm(site_world - p)),
+            )
+            rel_world = (nearest_kb - site_world).astype(np.float64)
+            rel_pelvis = (pelvis_mat.T @ rel_world).astype(np.float32)
+            stream4[k * 3: k * 3 + 3] = rel_pelvis
+
+        obs = np.concatenate([stream1, stream2, stream3, stream4]).astype(np.float32)
 
         # ── NaN / Inf guard ───────────────────────────────────────────────────
         if not np.all(np.isfinite(obs)):
             s1_end = self._stream1_dim
             s2_end = s1_end + self._stream2_dim
+            s3_end = s2_end + self._stream3_dim
             for start, end, name in [
                 (0, s1_end, "stream1/proprioception"),
                 (s1_end, s2_end, "stream2/exteroception"),
-                (s2_end, self._obs_dim, "stream3/goal"),
+                (s2_end, s3_end, "stream3/goal"),
+                (s3_end, self._obs_dim, "stream4/foot-kickboard"),
             ]:
                 chunk = obs[start:end]
                 if not np.all(np.isfinite(chunk)):
@@ -696,7 +718,7 @@ class MoonBoardEnv(gym.Env):
         return obs
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Reward function v0
+    # Reward function
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compute_reward(
@@ -706,27 +728,16 @@ class MoonBoardEnv(gym.Env):
     ) -> tuple[float, dict[str, float]]:
         """Compute base reward components (fall/finish bonuses added by step()).
 
-        Implements four exploit-prevention mechanisms:
-          Fix 2 — High-Water Mark height: reward only NEW upward progress.
-          Fix 3 — Yo-yo guard: each hold yields a match bonus at most once/episode.
-          Fix 4 — Energy penalty: discourage maximum-torque jitter.
-
         Args:
             curr_grip_target: Per-slot bool — True if slot grips its target hold.
-            joint_targets: Float32 array (nu,) of joint position targets for
-                the current step, used to compute the energy penalty.
+            joint_targets: Float32 array (nu,) of joint position targets.
 
         Returns:
-            Tuple of (total_base_reward, info_dict).  info_dict keys:
-                height_reward, hold_match_bonus, energy_penalty.
+            Tuple of (total_base_reward, info_dict).
         """
         info: dict[str, float] = {}
 
-        # ── Fix 2: High-Water Mark height reward ─────────────────────────────
-        # Only reward NEW upward progress beyond the furthest point reached this
-        # episode.  An agent that climbs to hold N and hangs earns 0/step there;
-        # it must reach hold N+1 to earn any more height reward.  This prevents
-        # the "camper" exploit of climbing once and farming altitude reward.
+        # High-Water Mark height reward: only new upward progress earns reward.
         pelvis_z = float(np.array(self._data.xpos[self._torso_id])[2])
         if pelvis_z > self._max_pelvis_z:
             height_reward = float((pelvis_z - self._max_pelvis_z) * _HWM_HEIGHT_SCALE)
@@ -735,30 +746,24 @@ class MoonBoardEnv(gym.Env):
             height_reward = 0.0
         info["height_reward"] = height_reward
 
-        # ── Fix 3: Hold match bonus (rising edge + yo-yo guard) ───────────────
-        # Rising edge: only award when the slot transitions from not-gripping to
-        # gripping its target hold this step.
-        # Yo-yo guard: each target hold's bonus is awarded at most once per
-        # episode.  After the first award the hold ID is added to
-        # _holds_matched_this_episode so releasing and re-gripping yields nothing.
+        # Hold match bonus (rising edge + yo-yo guard).
         hold_match_bonus = 0.0
         active = self._grip_manager.get_active_hold_ids()
         for slot in range(4):
             rising = curr_grip_target[slot] and not self._prev_grip_target_state[slot]
             if not rising:
                 continue
-            th = self._route.holds[self._target_hold_indices[slot]]
-            hold_name = hold_body_name(th.col, th.row)
+            if slot in (0, 1):
+                th = self._route.holds[self._target_hold_indices[slot]]
+                hold_name = hold_body_name(th.col, th.row)
+            else:
+                hold_name = self._foot_target_hold_names[slot - 2]
             if hold_name not in self._holds_matched_this_episode:
                 hold_match_bonus += 5.0
                 self._holds_matched_this_episode.add(hold_name)
         info["hold_match_bonus"] = hold_match_bonus
 
-        # ── Fix 4: Energy penalty ─────────────────────────────────────────────
-        # Penalise large joint targets every step.  Discourages the "jitter"
-        # exploit where the agent outputs maximum torques on all joints (which
-        # wastes energy and produces violent, unrealistic movement) because pure
-        # torque vibration earns negative reward and no height progress.
+        # Energy penalty: discourage maximum-torque jitter.
         energy_penalty = float(
             -_ENERGY_PENALTY_COEFF * np.sum(np.square(joint_targets))
         )
@@ -772,48 +777,19 @@ class MoonBoardEnv(gym.Env):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _select_foot_holds(self) -> tuple[str, str]:
-        """Pick the two lowest holds on the route as starting foot holds.
+        """Return the kickboard upper holds as the canonical foot start positions.
 
-        Selection rules:
-          1. Sort all route holds by row (ascending).
-          2. Take the hold(s) at the minimum row.
-          3. Among those, assign the leftmost column to the left foot (slot 2)
-             and the rightmost to the right foot (slot 3).
-          4. If there is only one hold at the minimum row, use it for both feet.
-          5. If there are no holds in the model at all, fall back to the first
-             hold in the route.
+        Left foot always starts on kb_hold_KB_LU, right foot on kb_hold_KB_RU.
+        These holds are at z ≈ 0.270 m, within reach of the IK-positioned legs.
+        This is route-independent: every episode starts from the kickboard.
 
         Returns:
-            Tuple (lfoot_hold_name, rfoot_hold_name) as hold body name strings.
+            Tuple (lfoot_hold_name, rfoot_hold_name).
         """
-        available = [
-            h for h in self._route.holds
-            if hold_body_name(h.col, h.row) in self._hold_body_ids
-        ]
-        if not available:
-            # Degenerate route — use start hold for both feet.
-            fallback = hold_body_name(
-                self._start_holds[0].col, self._start_holds[0].row
-            ) if self._start_holds else "hold_5_5"
-            return fallback, fallback
-
-        min_row = min(h.row for h in available)
-        lowest = [h for h in available if h.row == min_row]
-        lowest_sorted = sorted(lowest, key=lambda h: h.col)
-
-        lfoot = hold_body_name(lowest_sorted[0].col, lowest_sorted[0].row)
-        rfoot = hold_body_name(lowest_sorted[-1].col, lowest_sorted[-1].row)
-        return lfoot, rfoot
+        return ("kb_hold_KB_LU", "kb_hold_KB_RU")
 
     def _advance_hand_target(self, hand_slot: int) -> None:
         """Advance a hand slot's target to the next available mid hold.
-
-        When hand i grips its target:
-          - Record the current mid-hold pointer in history (for foot lag).
-          - Find the next mid hold not currently targeted by the other hand.
-          - If no mid holds remain: target the finish hold.
-
-        TODO (Week 2): replace with beta planner.
 
         Args:
             hand_slot: 0 (left hand) or 1 (right hand).
@@ -833,25 +809,21 @@ class MoonBoardEnv(gym.Env):
             self._hand_mid_ptr[hand_slot] = next_ptr
             self._target_hold_indices[hand_slot] = self._mid_holds_ri[next_ptr]
         else:
-            # All mid holds exhausted; target the finish hold.
             if self._end_holds_ri:
                 self._target_hold_indices[hand_slot] = self._end_holds_ri[0]
-            self._hand_mid_ptr[hand_slot] = len(self._mid_holds_ri)  # sentinel
+            self._hand_mid_ptr[hand_slot] = len(self._mid_holds_ri)
 
     def _advance_foot_target(self, foot_slot: int) -> None:
         """Advance a foot slot's target using a two-step lag behind its hand.
 
-        Foot j targets the mid hold that hand (j-2) was targeting exactly two
-        advances ago.  Fallback: lowest-index available mid hold not already
-        targeted by the other foot.
-
-        TODO (Week 2): replace with beta planner.
+        When the foot grips its current target, it advances to the route hold
+        that the corresponding hand was targeting two moves ago.  This keeps
+        feet tracking hands with a natural lag.
 
         Args:
             foot_slot: 2 (left foot) or 3 (right foot).
         """
-        hand_slot = foot_slot - 2    # 2→0, 3→1
-        other_foot = 5 - foot_slot   # 2→3, 3→2
+        hand_slot = foot_slot - 2
         history = self._hand_mid_history[hand_slot]
 
         new_ri: int | None = None
@@ -861,17 +833,101 @@ class MoonBoardEnv(gym.Env):
             if mid_ptr < len(self._mid_holds_ri):
                 new_ri = self._mid_holds_ri[mid_ptr]
 
-        if new_ri is None:
-            other_target = self._target_hold_indices[other_foot]
+        if new_ri is None and self._mid_holds_ri:
+            other_foot = 5 - foot_slot
+            other_target = self._foot_target_hold_names[other_foot - 2]
             for ri in self._mid_holds_ri:
-                if ri != other_target:
+                candidate = hold_body_name(
+                    self._route.holds[ri].col, self._route.holds[ri].row
+                )
+                if candidate != other_target:
                     new_ri = ri
                     break
-            if new_ri is None and self._mid_holds_ri:
+            if new_ri is None:
                 new_ri = self._mid_holds_ri[0]
 
         if new_ri is not None:
-            self._target_hold_indices[foot_slot] = new_ri
+            # Transition from kickboard to route hold.
+            h = self._route.holds[new_ri]
+            self._foot_target_hold_names[foot_slot - 2] = hold_body_name(h.col, h.row)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # IK helper
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _ik_feet_to_kickboard(self) -> None:
+        """Damped-Least-Squares IK to place foot sites near the kickboard upper holds.
+
+        Uses 4 DOFs per leg (hip_x, hip_z, hip_y, knee) and Damped Least Squares
+        (DLS) for robust convergence, which avoids the divergence that simple
+        gradient descent suffers near joint limits.
+
+        DLS update: dq = J.T @ (J @ J.T + λI)^-1 @ err   (λ=0.01)
+
+        Runs 30 iterations, step scale 0.5.  Terminates early if foot site is
+        within 150 mm of target.
+
+        Should be called while the body is in a settled state (e.g., after
+        Phase 1 hand-warmup) so the Jacobian reflects realistic leg kinematics.
+        Caller must call mj_forward after this method returns.
+
+        Target holds (units: metres):
+          Left  foot → kb_hold_KB_LU
+          Right foot → kb_hold_KB_RU
+        """
+        # Joint qpos indices for each leg (4 DOFs each).
+        slot_params = [
+            # (foot_slot, target_name, [qi0, qi1, qi2, qi3], [(lo,hi)...])
+            (
+                2, "kb_hold_KB_LU",
+                [_QI_LEFT_HIP_Z,  _QI_LEFT_HIP_Y,  _QI_LEFT_KNEE],
+                [(-60, 35), (-110, 20), (-160, -2)],
+            ),
+            (
+                3, "kb_hold_KB_RU",
+                [_QI_RIGHT_HIP_Z, _QI_RIGHT_HIP_Y, _QI_RIGHT_KNEE],
+                [(-60, 35), (-110, 20), (-160, -2)],
+            ),
+        ]
+
+        _lam = 0.01   # DLS damping — keeps updates stable near singularities
+
+        for foot_slot, target_name, qi_list, ranges_deg in slot_params:
+            target = self._kb_positions[target_name]
+            site_id = self._site_ids[foot_slot]
+            site_body_id = int(self._model.site_bodyid[site_id])
+
+            # qpos index → qvel index: vi = qi - 1 (freejoint offset).
+            vi_list = [qi - 1 for qi in qi_list]
+            lo_arr = np.array([np.radians(r[0]) for r in ranges_deg])
+            hi_arr = np.array([np.radians(r[1]) for r in ranges_deg])
+            n_dofs = len(qi_list)
+
+            for _ in range(30):
+                self._mj.mj_forward(self._model, self._data)
+                site_pos = np.array(self._data.site_xpos[site_id])
+                err = target - site_pos
+                if np.linalg.norm(err) < 0.15:
+                    break
+
+                jacp = np.zeros((3, self._model.nv))
+                jacr = np.zeros((3, self._model.nv))
+                self._mj.mj_jac(
+                    self._model, self._data, jacp, jacr,
+                    site_pos, site_body_id,
+                )
+
+                # Sub-Jacobian: columns for the selected DOFs (shape 3 × n_dofs).
+                J_sub = jacp[:, vi_list]   # 3 × n_dofs
+
+                # DLS solution: dq = J.T @ (J @ J.T + λI)^-1 @ err
+                A = J_sub @ J_sub.T + _lam * np.eye(3)   # 3×3
+                dq = 0.5 * (J_sub.T @ np.linalg.solve(A, err))  # n_dofs
+
+                # Apply update, clip to joint limits.
+                for k, qi in enumerate(qi_list):
+                    new_val = float(self._data.qpos[qi]) + float(dq[k])
+                    self._data.qpos[qi] = float(np.clip(new_val, lo_arr[k], hi_arr[k]))
 
     # ─────────────────────────────────────────────────────────────────────────
     # Action parsing
@@ -886,9 +942,7 @@ class MoonBoardEnv(gym.Env):
             action: Float32 array of shape (nu + 4,).
 
         Returns:
-            Tuple of:
-                joint_targets: Float32 array of shape (nu,), clamped to ctrlrange.
-                grip_intents: Float32 array of shape (4,), clamped to [-1, 1].
+            Tuple of (joint_targets, grip_intents).
         """
         action = np.asarray(action, dtype=np.float32)
         joint_targets = np.clip(action[: self._nu], self._act_lo, self._act_hi)

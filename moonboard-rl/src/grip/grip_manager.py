@@ -47,6 +47,7 @@ import numpy as np
 
 # Import WALL_NORMAL so callers and tests can use the canonical value.
 from ..xml_gen.wall import WALL_NORMAL  # noqa: F401 (re-exported intentionally)
+from ..xml_gen.wall import KICKBOARD_HOLD_NAMES, kickboard_hold_positions_world
 from ..xml_gen.scene import GRIP_CONSTRAINT_NAMES, LIMB_BODY_NAMES, LIMB_SITE_NAMES
 
 # ── Grip physics thresholds ───────────────────────────────────────────────────
@@ -63,7 +64,7 @@ interactive mode where the arm is in a neutral default orientation."""
 MAX_CONSTRAINT_FORCE: float = 6000.0
 """Force magnitude (Newtons) above which a grip auto-releases (slip detection).
 
-Rationale: the MuJoCo humanoid weighs 43.7 kg (429 N total).
+Rationale: the MuJoCo humanoid weighs 43.7 kg (429 N).
   Static two-handed hang:  ~215 N per constraint.
   Dynamic deadpoint moves:  3-5× per-limb BW → 650-1070 N.
   Initialization transient: the connect constraint engages ~0.17 m from the
@@ -74,6 +75,30 @@ Rationale: the MuJoCo humanoid weighs 43.7 kg (429 N total).
 6000 N sits above the initialization transient (4400 N) and just below the
 free-fall threshold (≈6500 N), so the constraint releases on genuine falls
 while tolerating the reset settling spike."""
+
+SLOT_MAX_FORCE: dict[int, float] = {
+    0: MAX_CONSTRAINT_FORCE,          # lhand — standard threshold
+    1: MAX_CONSTRAINT_FORCE,          # rhand — standard threshold
+    2: MAX_CONSTRAINT_FORCE * 1.5,    # lfoot — push load spikes during reset
+    3: MAX_CONSTRAINT_FORCE * 1.5,    # rfoot — push load spikes during reset
+}
+"""Per-slot maximum constraint force (Newtons) before auto-release.
+
+Feet carry compressive (push) loads on an overhanging wall and can spike
+higher than hands during the reset constraint-force transient.  1.5× gives
+headroom for the warmup phase without masking genuine fall-induced slip."""
+
+SLOT_ALIGNMENT_THRESHOLD: dict[int, float] = {
+    0: ALIGNMENT_THRESHOLD,   # lhand — check alignment with wall normal
+    1: ALIGNMENT_THRESHOLD,   # rhand — check alignment with wall normal
+    2: -1.0,                  # lfoot — orientation varies widely on overhangs
+    3: -1.0,                  # rfoot — kickboard normal differs from wall normal
+}
+"""Per-slot minimum alignment dot-product for grip to engage.
+
+Foot bodies rotate in many orientations during climbing (toe-on, heel-on,
+smearing). The kickboard hold normal (0,1,0) also differs from WALL_NORMAL,
+so feet use -1.0 (accept any orientation) while hands remain strict."""
 
 
 class GripManager:
@@ -88,9 +113,10 @@ class GripManager:
         data:  The corresponding ``mujoco.MjData`` instance.
         hold_positions: Dict mapping hold body name (e.g. ``"hold_5_8"``) to a
             length-3 numpy array giving the hold body's world position.
-            Used for proximity checks.
+            Used for proximity checks.  Kickboard holds are added automatically.
         hold_body_ids: Dict mapping hold body name to integer MuJoCo body index.
-            Used to retarget constraints at runtime.
+            Used to retarget constraints at runtime.  Kickboard holds are added
+            automatically.
     """
 
     def __init__(
@@ -99,6 +125,7 @@ class GripManager:
         data,
         hold_positions: dict[str, np.ndarray],
         hold_body_ids: dict[str, int],
+        verbose: bool = False,
     ) -> None:
         import mujoco  # local import so the module loads without mujoco installed
 
@@ -107,6 +134,7 @@ class GripManager:
         self._hold_positions = hold_positions
         self._hold_body_ids = hold_body_ids
         self._mj = mujoco
+        self._verbose = verbose
 
         # Resolve constraint indices once; crash early if names are missing.
         self._eq_ids: list[int] = []
@@ -138,6 +166,22 @@ class GripManager:
                 )
             self._site_ids.append(sid)
 
+        # ── Register kickboard holds alongside main-wall holds ─────────────────
+        # Kickboard hold bodies are injected into the XML by scene.py via
+        # kickboard_holds_xml().  We add them here so try_grip() / nearest_hold()
+        # work transparently for kickboard hold names.
+        kb_world_positions = kickboard_hold_positions_world()
+        for kb_name in KICKBOARD_HOLD_NAMES:
+            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, kb_name)
+            if bid >= 0:
+                self._hold_positions[kb_name] = kb_world_positions[kb_name]
+                self._hold_body_ids[kb_name] = bid
+            else:
+                print(f"[GripManager] WARNING: kickboard body '{kb_name}' not in model — skipped.")
+
+        # Track kickboard hold names for get_available_holds_for_slot().
+        self._kickboard_hold_names: frozenset[str] = frozenset(KICKBOARD_HOLD_NAMES)
+
         # Slot → active hold body name (None if not gripping).
         self._active_holds: dict[int, str | None] = {i: None for i in range(4)}
 
@@ -146,7 +190,7 @@ class GripManager:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def try_grip(self, limb_slot: int, hold_id: str) -> bool:
+    def try_grip(self, limb_slot: int, hold_id: str, snap_to_center: bool = False) -> bool:
         """Attempt to engage a grip constraint between a limb site and a hold.
 
         Uses data.site_xpos[site_id] (the hand/foot tip) for distance and
@@ -156,7 +200,9 @@ class GripManager:
         1. Proximity: distance from limb site world pos to hold centre
            ≤ PROXIMITY_THRESHOLD.
         2. Alignment: dot product of limb body's local Z-axis with WALL_NORMAL
-           ≥ ALIGNMENT_THRESHOLD.
+           ≥ SLOT_ALIGNMENT_THRESHOLD[limb_slot].  Foot slots use -1.0 (any
+           orientation accepted) so kickboard holds engage regardless of foot
+           body rotation.
 
         If both pass, the constraint is retargeted and activated (see module
         docstring for the exact 4-step protocol).
@@ -164,6 +210,11 @@ class GripManager:
         Args:
             limb_slot: Integer 0–3 identifying the limb (see module docstring).
             hold_id: String key into hold_positions / hold_body_ids.
+            snap_to_center: If True, set anchor2=(0,0,0) so the constraint
+                spring pulls the limb site TO the hold centre during warmup.
+                Use for reset foot snapping.  If False (default), anchor2 is set
+                to the current limb–hold offset so position is preserved in
+                place — correct for episode gripping.
 
         Returns:
             True if the grip was successfully engaged, False otherwise.
@@ -186,21 +237,27 @@ class GripManager:
         site_world_pos = np.array(self._data.site_xpos[site_id])
         dist = float(np.linalg.norm(site_world_pos - hold_world_pos))
         if dist > PROXIMITY_THRESHOLD:
-            print(
-                f"[GripManager] try_grip FAIL slot={limb_slot} hold={hold_id}: "
-                f"site dist {dist:.3f} m > threshold {PROXIMITY_THRESHOLD:.3f} m"
-            )
+            if self._verbose:
+                print(
+                    f"[GripManager] try_grip FAIL slot={limb_slot} hold={hold_id}: "
+                    f"site dist {dist:.3f} m > threshold {PROXIMITY_THRESHOLD:.3f} m"
+                )
             return False
 
-        # ── Check 2: Alignment ────────────────────────────────────────────────
+        # ── Check 2: Alignment (per-slot threshold) ───────────────────────────
+        # Foot slots (2, 3) always use -1.0 (any orientation); hand slots use
+        # the current module-level ALIGNMENT_THRESHOLD so that the env can
+        # temporarily override it to -1.0 during reset via _gm_mod.ALIGNMENT_THRESHOLD.
+        slot_align_thresh = -1.0 if limb_slot in (2, 3) else ALIGNMENT_THRESHOLD
         limb_mat = np.array(self._data.xmat[limb_body_id]).reshape(3, 3)
         limb_z_world = limb_mat[:, 2]
         alignment = float(np.dot(limb_z_world, WALL_NORMAL))
-        if alignment < ALIGNMENT_THRESHOLD:
-            print(
-                f"[GripManager] try_grip FAIL slot={limb_slot} hold={hold_id}: "
-                f"alignment {alignment:.3f} < threshold {ALIGNMENT_THRESHOLD:.3f}"
-            )
+        if alignment < slot_align_thresh:
+            if self._verbose:
+                print(
+                    f"[GripManager] try_grip FAIL slot={limb_slot} hold={hold_id}: "
+                    f"alignment {alignment:.3f} < threshold {slot_align_thresh:.3f}"
+                )
             return False
 
         # ── Retarget and activate constraint ──────────────────────────────────
@@ -213,12 +270,18 @@ class GripManager:
         limb_world_pos = np.array(self._data.xpos[limb_body_id])
         anchor1 = limb_mat.T @ (site_world_pos - limb_world_pos)
 
-        # Step 3: anchor2 = site world position in body2 (hold) local frame.
-        #   (Hold bodies have identity rotation since they are placed with pos only.)
-        hold_world_mat = np.array(self._data.xmat[hold_body_id]).reshape(3, 3)
-        hold_world_pos_now = np.array(self._data.xpos[hold_body_id])
-        rel = site_world_pos - hold_world_pos_now
-        anchor2 = hold_world_mat.T @ rel
+        # Step 3: anchor2 in body2 (hold) local frame.
+        #   Normal mode (snap_to_center=False): preserves the current limb–hold
+        #   offset so the constraint holds the limb in place (correct for episodes).
+        #   Snap mode (snap_to_center=True): sets anchor2=(0,0,0) so the spring
+        #   pulls the limb site TO the hold centre during warmup (correct for reset).
+        if snap_to_center:
+            anchor2 = np.zeros(3)
+        else:
+            hold_world_mat = np.array(self._data.xmat[hold_body_id]).reshape(3, 3)
+            hold_world_pos_now = np.array(self._data.xpos[hold_body_id])
+            rel = site_world_pos - hold_world_pos_now
+            anchor2 = hold_world_mat.T @ rel
 
         self._model.eq_data[eq_id, 0:3] = anchor1
         self._model.eq_data[eq_id, 3:6] = anchor2
@@ -227,12 +290,13 @@ class GripManager:
         self._data.eq_active[eq_id] = 1
         self._active_holds[limb_slot] = hold_id
 
-        print(
-            f"[GripManager] GRIP ENGAGED slot={limb_slot} "
-            f"({LIMB_BODY_NAMES[limb_slot]}) → {hold_id} "
-            f"site_dist={dist:.3f} m  align={alignment:.3f}  "
-            f"anchor1={anchor1}  anchor2={anchor2}"
-        )
+        if self._verbose:
+            print(
+                f"[GripManager] GRIP ENGAGED slot={limb_slot} "
+                f"({LIMB_BODY_NAMES[limb_slot]}) → {hold_id} "
+                f"site_dist={dist:.3f} m  align={alignment:.3f}  "
+                f"anchor1={anchor1}  anchor2={anchor2}"
+            )
         return True
 
     def release_grip(self, limb_slot: int) -> None:
@@ -245,13 +309,18 @@ class GripManager:
         self._data.eq_active[eq_id] = 0
         released_hold = self._active_holds.get(limb_slot)
         self._active_holds[limb_slot] = None
-        print(
-            f"[GripManager] GRIP RELEASED slot={limb_slot} "
-            f"({LIMB_BODY_NAMES[limb_slot]}) was on {released_hold}"
-        )
+        if self._verbose:
+            print(
+                f"[GripManager] GRIP RELEASED slot={limb_slot} "
+                f"({LIMB_BODY_NAMES[limb_slot]}) was on {released_hold}"
+            )
 
     def check_slip(self) -> list[int]:
-        """Check constraint forces and auto-release any grip exceeding MAX_CONSTRAINT_FORCE.
+        """Check constraint forces and auto-release any grip exceeding its slot's threshold.
+
+        Uses SLOT_MAX_FORCE[slot] rather than a single global threshold, so foot
+        slots (2, 3) tolerate the higher transient forces that arise from push
+        loads and the reset constraint-force spike without spurious auto-release.
 
         Force estimation: iterates over data.efc_force rows that belong to
         active equality constraints.  For each active connect constraint (3 efc
@@ -269,11 +338,13 @@ class GripManager:
             if force_mag > self.peak_forces[slot]:
                 self.peak_forces[slot] = force_mag
             eq_id = self._eq_ids[slot]
-            if self._data.eq_active[eq_id] and force_mag > MAX_CONSTRAINT_FORCE:
-                print(
-                    f"[GripManager] SLIP slot={slot}: force {force_mag:.1f} N "
-                    f"> {MAX_CONSTRAINT_FORCE:.1f} N  → auto-releasing"
-                )
+            max_force = SLOT_MAX_FORCE.get(slot, MAX_CONSTRAINT_FORCE)
+            if self._data.eq_active[eq_id] and force_mag > max_force:
+                if self._verbose:
+                    print(
+                        f"[GripManager] SLIP slot={slot}: force {force_mag:.1f} N "
+                        f"> {max_force:.1f} N  → auto-releasing"
+                    )
                 self.release_grip(slot)
                 auto_released.append(slot)
 
@@ -299,6 +370,37 @@ class GripManager:
             hold_id string currently gripped by that slot.  Inactive slots omitted.
         """
         return {k: v for k, v in self._active_holds.items() if v is not None}
+
+    def get_gripped_hold(self, slot: int) -> str | None:
+        """Return the hold_id currently gripped by the given slot, or None.
+
+        Args:
+            slot: Integer 0–3 identifying the limb.
+
+        Returns:
+            Hold body name string if gripping, else None.
+        """
+        return self._active_holds.get(slot)
+
+    def get_available_holds_for_slot(self, slot: int) -> list[str]:
+        """Return the list of valid grip targets for the given limb slot.
+
+        Hand slots (0, 1) can only grip main-wall holds.
+        Foot slots (2, 3) can grip main-wall holds AND kickboard holds.
+
+        Args:
+            slot: Integer 0–3 identifying the limb.
+
+        Returns:
+            List of hold body name strings.  Order is not guaranteed.
+        """
+        main_holds = [
+            name for name in self._hold_positions
+            if name not in self._kickboard_hold_names
+        ]
+        if slot in (2, 3):
+            return main_holds + list(KICKBOARD_HOLD_NAMES)
+        return main_holds
 
     def nearest_hold(self, limb_slot: int) -> tuple[str, float] | None:
         """Find the hold whose centre is closest to the given limb's site.

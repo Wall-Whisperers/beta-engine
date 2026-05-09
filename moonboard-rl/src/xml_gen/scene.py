@@ -31,7 +31,7 @@ import xml.etree.ElementTree as ET
 
 from ..parsers.canonical import Route
 from .holds import holds_xml
-from .wall import wall_xml
+from .wall import wall_xml, kickboard_holds_xml
 
 # Humanoid placement: in front of the wall, facing -Y (toward wall face).
 _HUMANOID_POS = "0 1.0 1.4"   # z=1.4 keeps feet above floor (matches original)
@@ -203,6 +203,7 @@ def build_scene_xml(route: Route, humanoid_xml_path: str) -> str:
 
     _inject_xml_fragment(worldbody, wall_xml())
     _inject_xml_fragment(worldbody, holds_xml(route.holds))
+    _inject_xml_fragment(worldbody, kickboard_holds_xml())
 
     # grip_anchor — a massless, zero-size body welded to worldbody.
     # Used as the default body2 for all connect constraints so MuJoCo accepts
