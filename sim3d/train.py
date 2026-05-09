@@ -64,6 +64,7 @@ class TrainConfig:
     move_frames: int = 24               # shorter for snap, longer for reach
     max_episode_steps: int = 30
     enable_slip: bool = True
+    body_intersection_penalty: float = 2.0
     out_dir: str = "data/runs/sim3d"
     run_id: Optional[str] = None        # auto-generated from timestamp if None
 
@@ -93,7 +94,7 @@ class _EpisodeStatsCallback:
                 outer._writer = csv.writer(outer._fh)
                 outer._writer.writerow([
                     "episode", "total_steps", "reward", "length",
-                    "outcome", "final_com_z", "n_slips",
+                    "outcome", "final_com_z", "n_slips", "body_intersections",
                 ])
 
             def _on_step(self) -> bool:
@@ -119,6 +120,7 @@ class _EpisodeStatsCallback:
                         outcome,
                         round(float(com[2]), 3),
                         int(info.get("slips", 0)),
+                        int(info.get("body_intersections", 0)),
                     ])
                 outer._fh.flush()
                 return True
@@ -158,6 +160,7 @@ def _make_env_factory(cfg: TrainConfig):
             move_frames=cfg.move_frames,
             max_steps=cfg.max_episode_steps,
             enable_slip=cfg.enable_slip,
+            body_intersection_penalty=cfg.body_intersection_penalty,
         )
         return Climbing3DEnv(wall, profile=profile, config=env_cfg)
 
@@ -265,6 +268,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--move-frames", type=int, default=24)
     p.add_argument("--episode-steps", type=int, default=30)
     p.add_argument("--no-slip", action="store_true")
+    p.add_argument("--body-intersection-penalty", type=float, default=2.0,
+                   help="Reward penalty per limb-vs-torso/pelvis intersection contact.")
     p.add_argument("--out-dir", default="data/runs/sim3d")
     p.add_argument("--run-id", default=None,
                    help="Custom run id; default = run_<timestamp>.")
@@ -287,6 +292,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         move_frames=args.move_frames,
         max_episode_steps=args.episode_steps,
         enable_slip=not args.no_slip,
+        body_intersection_penalty=args.body_intersection_penalty,
         out_dir=args.out_dir,
         run_id=args.run_id,
     )

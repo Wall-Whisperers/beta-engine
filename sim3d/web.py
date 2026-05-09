@@ -400,6 +400,9 @@ def load_policy(sid: str):
             move_frames=int(cfg.get("move_frames", 24)),
             max_steps=int(cfg.get("max_episode_steps", 30)),
             enable_slip=bool(cfg.get("enable_slip", True)),
+            body_intersection_penalty=float(
+                cfg.get("body_intersection_penalty", 2.0)
+            ),
         )
         model = PPO.load(str(model_path))
         env = Climbing3DEnv(wall, profile=profile, config=env_cfg)

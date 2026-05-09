@@ -180,6 +180,20 @@ class Climb3DWorld:
                     self._limb_actuator_ids[limb].append(i)
                     break
 
+        # Geom groups used by RL reward shaping. MuJoCo's contact solver
+        # tells us when a limb geom penetrates the torso/pelvis; we turn
+        # those contacts into a soft penalty instead of pretending that
+        # impossible self-intersecting poses are valid climbing beta.
+        self._body_intersection_torso_geom_ids = self._geom_ids(
+            "g_pelvis", "g_chest",
+        )
+        self._body_intersection_limb_geom_ids = self._geom_ids(
+            "g_l_upperarm", "g_l_forearm", "g_l_hand",
+            "g_r_upperarm", "g_r_forearm", "g_r_hand",
+            "g_l_thigh", "g_l_shin", "g_l_foot",
+            "g_r_thigh", "g_r_shin", "g_r_foot",
+        )
+
         # Track slips for diagnostics / RL reward shaping.
         self.slip_events: list[SlipEvent] = []
         self._max_slip_log = 200
@@ -203,6 +217,56 @@ class Climb3DWorld:
         # that asks for site positions before stepping.
         mujoco.mj_forward(self.model, self.data)
         self._sync_actuator_targets_to_pose()
+
+    def _geom_ids(self, *names: str) -> set[int]:
+        """Resolve geom names to ids, ignoring missing names so old MJCFs
+        or experiments can still run."""
+        ids: set[int] = set()
+        for name in names:
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            if gid >= 0:
+                ids.add(int(gid))
+        return ids
+
+    def body_intersection_contacts(self) -> list[dict]:
+        """Return current limb-vs-torso/pelvis penetration contacts.
+
+        This is intentionally diagnostic/reward-shaping only. We do not
+        terminate episodes or modify physics here; MuJoCo has already
+        advanced the state, and the RL environment can decide how much to
+        penalize impossible self-intersections.
+        """
+        contacts: list[dict] = []
+        torso = self._body_intersection_torso_geom_ids
+        limbs = self._body_intersection_limb_geom_ids
+        for i in range(int(self.data.ncon)):
+            c = self.data.contact[i]
+            g1 = int(c.geom1)
+            g2 = int(c.geom2)
+            if c.dist > 0:
+                continue
+            if g1 in torso and g2 in limbs:
+                torso_gid, limb_gid = g1, g2
+            elif g2 in torso and g1 in limbs:
+                torso_gid, limb_gid = g2, g1
+            else:
+                continue
+            torso_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, torso_gid,
+            )
+            limb_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, limb_gid,
+            )
+            contacts.append({
+                "torso_geom": torso_name or str(torso_gid),
+                "limb_geom": limb_name or str(limb_gid),
+                "penetration_m": float(max(0.0, -c.dist)),
+            })
+        return contacts
+
+    def body_intersection_count(self) -> int:
+        """Number of current limb-vs-body intersection contacts."""
+        return len(self.body_intersection_contacts())
 
     # ─── Pose seeding ─────────────────────────────────────────────────
     def seed_pose(
