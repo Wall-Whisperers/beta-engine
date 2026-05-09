@@ -76,6 +76,8 @@ class EnvConfig:
     enable_slip: bool = True                     # hold-overload model on by default for training
     seed_pose: bool = True
     seed_kwargs: dict = field(default_factory=dict)
+    official_route_only: bool = False          # MoonBoard: reject off-route hand/foot contacts
+    invalid_action_penalty: float = 0.25       # small repeated-attempt penalty for masked holds
 
 
 class Climbing3DEnv(gym.Env):
@@ -121,12 +123,21 @@ class Climbing3DEnv(gym.Env):
         self.n_holds = len(self._hold_ids)
         self._hold_index: dict[str, int] = {h: i for i, h in enumerate(self._hold_ids)}
 
-        # Eligibility mask — hands can't use "foothold-only" holds.
-        self._hand_eligible = np.array([
-            not self.world._hold_meta_by_id[h]["is_foothold_only"]
-            for h in self._hold_ids
+        # Eligibility masks. Hands can't use "foothold-only" holds. In
+        # MoonBoard full-board mode, off-route gray holds are present only to
+        # keep a fixed 11×18 action index and are not legal contacts.
+        self._route_eligible = np.array([
+            self._is_official_route_hold(h) for h in self._hold_ids
         ], dtype=np.bool_)
-        self._foot_eligible = np.ones(self.n_holds, dtype=np.bool_)  # feet can use any hold
+        self._hand_eligible = np.array([
+            (not self.world._hold_meta_by_id[h]["is_foothold_only"])
+            and (not self.cfg_env.official_route_only or self._route_eligible[i])
+            for i, h in enumerate(self._hold_ids)
+        ], dtype=np.bool_)
+        self._foot_eligible = np.array([
+            (not self.cfg_env.official_route_only or self._route_eligible[i])
+            for i, _h in enumerate(self._hold_ids)
+        ], dtype=np.bool_)
 
         self._finish_hold_ids = [
             h for h in self._hold_ids
@@ -202,7 +213,9 @@ class Climbing3DEnv(gym.Env):
                     kw["lh"] = kw["rh"] = starts[0].hold_id
 
                 feet_candidates = sorted(
-                    (h for h in self.wall.holds if h.hold_type == "foothold"),
+                    (h for h in self.wall.holds
+                     if h.hold_type == "foothold"
+                     and self._is_official_route_hold(h.hold_id)),
                     key=lambda h: h.y_cm,
                 )
                 if len(feet_candidates) < 2:
@@ -211,7 +224,9 @@ class Climbing3DEnv(gym.Env):
                     used_for_hands = {kw.get("lh"), kw.get("rh")}
                     extras = sorted(
                         (h for h in self.wall.holds
-                         if h.hold_id not in used_for_hands and not h.is_finish),
+                         if h.hold_id not in used_for_hands
+                         and not h.is_finish
+                         and self._is_official_route_hold(h.hold_id)),
                         key=lambda h: h.y_cm,
                     )
                     feet_candidates = (feet_candidates or []) + extras
@@ -244,9 +259,9 @@ class Climbing3DEnv(gym.Env):
             hold_id_idx = int(action) % self.n_holds
             limb = LIMBS[limb_id % 4]
             hold_id = self._hold_ids[hold_id_idx]
-            # Eligibility: hands can't use foothold-only.
-            if limb in HAND_LIMBS and not self._hand_eligible[hold_id_idx]:
-                info["invalid_action"] = "hand on foothold-only"
+            invalid_reason = self._invalid_move_reason(limb, hold_id_idx)
+            if invalid_reason is not None:
+                info["invalid_action"] = invalid_reason
             else:
                 self.world.move_limb(limb, hold_id, mode=self.cfg_env.move_mode)
             slips = self.world.step(
@@ -274,6 +289,8 @@ class Climbing3DEnv(gym.Env):
             - self.cfg_env.slip_penalty * slips
             - self.cfg_env.body_intersection_penalty * body_intersections
         )
+        if "invalid_action" in info:
+            reward -= self.cfg_env.invalid_action_penalty
 
         # Finish hold — either hand counts.
         on_finish = (
@@ -316,6 +333,27 @@ class Climbing3DEnv(gym.Env):
         pass
 
     # ─── Action helpers ───────────────────────────────────────────────
+    def _is_official_route_hold(self, hold_id: str) -> bool:
+        meta = self.world._hold_meta_by_id[hold_id]
+        # Start and finish are explicit schema flags. MoonBoard middle holds
+        # are colored blue by the adapter, while off-route fixed-board holds
+        # are gray. Generic non-MoonBoard walls remain all-route unless this
+        # option is explicitly enabled with gray helper holds.
+        return bool(
+            meta["is_start"]
+            or meta["is_finish"]
+            or str(meta.get("color", "")).lower() != "#888888"
+        )
+
+    def _invalid_move_reason(self, limb: Limb, hold_id_idx: int) -> str | None:
+        if self.cfg_env.official_route_only and not self._route_eligible[hold_id_idx]:
+            return "off-route hold"
+        if limb in HAND_LIMBS and not self._hand_eligible[hold_id_idx]:
+            return "hand on foothold-only"
+        if limb in FOOT_LIMBS and not self._foot_eligible[hold_id_idx]:
+            return "foot on ineligible hold"
+        return None
+
     def encode_move(self, limb: Limb, hold_id: str) -> int:
         """For tests / scripted policies."""
         return LIMBS.index(limb) * self.n_holds + self._hold_index[hold_id]

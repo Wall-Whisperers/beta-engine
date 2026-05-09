@@ -446,6 +446,8 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
             "max_force_n": h.max_force_n,
             "is_start": h.is_start,
             "is_finish": h.is_finish,
+            "hold_type": h.hold_type,
+            "color": h.color,
             "is_foothold_only": (h.hold_type == "foothold"),
         })
 
