@@ -37,8 +37,8 @@ def _require_sb3():
     try:
         import stable_baselines3 as sb3
         from stable_baselines3.common.callbacks import BaseCallback
-        from stable_baselines3.common.vec_env import DummyVecEnv
-        return sb3, BaseCallback, DummyVecEnv
+        from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+        return sb3, BaseCallback, DummyVecEnv, SubprocVecEnv
     except ImportError as e:
         raise ImportError(
             "sim3d.train requires stable-baselines3. "
@@ -64,8 +64,11 @@ class TrainConfig:
     move_frames: int = 24               # shorter for snap, longer for reach
     max_episode_steps: int = 30
     enable_slip: bool = True
+    body_intersection_penalty: float = 2.0
     out_dir: str = "data/runs/sim3d"
     run_id: Optional[str] = None        # auto-generated from timestamp if None
+    n_envs: int = 1                     # parallel CPU env workers
+    device: str = "auto"                # SB3/PyTorch device: auto | cpu | cuda
 
 
 class _EpisodeStatsCallback:
@@ -93,14 +96,18 @@ class _EpisodeStatsCallback:
                 outer._writer = csv.writer(outer._fh)
                 outer._writer.writerow([
                     "episode", "total_steps", "reward", "length",
-                    "outcome", "final_com_z", "n_slips",
+                    "outcome", "final_com_z", "n_slips", "body_intersections",
                 ])
 
             def _on_step(self) -> bool:
                 # SB3 stuffs episode info into self.locals when an
                 # episode finishes. Each parallel env emits its own.
-                infos = self.locals.get("infos") or []
-                dones = self.locals.get("dones") or []
+                infos = self.locals.get("infos")
+                dones = self.locals.get("dones")
+                if infos is None:
+                    infos = []
+                if dones is None:
+                    dones = []
                 if hasattr(dones, "__len__") and not isinstance(dones, list):
                     dones = list(dones)
                 for done, info in zip(dones, infos):
@@ -119,6 +126,7 @@ class _EpisodeStatsCallback:
                         outcome,
                         round(float(com[2]), 3),
                         int(info.get("slips", 0)),
+                        int(info.get("body_intersections", 0)),
                     ])
                 outer._fh.flush()
                 return True
@@ -158,6 +166,7 @@ def _make_env_factory(cfg: TrainConfig):
             move_frames=cfg.move_frames,
             max_steps=cfg.max_episode_steps,
             enable_slip=cfg.enable_slip,
+            body_intersection_penalty=cfg.body_intersection_penalty,
         )
         return Climbing3DEnv(wall, profile=profile, config=env_cfg)
 
@@ -165,7 +174,7 @@ def _make_env_factory(cfg: TrainConfig):
 
 
 def train(cfg: TrainConfig) -> Path:
-    sb3, BaseCallback, DummyVecEnv = _require_sb3()
+    sb3, BaseCallback, DummyVecEnv, SubprocVecEnv = _require_sb3()
     from stable_baselines3.common.monitor import Monitor
 
     if cfg.run_id is None:
@@ -178,7 +187,17 @@ def train(cfg: TrainConfig) -> Path:
         json.dump(asdict(cfg), f, indent=2)
 
     factory = _make_env_factory(cfg)
-    vec_env = DummyVecEnv([lambda: Monitor(factory())])
+
+    def _make_monitored_env(rank: int):
+        def _init():
+            env = factory()
+            env.reset(seed=cfg.seed + rank)
+            return Monitor(env)
+        return _init
+
+    n_envs = max(1, int(cfg.n_envs))
+    env_fns = [_make_monitored_env(i) for i in range(n_envs)]
+    vec_env = DummyVecEnv(env_fns) if n_envs == 1 else SubprocVecEnv(env_fns)
 
     # TensorBoard is an optional sub-dep. Enable logging only if it's
     # importable; otherwise SB3 errors out at .learn() time.
@@ -200,6 +219,7 @@ def train(cfg: TrainConfig) -> Path:
         gamma=cfg.gamma,
         seed=cfg.seed,
         tensorboard_log=tb_log,
+        device=cfg.device,
         verbose=1,
     )
 
@@ -211,6 +231,8 @@ def train(cfg: TrainConfig) -> Path:
     print(f"\nTraining complete. Run dir: {out_dir}")
     print(f"  model:        {out_dir / 'model.zip'}")
     print(f"  episode CSV:  {out_dir / 'episode_stats.csv'}")
+    print(f"  env workers:   {n_envs}")
+    print(f"  torch device:  {model.device}")
     if tb_log:
         print(f"  tensorboard:  tensorboard --logdir {out_dir / 'tb'}")
     replay_cmd = f"python -m sim3d --play {out_dir / 'model.zip'}"
@@ -234,8 +256,8 @@ def train(cfg: TrainConfig) -> Path:
 def play(model_path: str | Path, env: Climbing3DEnv, *, deterministic: bool = True) -> dict:
     """Run a single deterministic episode in the given env using a saved
     SB3 model. Returns the final info dict."""
-    sb3, _BaseCallback, _DummyVecEnv = _require_sb3()
-    model = sb3.PPO.load(str(model_path))
+    sb3, _BaseCallback, _DummyVecEnv, _SubprocVecEnv = _require_sb3()
+    model = sb3.PPO.load(str(model_path), device="auto")
     obs, info = env.reset()
     while True:
         action, _ = model.predict(obs, deterministic=deterministic)
@@ -265,9 +287,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--move-frames", type=int, default=24)
     p.add_argument("--episode-steps", type=int, default=30)
     p.add_argument("--no-slip", action="store_true")
+    p.add_argument("--body-intersection-penalty", type=float, default=2.0,
+                   help="Reward penalty per limb-vs-torso/pelvis intersection contact.")
     p.add_argument("--out-dir", default="data/runs/sim3d")
     p.add_argument("--run-id", default=None,
                    help="Custom run id; default = run_<timestamp>.")
+    p.add_argument("--n-envs", type=int, default=1,
+                   help="Parallel environment workers. Use >1 to speed up CPU-bound MuJoCo rollouts.")
+    p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
+                   help="PyTorch device for PPO policy updates. Env simulation still runs on CPU.")
     args = p.parse_args(argv)
 
     cfg = TrainConfig(
@@ -287,8 +315,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         move_frames=args.move_frames,
         max_episode_steps=args.episode_steps,
         enable_slip=not args.no_slip,
+        body_intersection_penalty=args.body_intersection_penalty,
         out_dir=args.out_dir,
         run_id=args.run_id,
+        n_envs=args.n_envs,
+        device=args.device,
     )
     train(cfg)
     return 0

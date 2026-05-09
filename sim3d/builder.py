@@ -26,6 +26,7 @@ from sim3d import config as cfg
 from sim3d.body import (
     LIMB_EQUALITY,
     LIMB_MOCAP_BODY,
+    LIMB_TIP_BODY,
     LIMB_TIP_SITE,
     ClimberProfile,
     Segments,
@@ -199,6 +200,8 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                         <site name="{LIMB_TIP_SITE['LH']}"
                               pos="0 0 {-hand_half[2]*2:.4f}" size="0.015"
                               rgba="0 1 0 0.6"/>
+                        <body name="{LIMB_TIP_BODY['LH']}"
+                              pos="0 0 {-hand_half[2]*2:.4f}"/>
                     </body>
                 </body>
             </body>
@@ -227,6 +230,8 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                         <site name="{LIMB_TIP_SITE['RH']}"
                               pos="0 0 {-hand_half[2]*2:.4f}" size="0.015"
                               rgba="0 1 0 0.6"/>
+                        <body name="{LIMB_TIP_BODY['RH']}"
+                              pos="0 0 {-hand_half[2]*2:.4f}"/>
                     </body>
                 </body>
             </body>
@@ -255,6 +260,8 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                     <site name="{LIMB_TIP_SITE['LF']}"
                           pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
                           size="0.015" rgba="0 1 0 0.6"/>
+                    <body name="{LIMB_TIP_BODY['LF']}"
+                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
                 </body>
             </body>
         </body>
@@ -282,6 +289,8 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                     <site name="{LIMB_TIP_SITE['RF']}"
                           pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
                           size="0.015" rgba="0 1 0 0.6"/>
+                    <body name="{LIMB_TIP_BODY['RF']}"
+                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
                 </body>
             </body>
         </body>
@@ -490,17 +499,12 @@ def _build_equalities_v2() -> str:
     and update it on attach.
 
     Bodies welded:
-        mocap_lh  ↔  l_hand
-        mocap_rh  ↔  r_hand
-        mocap_lf  ↔  l_foot
-        mocap_rf  ↔  r_foot
+        mocap_lh  ↔  tip_body_lh
+        mocap_rh  ↔  tip_body_rh
+        mocap_lf  ↔  tip_body_lf
+        mocap_rf  ↔  tip_body_rf
     """
-    pairs = [
-        ("LH", "l_hand"),
-        ("RH", "r_hand"),
-        ("LF", "l_foot"),
-        ("RF", "r_foot"),
-    ]
+    pairs = [(limb, LIMB_TIP_BODY[limb]) for limb in ("LH", "RH", "LF", "RF")]
     parts = []
     for limb, body_name in pairs:
         parts.append(

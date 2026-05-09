@@ -19,7 +19,7 @@ equality constraint:
     2. The weld equality is created at compile time, initially inactive.
     3. To attach: position the mocap at the hold, set eq_active[i]=1
        and update eq_data so the weld's relative pose snaps the limb's
-       hand/foot body to the mocap.
+       fixed tip-anchor body to the mocap.
     4. To release: set eq_active[i]=0.
 
 Why mocap+weld rather than connect with sites? `connect` needs two
@@ -180,6 +180,20 @@ class Climb3DWorld:
                     self._limb_actuator_ids[limb].append(i)
                     break
 
+        # Geom groups used by RL reward shaping. MuJoCo's contact solver
+        # tells us when a limb geom penetrates the torso/pelvis; we turn
+        # those contacts into a soft penalty instead of pretending that
+        # impossible self-intersecting poses are valid climbing beta.
+        self._body_intersection_torso_geom_ids = self._geom_ids(
+            "g_pelvis", "g_chest",
+        )
+        self._body_intersection_limb_geom_ids = self._geom_ids(
+            "g_l_upperarm", "g_l_forearm", "g_l_hand",
+            "g_r_upperarm", "g_r_forearm", "g_r_hand",
+            "g_l_thigh", "g_l_shin", "g_l_foot",
+            "g_r_thigh", "g_r_shin", "g_r_foot",
+        )
+
         # Track slips for diagnostics / RL reward shaping.
         self.slip_events: list[SlipEvent] = []
         self._max_slip_log = 200
@@ -187,22 +201,64 @@ class Climb3DWorld:
         # Continuous-reach state per limb (None = not reaching).
         self._reaching: dict[Limb, Optional[ReachState]] = {l: None for l in LIMBS}
 
-        # ── Tip-site offsets (in limb-body local frame) ────────────
-        # The weld snaps the limb body origin to the mocap. To make
-        # the actual *tip* site sit on the hold, we encode the body→site
-        # offset into the weld's relpose. Without this, hands end up
-        # with the wrist on the hold and fingers dangling 12 cm below.
-        self._tip_site_offset: dict[Limb, np.ndarray] = {}
-        for limb in LIMBS:
-            site_id = self._tip_site_idx[limb]
-            self._tip_site_offset[limb] = np.array(
-                self.model.site_pos[site_id], dtype=np.float64,
-            )
+        # Tip-anchor bodies are fixed children at the contact sites, so hold
+        # constraints can pin the actual hand/toe contact point rather than
+        # approximating it from the wrist/ankle body origin.
 
         # First mj_forward so kinematics are populated for any caller
         # that asks for site positions before stepping.
         mujoco.mj_forward(self.model, self.data)
         self._sync_actuator_targets_to_pose()
+
+    def _geom_ids(self, *names: str) -> set[int]:
+        """Resolve geom names to ids, ignoring missing names so old MJCFs
+        or experiments can still run."""
+        ids: set[int] = set()
+        for name in names:
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            if gid >= 0:
+                ids.add(int(gid))
+        return ids
+
+    def body_intersection_contacts(self) -> list[dict]:
+        """Return current limb-vs-torso/pelvis penetration contacts.
+
+        This is intentionally diagnostic/reward-shaping only. We do not
+        terminate episodes or modify physics here; MuJoCo has already
+        advanced the state, and the RL environment can decide how much to
+        penalize impossible self-intersections.
+        """
+        contacts: list[dict] = []
+        torso = self._body_intersection_torso_geom_ids
+        limbs = self._body_intersection_limb_geom_ids
+        for i in range(int(self.data.ncon)):
+            c = self.data.contact[i]
+            g1 = int(c.geom1)
+            g2 = int(c.geom2)
+            if c.dist > 0:
+                continue
+            if g1 in torso and g2 in limbs:
+                torso_gid, limb_gid = g1, g2
+            elif g2 in torso and g1 in limbs:
+                torso_gid, limb_gid = g2, g1
+            else:
+                continue
+            torso_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, torso_gid,
+            )
+            limb_name = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, limb_gid,
+            )
+            contacts.append({
+                "torso_geom": torso_name or str(torso_gid),
+                "limb_geom": limb_name or str(limb_gid),
+                "penetration_m": float(max(0.0, -c.dist)),
+            })
+        return contacts
+
+    def body_intersection_count(self) -> int:
+        """Number of current limb-vs-body intersection contacts."""
+        return len(self.body_intersection_contacts())
 
     # ─── Pose seeding ─────────────────────────────────────────────────
     def seed_pose(
@@ -326,7 +382,7 @@ class Climb3DWorld:
     # ─── Attach / release ─────────────────────────────────────────────
     def attach_limb(self, limb: Limb, hold_id: str) -> None:
         """Activate the per-limb weld between the hold (mocap) and the
-        limb's tip body (l_hand / r_hand / l_foot / r_foot).
+        limb's fixed tip-anchor body.
 
         On attach we:
             1. Set the mocap to the hold's world position.
@@ -340,42 +396,19 @@ class Climb3DWorld:
         mocap_idx = self._mocap_idx[limb]
         eq_idx = self._eq_idx[limb]
 
-        # Position the mocap at the hold's outer surface, slightly
-        # offset along the wall normal so the limb doesn't sink in.
-        wp = np.array(meta["world_pos"])
-        n = np.array(meta["wall_normal"])
-        target = wp + n * 0.02
+        # Position the mocap exactly at the hold's outer surface; body2 of
+        # the weld is the fixed tip-anchor body colocated with the site.
+        target = np.array(meta["world_pos"], dtype=np.float64)
         self.data.mocap_pos[mocap_idx] = target
         self.data.mocap_quat[mocap_idx] = (1.0, 0.0, 0.0, 0.0)
 
-        # Configure the weld.
-        # eq_data layout for mjEQ_WELD is
-        #     [anchor(3) | relpos(3) | relquat(4) | torquescale(1)]
-        # and the constraint enforces
-        #     body2_world = body1_world ⊕ relpose
-        # i.e. body2 (limb) sits at body1 (mocap) plus the relative pose.
-        #
-        # We want the *tip site* of body2 to coincide with body1's
-        # origin. The site is offset by `s` from body2's origin
-        # (in body2-local coords). So:
-        #     site_world = body2_world + R(body2_quat) · s
-        #                = body1_world + R(body1_quat) · relpos
-        #                  + R(body1_quat · relquat) · s
-        # Setting relquat = identity (free rotation, see torquescale=0)
-        # and assuming body1 (mocap) is roughly identity-rotated, the
-        # condition site_world = body1_world reduces to
-        #     relpos + s = 0   →   relpos = -s
-        # which puts body2 origin "behind" the mocap by the site offset,
-        # so the tip itself lands on the mocap.
-        #
-        # torquescale=0 turns off rotation locking — the limb can still
-        # rotate freely on the hold (a real hand can pivot around a
-        # crimp). Without this, every weld also welds the hand's
-        # orientation rigidly, which produces unnatural torso twists.
-        s = self._tip_site_offset[limb]
+        # Configure the weld. Body2 is the fixed tip-anchor body colocated
+        # with the rendered tip site, so a zero relpose pins the actual
+        # contact point to the mocap. torquescale=0 keeps this position-only:
+        # hands and feet can still pivot naturally on holds.
         eq_data = self.model.eq_data[eq_idx]
         eq_data[0:3] = (0.0, 0.0, 0.0)
-        eq_data[3:6] = -s
+        eq_data[3:6] = (0.0, 0.0, 0.0)
         eq_data[6:10] = (1.0, 0.0, 0.0, 0.0)
         if eq_data.shape[0] >= 11:
             eq_data[10] = 0.0
@@ -383,7 +416,7 @@ class Climb3DWorld:
         self.data.eq_active[eq_idx] = 1
         self._on_hold[limb] = HoldAttachment(
             hold_id=hold_id,
-            world_pos=tuple(target),
+            world_pos=tuple(float(v) for v in target),
             max_force_n=self._max_force_for(limb, meta),
         )
 
@@ -765,25 +798,31 @@ class Climb3DWorld:
                     "world_pos": list(meta["world_pos"]),
                     "wall_normal": list(meta["wall_normal"]),
                     "radius": radius,
+                    "protrude": _cfg.HOLD_PROTRUDE_M,
                     "is_start": meta["is_start"],
                     "is_finish": meta["is_finish"],
                     "color": self.wall.by_id(meta["hold_id"]).color,
                 }
 
-            # Plate centre needs to match the builder's lift-for-floor
-            # logic, so re-derive from the actual hold positions.
-            cz_base = (plate_h / 2.0) * math.cos(theta)
+            # Plate centre must exactly match builder._build_wall_xml.
+            # If this drifts, especially on 40° MoonBoard overhangs, the
+            # browser shows the wall on one diagonal while MuJoCo/body/holds
+            # occupy another. Keep this math in lockstep with the MJCF.
             cy_base = (plate_h / 2.0) * math.sin(theta)
-            min_hold_z = min(
-                (h["world_pos"][2] for h in self._hold_meta_by_id.values()),
-                default=0.0,
-            )
-            # The lift offset in the builder is added to cz only.
-            # Approximating: the plate's bottom-near corner sits at the
-            # lowest point on the wall surface; the lowest hold sits
-            # slightly above that. The exact offset isn't critical for
-            # rendering — the holds drive correctness, the plate is
-            # just a visual backdrop sized to match.
+            cz_base = (plate_h / 2.0) * math.cos(theta)
+            if self.wall.holds:
+                cos_t0 = math.cos(theta)
+                sin_t0 = math.sin(theta)
+                local_y_tip0 = _cfg.WALL_THICKNESS_M / 2.0 + _cfg.HOLD_PROTRUDE_M
+                min_world_z = min(
+                    cz_base - local_y_tip0 * sin_t0
+                    + ((h.y_cm / 100.0) - plate_h / 2.0) * cos_t0
+                    for h in self.wall.holds
+                )
+                deficit = _cfg.FLOOR_Z + _cfg.HOLD_FLOOR_CLEARANCE - min_world_z
+                if deficit > 0:
+                    cz_base += deficit
+
             snap["static"] = {
                 "wall": {
                     "width_m": width_m,

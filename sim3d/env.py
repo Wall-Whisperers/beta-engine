@@ -30,6 +30,7 @@ Reward (per step):
     - PER_STEP_PENALTY                             # be efficient
     - FALL_PENALTY (terminal) if pelvis_z < FALL_Z
     - SLIP_PENALTY × n_slips                       # don't blow up grips
+    - BODY_INTERSECTION_PENALTY × n_intersections  # no limbs through torso
 
 Termination:
     - hand on finish hold for ≥ FINISH_HOLD_FRAMES
@@ -71,6 +72,7 @@ class EnvConfig:
     per_step_penalty: float = 0.02
     fall_penalty: float = 50.0
     slip_penalty: float = 5.0
+    body_intersection_penalty: float = 2.0       # discourage limbs passing through torso/pelvis
     enable_slip: bool = True                     # hold-overload model on by default for training
     seed_pose: bool = True
     seed_kwargs: dict = field(default_factory=dict)
@@ -261,6 +263,7 @@ class Climbing3DEnv(gym.Env):
             )
 
         # ── Reward shaping ─────────────────────────────────────────
+        body_intersections = self.world.body_intersection_count()
         com_z = float(self.world.com()[2])
         progress = com_z - self._prev_com_z
         self._prev_com_z = com_z
@@ -269,6 +272,7 @@ class Climbing3DEnv(gym.Env):
             self.cfg_env.upward_reward * progress
             - self.cfg_env.per_step_penalty
             - self.cfg_env.slip_penalty * slips
+            - self.cfg_env.body_intersection_penalty * body_intersections
         )
 
         # Finish hold — either hand counts.
@@ -298,6 +302,7 @@ class Climbing3DEnv(gym.Env):
 
         info.update(self._info())
         info["slips"] = slips
+        info["body_intersections"] = body_intersections
         info["progress"] = progress
         return self._obs(), float(reward), terminated, truncated, info
 

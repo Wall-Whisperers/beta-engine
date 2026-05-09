@@ -166,7 +166,7 @@ TORQUE_CAP_NM = {
 # constraint. solref/solimp control how stiff the catch is — climbers
 # describe "snapping onto a hold" as a quick lock-in, so we tune for a
 # fast catch with low spring-back.
-HOLD_CONSTRAINT_SOLREF = (0.02, 1.0)
+HOLD_CONSTRAINT_SOLREF = (0.008, 1.0)
 HOLD_CONSTRAINT_SOLIMP = (0.95, 0.99, 0.001, 0.5, 2)
 
 # ─── Continuous-reach controller ────────────────────────────────────────────
