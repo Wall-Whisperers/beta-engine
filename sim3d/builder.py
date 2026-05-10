@@ -122,8 +122,8 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
     """
     s = profile.segments
     m = profile.masses
-    hand_half = (0.045, 0.025, 0.06)
-    foot_half = (0.05, 0.10, max(0.025, s.foot_h / 2.0))
+    hand_half = (0.045, 0.025, 0.0975)  # width=9cm, depth=5cm, length=19.5cm
+    foot_half = (0.045, 0.13, max(0.025, s.foot_h / 2.0))  # width=9cm, length=26cm
 
     R = lambda key: (
         f'{cfg.JOINT_LIMITS_RAD[key][0]:.4f} {cfg.JOINT_LIMITS_RAD[key][1]:.4f}'
@@ -156,8 +156,8 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
     return f"""
     <body name="pelvis" pos="{pelvis_x:.4f} {pelvis_y:.4f} {pelvis_z:.4f}">
         <freejoint name="root"/>
-        <geom name="g_pelvis" type="box"
-              size="{pw:.4f} 0.10 {0.09:.4f}"
+        <geom name="g_pelvis" type="ellipsoid"
+              size="{pw:.4f} 0.115 {0.09:.4f}"
               mass="{m.pelvis:.3f}" rgba="{cloth}"
               friction="1.0 0.005 0.001"/>
         <site name="site_com" pos="0 0 0" size="0.02" rgba="1 1 0 0.4"/>
@@ -165,14 +165,18 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
         <body name="chest" pos="0 0 {0.12:.4f}">
             <joint name="spine_lean" type="hinge" axis="1 0 0"
                    range="{R('spine_lean')}" {P('spine_lean')}/>
-            <geom name="g_chest" type="box"
-                  size="{sw*0.9:.4f} 0.10 {s.spine/2:.4f}"
+            <geom name="g_chest" type="ellipsoid"
+                  size="{sw*0.9:.4f} 0.115 {s.spine/2:.4f}"
                   pos="0 0 {s.spine/2:.4f}"
                   mass="{m.chest:.3f}" rgba="{cloth}"
                   friction="1.0 0.005 0.001"/>
+            <geom name="g_neck" type="cylinder"
+                  fromto="0 0 {s.spine:.4f}  0 0 {s.spine + s.head/2 - s.head_radius:.4f}"
+                  size="{cfg.NECK_RADIUS_M:.4f}" mass="0.3" rgba="{skin}"
+                  friction="1.0 0.005 0.001"/>
 
             <body name="head" pos="0 0 {s.spine + s.head/2:.4f}">
-                <geom name="g_head" type="sphere" size="{s.head/2:.4f}"
+                <geom name="g_head" type="sphere" size="{s.head_radius:.4f}"
                       mass="{m.head:.3f}" rgba="{skin}"/>
             </body>
 
@@ -184,15 +188,15 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                        range="{R('shoulder_el')}"   {P('shoulder_el')}/>
                 <joint name="l_shoulder_roll" type="hinge" axis="0 0 1"
                        range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
-                {capsule("g_l_upperarm", s.upper_arm, 0.045, m.upper_arm, skin)}
+                {capsule("g_l_upperarm", s.upper_arm, 0.051, m.upper_arm, skin)}
                 <body name="l_forearm" pos="0 0 {-s.upper_arm:.4f}">
                     <joint name="l_elbow" type="hinge" axis="1 0 0"
                            range="{R('elbow')}" {P('elbow')}/>
-                    {capsule("g_l_forearm", s.forearm, 0.038, m.forearm, skin)}
+                    {capsule("g_l_forearm", s.forearm, 0.046, m.forearm, skin)}
                     <body name="l_hand" pos="0 0 {-s.forearm:.4f}">
                         <joint name="l_wrist" type="hinge" axis="1 0 0"
                                range="{R('wrist')}" {P('wrist')}/>
-                        <geom name="g_l_hand" type="box"
+                        <geom name="g_l_hand" type="ellipsoid"
                               size="{hand_half[0]:.4f} {hand_half[1]:.4f} {hand_half[2]:.4f}"
                               pos="0 0 {-hand_half[2]:.4f}"
                               mass="{m.hand:.3f}" rgba="{skin}"
@@ -214,15 +218,15 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                        range="{R('shoulder_el')}"   {P('shoulder_el')}/>
                 <joint name="r_shoulder_roll" type="hinge" axis="0 0 1"
                        range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
-                {capsule("g_r_upperarm", s.upper_arm, 0.045, m.upper_arm, skin)}
+                {capsule("g_r_upperarm", s.upper_arm, 0.051, m.upper_arm, skin)}
                 <body name="r_forearm" pos="0 0 {-s.upper_arm:.4f}">
                     <joint name="r_elbow" type="hinge" axis="1 0 0"
                            range="{R('elbow')}" {P('elbow')}/>
-                    {capsule("g_r_forearm", s.forearm, 0.038, m.forearm, skin)}
+                    {capsule("g_r_forearm", s.forearm, 0.046, m.forearm, skin)}
                     <body name="r_hand" pos="0 0 {-s.forearm:.4f}">
                         <joint name="r_wrist" type="hinge" axis="1 0 0"
                                range="{R('wrist')}" {P('wrist')}/>
-                        <geom name="g_r_hand" type="box"
+                        <geom name="g_r_hand" type="ellipsoid"
                               size="{hand_half[0]:.4f} {hand_half[1]:.4f} {hand_half[2]:.4f}"
                               pos="0 0 {-hand_half[2]:.4f}"
                               mass="{m.hand:.3f}" rgba="{skin}"
@@ -245,15 +249,15 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                    range="{R('hip_abduct')}" {P('hip_abduct')}/>
             <joint name="l_hip_rot"    type="hinge" axis="0 0 1"
                    range="{R('hip_rot')}"    {P('hip_rot')}/>
-            {capsule("g_l_thigh", s.thigh, 0.07, m.thigh, cloth)}
+            {capsule("g_l_thigh", s.thigh, 0.086, m.thigh, cloth)}
             <body name="l_shin" pos="0 0 {-s.thigh:.4f}">
                 <joint name="l_knee" type="hinge" axis="1 0 0"
                        range="{R('knee')}" {P('knee')}/>
-                {capsule("g_l_shin", s.shin, 0.05, m.shin, skin)}
+                {capsule("g_l_shin", s.shin, 0.056, m.shin, skin)}
                 <body name="l_foot" pos="0 0 {-s.shin - foot_half[2]:.4f}">
                     <joint name="l_ankle" type="hinge" axis="1 0 0"
                            range="{R('ankle')}" {P('ankle')}/>
-                    <geom name="g_l_foot" type="box"
+                    <geom name="g_l_foot" type="ellipsoid"
                           size="{foot_half[0]:.4f} {foot_half[1]:.4f} {foot_half[2]:.4f}"
                           mass="{m.foot:.3f}" rgba="0.10 0.10 0.10 1"
                           friction="{foot_fric}"/>
@@ -274,15 +278,15 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                    range="{R('hip_abduct')}" {P('hip_abduct')}/>
             <joint name="r_hip_rot"    type="hinge" axis="0 0 1"
                    range="{R('hip_rot')}"    {P('hip_rot')}/>
-            {capsule("g_r_thigh", s.thigh, 0.07, m.thigh, cloth)}
+            {capsule("g_r_thigh", s.thigh, 0.086, m.thigh, cloth)}
             <body name="r_shin" pos="0 0 {-s.thigh:.4f}">
                 <joint name="r_knee" type="hinge" axis="1 0 0"
                        range="{R('knee')}" {P('knee')}/>
-                {capsule("g_r_shin", s.shin, 0.05, m.shin, skin)}
+                {capsule("g_r_shin", s.shin, 0.056, m.shin, skin)}
                 <body name="r_foot" pos="0 0 {-s.shin - foot_half[2]:.4f}">
                     <joint name="r_ankle" type="hinge" axis="1 0 0"
                            range="{R('ankle')}" {P('ankle')}/>
-                    <geom name="g_r_foot" type="box"
+                    <geom name="g_r_foot" type="ellipsoid"
                           size="{foot_half[0]:.4f} {foot_half[1]:.4f} {foot_half[2]:.4f}"
                           mass="{m.foot:.3f}" rgba="0.10 0.10 0.10 1"
                           friction="{foot_fric}"/>

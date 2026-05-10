@@ -9,6 +9,7 @@ Run via Docker:  docker compose up
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any
 
 from flask import Flask, jsonify, request, send_from_directory
 
-DATA_DIR = Path("/data/walls")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/walls"))
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = PROJECT_ROOT / "static"
 SCHEMA_PATH = PROJECT_ROOT / "schemas" / "wall.schema.json"

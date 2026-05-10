@@ -68,12 +68,18 @@ class Segments:
 
     @property
     def upper_arm(self) -> float:
-        # Upper arm slightly longer than forearm in the average human.
-        return self.arm_total * 0.55
+        # 35 cm / 67 cm arm_total (wingspan=181, shoulder=47)
+        return self.arm_total * 0.522
 
     @property
     def forearm(self) -> float:
-        return self.arm_total * 0.45
+        # 29 cm / 67 cm arm_total
+        return self.arm_total * 0.433
+
+    @property
+    def head_radius(self) -> float:
+        # From head circumference 57 cm → r = 57/(2π) = 9.1 cm.
+        return self.height_m * cfg.HEAD_RADIUS_FRAC
 
     @property
     def standing_leg(self) -> float:

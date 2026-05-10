@@ -44,17 +44,20 @@ HOLD_RADIUS_BY_SIZE_M = {
 # Average-climber dimensions. Mirror solver/body defaults so betas line
 # up across 2D and 3D solvers.
 DEFAULT_HEIGHT_CM = 175.0
-DEFAULT_WINGSPAN_CM = 175.0
+DEFAULT_WINGSPAN_CM = 181.0   # 5'9" male: fingertip-to-fingertip
 DEFAULT_MASS_KG = 70.0
 
-# Per-segment fraction of total height (anatomy approximation).
-THIGH_FRAC = 0.245
-SHIN_FRAC = 0.245
-FOOT_HEIGHT_FRAC = 0.04
-PELVIS_TO_CHEST_FRAC = 0.30   # spine length
-NECK_HEAD_FRAC = 0.18
-SHOULDER_WIDTH_FRAC = 0.23
-PELVIS_WIDTH_FRAC = 0.18
+# Per-segment fraction of total height — derived from measured joint heights
+# for a 175 cm male: ankle=8 cm, knee=51 cm, hip=94 cm, shoulder=145 cm.
+THIGH_FRAC = 0.246            # hip–knee: 43/175
+SHIN_FRAC = 0.246             # knee–ankle: 43/175
+FOOT_HEIGHT_FRAC = 0.046      # ankle joint from ground: 8/175
+PELVIS_TO_CHEST_FRAC = 0.291  # hip–shoulder: 51/175
+NECK_HEAD_FRAC = 0.171        # shoulder–crown: 30/175
+SHOULDER_WIDTH_FRAC = 0.269   # biacromial: 47/175
+PELVIS_WIDTH_FRAC = 0.160     # hip-joint separation ≈28 cm: 28/175
+HEAD_RADIUS_FRAC = 0.052      # from head circumference 57 cm → r=9.1 cm: 9.1/175
+NECK_RADIUS_M    = 0.059      # from neck circumference 37 cm → r=37/(2π)/100
 
 # Per-segment fraction of total mass (Winter, "Biomechanics & Motor
 # Control of Human Movement", rounded). Numbers are total per segment,
@@ -87,7 +90,7 @@ DEG = math.pi / 180.0
 JOINT_LIMITS_RAD = {
     # Spine — forward flex (climber tucks for high feet); we keep it
     # single-axis to avoid the under-actuated lumbar mess.
-    "spine_lean":      (-15 * DEG, 60 * DEG),
+    "spine_lean":      (-15 * DEG, 30 * DEG),
 
     # Shoulder (3-axis Euler around hinges). Order matters: az is
     # forward/back, then el (abduction), then roll (internal/external).
@@ -122,18 +125,24 @@ JOINT_LIMITS_RAD = {
 # stops the climber from flopping into pretzels when the actuator is
 # under-driving. Numbers chosen so the joints feel taut but not stiff —
 # climbers DO have passive elastic torque from tendons / ligaments.
+# Passive (stiffness Nm/rad, damping Nm·s/rad).
+# Upper body (shoulders, elbow, wrist): unchanged — arms are actively loaded
+# against the wall and should feel taut.
+# Lower body and spine: stiffness reduced so gravity can sag the body into a
+# natural hang; damping raised to overdamped so the settle phase converges
+# without ringing (ζ = d / (2√(k·I)) > 1 for each joint).
 JOINT_PASSIVE = {
-    "spine_lean":    (15.0, 2.0),
+    "spine_lean":    ( 6.0, 5.0),   # was (15.0, 2.0) — allow forward lean; d raised for ζ≈0.75
     "shoulder_az":   ( 5.0, 0.8),
     "shoulder_el":   ( 5.0, 0.8),
     "shoulder_roll": ( 3.0, 0.5),
     "elbow":         ( 4.0, 0.6),
     "wrist":         ( 2.0, 0.3),
-    "hip_flex":      (10.0, 1.5),
-    "hip_abduct":    (10.0, 1.5),
-    "hip_rot":       ( 6.0, 1.0),
-    "knee":          ( 8.0, 1.2),
-    "ankle":         ( 4.0, 0.6),
+    "hip_flex":      ( 3.0, 3.5),   # was (10.0, 1.5) — hips sag freely
+    "hip_abduct":    ( 3.0, 3.5),   # was (10.0, 1.5)
+    "hip_rot":       ( 2.0, 2.0),   # was (6.0, 1.0)
+    "knee":          ( 2.0, 3.0),   # was (8.0, 1.2) — knees bend freely
+    "ankle":         ( 2.0, 1.5),   # was (4.0, 0.6)
 }
 
 # ─── Actuation ──────────────────────────────────────────────────────────────
@@ -166,6 +175,14 @@ TORQUE_CAP_NM = {
 # constraint. solref/solimp control how stiff the catch is — climbers
 # describe "snapping onto a hold" as a quick lock-in, so we tune for a
 # fast catch with low spring-back.
+# ─── Pose seeding ───────────────────────────────────────────────────────────
+# Ramp: gravity rises from 0→full over SEED_RAMP_S so the welds aren't hit
+# by the body's full weight in one step. Hold: free-physics settle with
+# actuators disabled. Must be ≥ 2–3× the longest joint period (≈ 2 s at the
+# new lower stiffness values) to guarantee overdamped convergence.
+SEED_RAMP_S = 0.5
+SEED_HOLD_S = 2.0
+
 HOLD_CONSTRAINT_SOLREF = (0.008, 1.0)
 HOLD_CONSTRAINT_SOLIMP = (0.95, 0.99, 0.001, 0.5, 2)
 

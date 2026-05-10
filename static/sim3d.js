@@ -115,15 +115,16 @@ function buildClimberMeshes(profile) {
     const cloth = 0x3366b3;
     const hMat = (col) => new THREE.MeshStandardMaterial({ color: col, roughness: 0.6 });
     const h = profile.height_cm / 100;
-    const armTotal = Math.max(0.10, (profile.wingspan_cm / 100 - h * 0.23) / 2);
-    const upperArm = armTotal * 0.55;
-    const forearm = armTotal * 0.45;
-    const thigh = h * 0.245;
-    const shin = h * 0.245;
-    const spine = h * 0.30;
-    const head = h * 0.18;
-    const sw = h * 0.23;          // shoulder width
-    const pw = h * 0.18;          // pelvis width
+    const armTotal = Math.max(0.10, (profile.wingspan_cm / 100 - h * 0.269) / 2);
+    const upperArm = armTotal * 0.522;   // 35 cm / 67 cm arm_total
+    const forearm = armTotal * 0.433;    // 29 cm / 67 cm arm_total
+    const thigh = h * 0.246;            // hip–knee: 43/175
+    const shin = h * 0.246;             // knee–ankle: 43/175
+    const spine = h * 0.291;            // hip–shoulder: 51/175
+    const headSeg = h * 0.171;          // shoulder–crown: 30/175
+    const headRadius = h * 0.052;       // from head circ 57 cm → r=9.1 cm
+    const sw = h * 0.269;               // biacromial shoulder width: 47/175
+    const pw = h * 0.160;               // hip-joint separation: 28/175
 
     // Helper: build a capsule along local -Z (matches MJCF capsule fromto).
     const cap = (length, radius, mat) => {
@@ -134,59 +135,71 @@ function buildClimberMeshes(profile) {
         m.castShadow = true;
         return m;
     };
+    // Helper: ellipsoid as a scaled unit sphere — semi-axes (ax, ay, az).
+    // Matches MuJoCo ellipsoid size semantics exactly.
+    const ellipsoid = (ax, ay, az, mat) => {
+        const m = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12), mat);
+        m.scale.set(ax, ay, az);
+        m.castShadow = true;
+        return m;
+    };
 
     const meshes = {};
     // Pelvis — anchored to world coords; everything else gets transformed
     // each frame via xpos/xquat from the server.
     const pelvis = new THREE.Group();
-    pelvis.add(new THREE.Mesh(
-        new THREE.BoxGeometry(pw * 2, 0.16, 0.16),
-        hMat(cloth),
-    ));
+    pelvis.add(ellipsoid(pw, 0.115, 0.09, hMat(cloth)));
     meshes.pelvis = pelvis;
 
     const chest = new THREE.Group();
-    const chestBox = new THREE.Mesh(
-        new THREE.BoxGeometry(sw * 1.8, 0.20, spine),
-        hMat(cloth),
-    );
-    chestBox.position.z = spine / 2;
-    chest.add(chestBox);
+    const chestE = ellipsoid(sw * 0.45, 0.115, spine / 2, hMat(cloth));
+    chestE.position.z = spine / 2;
+    chest.add(chestE);
+    // Neck cylinder from chest top to head-sphere bottom.
+    const neckLen = headSeg / 2 - headRadius;
+    if (neckLen > 0.005) {
+        const neckMesh = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.059, 0.059, neckLen, 12),
+            hMat(skin),
+        );
+        neckMesh.rotation.x = -Math.PI / 2;        // Y→+Z
+        neckMesh.position.z = spine + neckLen / 2;
+        neckMesh.castShadow = true;
+        chest.add(neckMesh);
+    }
     meshes.chest = chest;
 
     const headG = new THREE.Group();
-    headG.add(new THREE.Mesh(new THREE.SphereGeometry(head / 2, 16, 12), hMat(skin)));
+    headG.add(new THREE.Mesh(new THREE.SphereGeometry(headRadius, 16, 12), hMat(skin)));
     meshes.head = headG;
 
     for (const side of ['l', 'r']) {
         const upG = new THREE.Group();
-        upG.add(cap(upperArm, 0.045, hMat(skin)));
+        upG.add(cap(upperArm, 0.051, hMat(skin)));
         meshes[`${side}_upperarm`] = upG;
 
         const foreG = new THREE.Group();
-        foreG.add(cap(forearm, 0.038, hMat(skin)));
+        foreG.add(cap(forearm, 0.046, hMat(skin)));
         meshes[`${side}_forearm`] = foreG;
 
         const handG = new THREE.Group();
-        const handBox = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.05, 0.12), hMat(skin));
-        // The server streams the MuJoCo hand body origin at the wrist. In the
-        // MJCF, the visible hand box is centered 6 cm down local -Z and the
-        // fingertip/contact site is on the lower face. Mirror that offset so
-        // a physically attached hand does not look like it is missing the hold.
-        handBox.position.z = -0.06;
-        handG.add(handBox);
+        // Ellipsoid: semi-axes match MJCF hand_half (width=4.5cm, depth=2.5cm, length=9.75cm).
+        const handE = ellipsoid(0.045, 0.025, 0.0975, hMat(skin));
+        handE.position.z = -0.0975;  // centre at mid-hand, tip at -19.5cm from wrist
+        handG.add(handE);
         meshes[`${side}_hand`] = handG;
 
         const thighG = new THREE.Group();
-        thighG.add(cap(thigh, 0.07, hMat(cloth)));
+        thighG.add(cap(thigh, 0.086, hMat(cloth)));
         meshes[`${side}_thigh`] = thighG;
 
         const shinG = new THREE.Group();
-        shinG.add(cap(shin, 0.05, hMat(skin)));
+        shinG.add(cap(shin, 0.056, hMat(skin)));
         meshes[`${side}_shin`] = shinG;
 
         const footG = new THREE.Group();
-        footG.add(new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.20, h * 0.04), hMat(0x111111)));
+        // Ellipsoid: semi-axes match MJCF foot_half (width=4.5cm, length=13cm, height=ankle/2).
+        footG.add(ellipsoid(0.045, 0.13, h * 0.023, hMat(0x111111)));
         meshes[`${side}_foot`] = footG;
     }
 

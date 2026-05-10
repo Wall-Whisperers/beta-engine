@@ -316,22 +316,40 @@ class Climb3DWorld:
                 # Crouched pose: pelvis low between hands and feet.
                 pelvis_z = float(0.5 * (foot_mid[2] + hand_mid[2]))
             pelvis_x = float(0.5 * foot_mid[0] + 0.5 * hand_mid[0])
-            pelvis_y = float(max(foot_mid[1], hand_mid[1]) + 0.35)
+            pelvis_y = float(max(foot_mid[1], hand_mid[1]) + 0.55)
         elif foot_pts:
             foot_mid = np.mean(foot_pts, axis=0)
             pelvis_x = float(foot_mid[0])
-            pelvis_y = float(foot_mid[1] + 0.35)
+            pelvis_y = float(foot_mid[1] + 0.55)
             pelvis_z = float(foot_mid[2] + s.standing_leg * 0.85)
         elif hand_pts:
             hand_mid = np.mean(hand_pts, axis=0)
             pelvis_x = float(hand_mid[0])
-            pelvis_y = float(hand_mid[1] + 0.35)
+            pelvis_y = float(hand_mid[1] + 0.55)
             pelvis_z = float(hand_mid[2] - s.spine - 0.10)
         else:
             pelvis_x, pelvis_y, pelvis_z = 0.0, 0.5, s.standing_leg + 0.20
 
         # Clamp pelvis_z above the floor by at least one foot length.
         pelvis_z = max(pelvis_z, cfg.FLOOR_Z + s.standing_leg * 0.5)
+
+        # Wall-clearance clamp: even at maximum spine lean the chest must
+        # stay in front of the wall surface. Without this, MuJoCo starts
+        # the settle with the body already penetrating the wall, which the
+        # contact solver cannot reliably recover from.
+        #
+        # Derivation: wall_surface_Y ≈ min(hold_Y) − HOLD_PROTRUDE_M.
+        # Worst-case chest front = pelvis_Y − spine*sin(max_lean) − chest_half_depth.
+        # We require that to be > wall_surface_Y + a small safety margin.
+        if positions:
+            wall_ref_y = float(min(p[1] for p in positions.values())) - cfg.HOLD_PROTRUDE_M
+            _max_lean = cfg.JOINT_LIMITS_RAD["spine_lean"][1]
+            # Worst-case body extent: the HEAD at the far end of the spine.
+            # When the spine leans forward by max_lean, the head (at distance
+            # spine + neck/2 + head_radius from chest) projects toward the wall.
+            _spine_chain = s.spine + s.head / 2 + s.head_radius
+            _min_clearance = _spine_chain * math.sin(_max_lean) + 0.06
+            pelvis_y = max(pelvis_y, wall_ref_y + _min_clearance)
 
         # ── 1) Reset state ────────────────────────────────────────
         mujoco.mj_resetData(self.model, self.data)
@@ -354,12 +372,33 @@ class Climb3DWorld:
         #         weight in a single instant. Slip detection is OFF
         #         during settle — the spike forces here are an
         #         artefact of the warm-start, not a real grip event.
+        #
+        #         Exception: the spine actuator stays active at full gain
+        #         targeting a slight forward lean. Without it, the 66 Nm
+        #         gravitational torque on the upper body overwhelms the
+        #         6 Nm/rad passive spring and slams the spine to its limit,
+        #         driving the head through the wall.
         kp_backup = self.model.actuator_gainprm[:, 0].copy()
         gravity_backup = np.array(self.model.opt.gravity)
         self.model.actuator_gainprm[:, 0] = 0.0
+        for i in range(self.model.nu):
+            jnt_id = int(self.model.actuator_trnid[i, 0])
+            jname = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id,
+            )
+            if jname == "spine_lean":
+                # During settle we need ≫ normal kp to resist the ~66 Nm
+                # gravitational torque on the upper body. Normal kp=120 gives
+                # equilibrium at ~44° (still clipping). kp=1000 → ~4° lean.
+                self.model.actuator_gainprm[i, 0] = 1000.0
+                self.data.ctrl[i] = 0.0  # target upright; gravity settles ~4°
+                # Also zero the spine qpos so the ramp starts from upright.
+                jnt_qpos_adr = self.model.jnt_qposadr[jnt_id]
+                self.data.qpos[jnt_qpos_adr] = 0.0
+                break
         try:
-            ramp_steps = int(0.3 / cfg.PHYS_DT)
-            hold_steps = int(0.4 / cfg.PHYS_DT)
+            ramp_steps = int(cfg.SEED_RAMP_S / cfg.PHYS_DT)
+            hold_steps = int(cfg.SEED_HOLD_S / cfg.PHYS_DT)
             for i in range(ramp_steps):
                 alpha = (i + 1) / ramp_steps      # 0 → 1
                 self.model.opt.gravity[:] = gravity_backup * alpha

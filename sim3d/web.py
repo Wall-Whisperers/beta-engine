@@ -409,6 +409,11 @@ def move_limb(sid: str):
             s.world.move_limb(limb, hold_id, mode=mode)
         except (KeyError, ValueError) as e:
             abort(400, description=str(e))
+        # Step enough frames for the move to complete before returning.
+        # "snap" just needs a few steps to propagate the weld constraint.
+        # "reach"/"dyno" need up to REACH_TIMEOUT_S worth of frames.
+        frames = 5 if mode == "snap" else 100
+        s.world.step(frames=frames)
         s.policy = None
         return jsonify(s.world.pose_snapshot())
 
