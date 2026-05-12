@@ -9,6 +9,7 @@ Run via Docker:  docker compose up
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any
 
 from flask import Flask, jsonify, request, send_from_directory
 
-DATA_DIR = Path("/data/walls")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data/walls"))
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = PROJECT_ROOT / "static"
 SCHEMA_PATH = PROJECT_ROOT / "schemas" / "wall.schema.json"
@@ -195,8 +196,21 @@ def _seed_examples() -> None:
             shutil.copy(src, dst)
 
 
+def _register_sim3d() -> None:
+    """Mount the 3D-simulator blueprint at /sim3d/. Imported lazily so
+    a missing mujoco install only breaks the 3D feature, not the
+    editor's hot path."""
+    try:
+        from sim3d.web import bp as sim3d_bp
+    except ImportError as e:  # pragma: no cover — Docker has mujoco preinstalled
+        app.logger.warning("sim3d not loaded (%s) — /sim3d will be unavailable", e)
+        return
+    app.register_blueprint(sim3d_bp)
+
+
 def main() -> None:
     _seed_examples()
+    _register_sim3d()
     app.run(host="0.0.0.0", port=8000, debug=False)
 
 

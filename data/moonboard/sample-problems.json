@@ -1,0 +1,11 @@
+[
+  {"id": 19215, "mb_type": 0, "name": "Far from the Madding Crowd", "setter": "Ben Moon",
+   "grade": 4, "holdsets": [2],
+   "start_holds": ["E6", "C5"], "mid_holds": ["E8", "F11", "C13", "D15"], "end_holds": ["D18"]},
+  {"id": 19216, "mb_type": 0, "name": "Wuthering Heights", "setter": "Ben Moon",
+   "grade": 4, "holdsets": [1],
+   "start_holds": ["F5"], "mid_holds": ["J8", "I11", "K11", "G13", "E15"], "end_holds": ["E18"]},
+  {"id": 19218, "mb_type": 0, "name": "HARD TIMES", "setter": "Ben Moon",
+   "grade": 7, "holdsets": [2],
+   "start_holds": ["G4", "J5"], "mid_holds": ["B10", "E6", "E8", "E12", "E16"], "end_holds": ["I18"]}
+]
