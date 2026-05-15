@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Beta Engine — Solver</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+      padding: 1rem 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    header h1 { font-size: 1.1rem; font-weight: 600; color: #f8fafc; }
+    header a  { color: #94a3b8; font-size: 0.85rem; text-decoration: none; }
+    header a:hover { color: #cbd5e1; }
+
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem;
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 1.5rem;
+    }
+
+    /* ── Panels ── */
+    .panel {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 1.25rem;
+    }
+    .panel h2 {
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #64748b;
+      margin-bottom: 1rem;
+    }
+
+    /* ── Form controls ── */
+    label {
+      display: block;
+      font-size: 0.8rem;
+      color: #94a3b8;
+      margin-bottom: 0.25rem;
+      margin-top: 0.75rem;
+    }
+    label:first-of-type { margin-top: 0; }
+
+    input[type=number], input[type=range] {
+      width: 100%;
+    }
+    input[type=number] {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #e2e8f0;
+      padding: 0.4rem 0.6rem;
+      font-size: 0.85rem;
+    }
+    input[type=range] { accent-color: #22c55e; }
+
+    .range-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .range-val {
+      font-size: 0.8rem;
+      color: #94a3b8;
+      width: 2.5rem;
+      text-align: right;
+      flex-shrink: 0;
+    }
+
+    button {
+      margin-top: 1rem;
+      width: 100%;
+      padding: 0.6rem 1rem;
+      border: none;
+      border-radius: 7px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    button:disabled { opacity: 0.4; cursor: default; }
+    .btn-green  { background: #22c55e; color: #052e16; }
+    .btn-blue   { background: #3b82f6; color: #eff6ff; }
+    .btn-slate  { background: #334155; color: #cbd5e1; margin-top: 0.5rem; }
+
+    /* ── Result area ── */
+    .result-area { grid-column: 2; display: flex; flex-direction: column; gap: 1.5rem; }
+
+    /* ── Frame viewer ── */
+    .frame-viewer { display: none; flex-direction: column; gap: 0.75rem; }
+
+    .frame-img-wrap {
+      position: relative;
+      background: #020617;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .frame-img-wrap img {
+      width: 100%;
+      display: block;
+    }
+    .frame-nav-btn {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(15,23,42,0.75);
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 1.3rem;
+      width: 2.4rem;
+      height: 2.4rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s;
+      margin-top: 0;
+    }
+    .frame-nav-btn:hover { background: rgba(51,65,85,0.9); }
+    .frame-nav-btn.prev { left: 0.5rem; }
+    .frame-nav-btn.next { right: 0.5rem; }
+    .frame-nav-btn:disabled { opacity: 0.25; cursor: default; }
+
+    .frame-controls {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .frame-slider {
+      flex: 1;
+      accent-color: #3b82f6;
+    }
+    .frame-label {
+      font-size: 0.8rem;
+      color: #94a3b8;
+      min-width: 9rem;
+      text-align: right;
+    }
+    .frame-play-btn {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 0.85rem;
+      padding: 0.3rem 0.8rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .frame-play-btn:hover { background: #334155; }
+
+    /* ── Training runs ── */
+    .runs-section { grid-column: 1 / -1; }
+
+    .run-card {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-bottom: 0.75rem;
+    }
+    .run-card h3 { font-size: 0.85rem; color: #cbd5e1; margin-bottom: 0.5rem; }
+    .run-meta    { font-size: 0.75rem; color: #64748b; margin-bottom: 0.5rem; }
+    .run-log {
+      font-family: ui-monospace, monospace;
+      font-size: 0.72rem;
+      color: #64748b;
+      background: #020617;
+      border-radius: 5px;
+      padding: 0.5rem;
+      max-height: 140px;
+      overflow-y: auto;
+      white-space: pre;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 99px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      margin-right: 0.3rem;
+    }
+    .badge-green { background: #14532d; color: #4ade80; }
+    .badge-blue  { background: #1e3a5f; color: #60a5fa; }
+
+    /* ── Status / spinner ── */
+    .status {
+      font-size: 0.8rem;
+      color: #64748b;
+      margin-top: 0.5rem;
+      min-height: 1.2em;
+    }
+    .status.error { color: #f87171; }
+    .status.ok    { color: #4ade80; }
+
+    .spinner {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border: 2px solid #334155;
+      border-top-color: #22c55e;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 0.3rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Beta Engine — Solver</h1>
+  <a href="/">← Wall Editor</a>
+</header>
+
+<main>
+  <!-- ── Left column: controls ── -->
+  <div>
+    <div class="panel" style="margin-bottom:1rem">
+      <h2>Generate Wall</h2>
+
+      <label>Wall name <span style="color:#475569">(optional)</span></label>
+      <input type="text" id="gen-name" placeholder="e.g. red-overhang-v4"
+             style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:0.4rem 0.6rem;font-size:0.85rem;"
+             maxlength="64" pattern="[A-Za-z0-9_\-]*" />
+
+      <label>Cols</label>
+      <input type="number" id="gen-cols" value="12" min="6" max="20" />
+
+      <label>Rows</label>
+      <input type="number" id="gen-rows" value="18" min="8" max="28" />
+
+      <label>Difficulty — <span id="diff-label">0.50</span> &nbsp;<span id="diff-grade" style="color:#f59e0b;font-size:0.75rem"></span></label>
+      <div class="range-row">
+        <input type="range" id="gen-diff" min="0" max="1" step="0.05" value="0.5"
+               oninput="updateDiff(this.value)"/>
+      </div>
+      <div id="diff-summary" style="font-size:0.72rem;color:#64748b;margin-top:0.35rem;line-height:1.5"></div>
+
+      <button class="btn-green" id="btn-generate">Generate Wall</button>
+      <div class="status" id="gen-status"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Solve Wall</h2>
+
+      <label>Wall ID</label>
+      <input type="number" id="solve-wall-id"
+             placeholder="(filled automatically after generate)" style="display:none"/>
+      <select id="solve-wall-select"
+              style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:0.4rem 0.6rem;font-size:0.85rem;">
+        <option value="">Loading walls…</option>
+      </select>
+
+      <label>Height (cm)</label>
+      <input type="number" id="solve-height" value="175" min="150" max="210" />
+
+      <label>Wingspan (cm)</label>
+      <input type="number" id="solve-wingspan" value="175" min="140" max="220" />
+
+      <button class="btn-blue" id="btn-solve">Solve with A★</button>
+      <div class="status" id="solve-status"></div>
+    </div>
+  </div>
+
+  <!-- ── Right column: result ── -->
+  <div class="result-area">
+    <div class="panel" id="result-panel" style="display:none">
+      <h2 id="result-title">Solution</h2>
+
+      <div class="frame-viewer" id="frame-viewer">
+        <!-- image + side arrows -->
+        <div class="frame-img-wrap">
+          <img id="frame-img" alt="pose" />
+          <button class="frame-nav-btn prev" id="btn-prev" onclick="seekFrame(-1)">&#8592;</button>
+          <button class="frame-nav-btn next" id="btn-next" onclick="seekFrame(+1)">&#8594;</button>
+        </div>
+
+        <!-- slider + play + label -->
+        <div class="frame-controls">
+          <button class="frame-play-btn" id="btn-play" onclick="togglePlay()">&#9654; Play</button>
+          <input class="frame-slider" type="range" id="frame-slider"
+                 min="0" value="0" oninput="goToFrame(+this.value)" />
+          <span class="frame-label" id="frame-label"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Full-width: training runs ── -->
+  <div class="panel runs-section">
+    <h2>Training Runs <button class="btn-slate" style="width:auto;margin:0;padding:0.3rem 0.8rem;float:right;font-size:0.75rem" onclick="loadRuns()">Refresh</button></h2>
+    <div id="runs-container" style="margin-top:0.75rem">
+      <div class="status">Loading…</div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ── Difficulty slider ─────────────────────────────────────────────────────────
+function updateDiff(val) {
+  const d = parseFloat(val);
+  document.getElementById('diff-label').textContent = d.toFixed(2);
+
+  // Grade label
+  const grades = [
+    [0.2,  'V0–V1'],
+    [0.4,  'V2–V3'],
+    [0.6,  'V4–V5'],
+    [0.8,  'V6–V7'],
+    [1.01, 'V8+'],
+  ];
+  const grade = grades.find(([t]) => d < t)?.[1] ?? 'V8+';
+  document.getElementById('diff-grade').textContent = grade;
+
+  // Live breakdown
+  const nScatter   = Math.max(3, Math.round(14 - d * 11));
+  const minStep    = 1 + Math.round(d * 1);
+  const maxStep    = 2 + Math.round(d * 2);
+  const footLag    = Math.max(3, Math.round(3 + d * 5));
+  const reachPct   = Math.round((0.60 + d * 0.30) * 100);
+  const scatMode   = d < 0.4 ? 'near spine' : d < 0.7 ? 'mixed' : 'random';
+  const holdSz     = d >= 0.6 ? 'small' : 'normal';
+  document.getElementById('diff-summary').innerHTML =
+    `<span style="color:#94a3b8">holds</span> ${nScatter} scatter · ` +
+    `<span style="color:#94a3b8">moves</span> ${minStep}–${maxStep} rows · ` +
+    `<span style="color:#94a3b8">footholds</span> every ~${footLag} rows<br>` +
+    `<span style="color:#94a3b8">reach</span> ${reachPct}% · ` +
+    `<span style="color:#94a3b8">scatter</span> ${scatMode} · ` +
+    `<span style="color:#94a3b8">hold size</span> ${holdSz}`;
+}
+updateDiff(0.5); // initialise on load
+
+// ── Utility ──────────────────────────────────────────────────────────────────
+function setStatus(el, msg, cls='') {
+  el.textContent = msg;
+  el.className = 'status ' + cls;
+}
+function spin(el, msg) {
+  el.innerHTML = `<span class="spinner"></span>${msg}`;
+  el.className = 'status';
+}
+
+// ── Wall selector ─────────────────────────────────────────────────────────────
+async function loadWallList() {
+  const sel = document.getElementById('solve-wall-select');
+  try {
+    const r = await fetch('/api/walls');
+    const d = await r.json();
+    sel.innerHTML = d.walls.map(id => `<option value="${id}">${id}</option>`).join('');
+  } catch { sel.innerHTML = '<option>Error loading walls</option>'; }
+}
+
+// ── Generate ─────────────────────────────────────────────────────────────────
+document.getElementById('btn-generate').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-generate');
+  const st  = document.getElementById('gen-status');
+  btn.disabled = true;
+  spin(st, 'Generating…');
+
+  const name = document.getElementById('gen-name').value.trim();
+  const payload = {
+    cols:       parseInt(document.getElementById('gen-cols').value),
+    rows:       parseInt(document.getElementById('gen-rows').value),
+    difficulty: parseFloat(document.getElementById('gen-diff').value),
+    ...(name && { name }),
+  };
+
+  try {
+    const r = await fetch('/api/solver/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+
+    setStatus(st, `✓ Generated ${d.wall_id} (${d.wall.holds.length} holds)`, 'ok');
+
+    // Pre-select the new wall in the solve dropdown.
+    await loadWallList();
+    document.getElementById('solve-wall-select').value = d.wall_id;
+  } catch(e) {
+    setStatus(st, '✗ ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ── Frame navigator state ─────────────────────────────────────────────────────
+let _frames  = [];
+let _moves   = [];
+let _frameIdx = 0;
+let _playTimer = null;
+
+function goToFrame(i) {
+  _frameIdx = Math.max(0, Math.min(_frames.length - 1, i));
+  document.getElementById('frame-img').src = 'data:image/png;base64,' + _frames[_frameIdx];
+  document.getElementById('frame-slider').value = _frameIdx;
+  document.getElementById('btn-prev').disabled = _frameIdx === 0;
+  document.getElementById('btn-next').disabled = _frameIdx === _frames.length - 1;
+
+  const label = _frameIdx === 0
+    ? 'Start'
+    : _moves[_frameIdx - 1];
+  document.getElementById('frame-label').textContent =
+    `${_frameIdx + 1} / ${_frames.length}  ${label}`;
+}
+
+function seekFrame(delta) { goToFrame(_frameIdx + delta); }
+
+function togglePlay() {
+  const btn = document.getElementById('btn-play');
+  if (_playTimer) {
+    clearInterval(_playTimer);
+    _playTimer = null;
+    btn.innerHTML = '&#9654; Play';
+  } else {
+    if (_frameIdx === _frames.length - 1) goToFrame(0);
+    btn.innerHTML = '&#9646;&#9646; Pause';
+    _playTimer = setInterval(() => {
+      if (_frameIdx >= _frames.length - 1) {
+        clearInterval(_playTimer);
+        _playTimer = null;
+        btn.innerHTML = '&#9654; Play';
+      } else {
+        seekFrame(1);
+      }
+    }, 900);
+  }
+}
+
+// Keyboard arrows when viewer is visible.
+document.addEventListener('keydown', e => {
+  if (!_frames.length) return;
+  if (e.key === 'ArrowLeft')  { seekFrame(-1); e.preventDefault(); }
+  if (e.key === 'ArrowRight') { seekFrame(+1); e.preventDefault(); }
+});
+
+function _showFrames(frames, moves, wallId, nMoves, expanded) {
+  _frames   = frames;
+  _moves    = moves;
+  _frameIdx = 0;
+
+  const slider = document.getElementById('frame-slider');
+  slider.max   = frames.length - 1;
+  slider.value = 0;
+
+  document.getElementById('result-title').textContent =
+    `Solution — ${wallId}  (${nMoves} moves, ${expanded} expanded)`;
+  document.getElementById('frame-viewer').style.display = 'flex';
+  document.getElementById('result-panel').style.display = 'block';
+  goToFrame(0);
+}
+
+// ── Solve ─────────────────────────────────────────────────────────────────────
+document.getElementById('btn-solve').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-solve');
+  const st  = document.getElementById('solve-status');
+  const wall_id = document.getElementById('solve-wall-select').value;
+  if (!wall_id) { setStatus(st, 'Select a wall first.', 'error'); return; }
+
+  btn.disabled = true;
+  spin(st, 'Solving…');
+  document.getElementById('result-panel').style.display = 'none';
+  if (_playTimer) { clearInterval(_playTimer); _playTimer = null; }
+
+  const payload = {
+    wall_id,
+    height_cm:   parseFloat(document.getElementById('solve-height').value),
+    wingspan_cm: parseFloat(document.getElementById('solve-wingspan').value),
+  };
+
+  try {
+    const r = await fetch('/api/solver/solve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+
+    if (!d.solved) {
+      setStatus(st, '✗ No solution found for this wall.', 'error');
+    } else {
+      setStatus(st, `✓ ${d.n_moves}-move beta  (${d.expanded} nodes expanded)`, 'ok');
+      _showFrames(d.frames, d.moves, wall_id, d.n_moves, d.expanded);
+    }
+  } catch(e) {
+    setStatus(st, '✗ ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ── Training runs ─────────────────────────────────────────────────────────────
+async function loadRuns() {
+  const container = document.getElementById('runs-container');
+  container.innerHTML = '<div class="status">Loading…</div>';
+  try {
+    const r = await fetch('/api/runs');
+    const d = await r.json();
+    if (!d.runs.length) {
+      container.innerHTML = '<div class="status">No training runs yet. Run <code>docker compose run --rm solver train</code> to start one.</div>';
+      return;
+    }
+    container.innerHTML = d.runs.map(run => `
+      <div class="run-card">
+        <h3>${run.run_id}</h3>
+        <div class="run-meta">
+          ${run.has_best_model  ? '<span class="badge badge-green">best_model</span>' : ''}
+          ${run.has_final_model ? '<span class="badge badge-blue">final_model</span>' : ''}
+          ${run.images.length   ? run.images.join(', ') : 'no images yet'}
+        </div>
+        ${run.log_tail ? `<div class="run-log">${escHtml(run.log_tail)}</div>` : ''}
+      </div>
+    `).join('');
+  } catch(e) {
+    container.innerHTML = `<div class="status error">Failed to load runs: ${e.message}</div>`;
+  }
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadWallList();
+loadRuns();
+</script>
+</body>
+</html>

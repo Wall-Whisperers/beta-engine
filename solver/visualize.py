@@ -177,6 +177,48 @@ def render_panels(
     return out_path
 
 
+def render_frame(
+    wall: Wall,
+    result: SolveResult,
+    index: int,
+    body: BodyModel | None = None,
+) -> bytes:
+    """Render a single pose frame as PNG bytes (no file written)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import io
+
+    body = body or BodyModel()
+    fig, ax = plt.subplots(figsize=(5, 7))
+    fig.patch.set_facecolor("#020617")
+    _setup_axes(ax, wall)
+    _draw_holds(ax, wall)
+    _draw_skeleton(ax, wall, body, result.poses[index])
+
+    if index == 0:
+        title = "Start"
+    else:
+        limb, hold_id = result.moves[index - 1]
+        title = f"Step {index}: {limb} → {hold_id}"
+    ax.set_title(title, color="#e2e8f0", fontsize=11, pad=8)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def render_all_frames(
+    wall: Wall,
+    result: SolveResult,
+    body: BodyModel | None = None,
+) -> list[bytes]:
+    """Return one PNG bytes object per pose in the solution."""
+    return [render_frame(wall, result, i, body) for i in range(len(result.poses))]
+
+
 def render_animation(
     wall: Wall,
     result: SolveResult,

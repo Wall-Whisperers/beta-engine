@@ -56,7 +56,8 @@ def _is_goal(wall: Wall, pose: Pose) -> bool:
     finish_ids = {h.hold_id for h in wall.finishes()}
     if not finish_ids:
         return False
-    return (pose.LH in finish_ids) or (pose.RH in finish_ids)
+    # Both hands must be on finish holds (match the top).
+    return (pose.LH in finish_ids) and (pose.RH in finish_ids)
 
 
 def starting_poses(wall: Wall, body: BodyModel) -> list[Pose]:

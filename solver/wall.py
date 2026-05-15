@@ -28,6 +28,15 @@ POSITIVITY_BY_TYPE: dict[str, float] = {
     "sloper": 0.40,
 }
 
+# Friction coefficients by hold type (used in physics simulation).
+FRICTION_BY_TYPE: dict[str, float] = {
+    "jug":      0.90,
+    "crimp":    0.85,
+    "pinch":    0.80,
+    "foothold": 0.85,
+    "sloper":   0.60,
+}
+
 # Foothold-only holds can't be used by the hands in our simple model.
 # Feet CAN use hand holds in a pinch but strongly prefer dedicated footholds.
 HAND_USABLE_TYPES = {"jug", "crimp", "sloper", "pinch"}  # hands never use footholds
@@ -173,6 +182,8 @@ def load_wall(
     )
 
     holds = [_hold_from_json(h, resolved_cell) for h in payload.get("holds", [])]
+    wall_angle_deg = float(payload.get("wall_angle_deg", 0.0))
+    surface_friction = float(payload.get("surface_friction", 0.7))
 
     return Wall(
         wall_id=str(payload.get("wall_id", "unnamed")),
@@ -181,8 +192,8 @@ def load_wall(
         rows=rows,
         cell_size_cm=resolved_cell,
         holds=holds,
-        wall_angle_deg=float(payload.get("wall_angle_deg", 0.0)),
-        surface_friction=float(payload.get("surface_friction", 0.7)),
+        wall_angle_deg=wall_angle_deg,
+        surface_friction=surface_friction,
     )
 
 
@@ -207,6 +218,9 @@ def _resolve_payload(source: str | Path | dict) -> dict:
 
 def _hold_from_json(h: dict, cell_size_cm: float) -> Hold:
     x_cm, y_cm = _grid_to_world(h["grid_x"], h["grid_y"], cell_size_cm)
+    friction_raw = h.get("friction")
+    positivity_raw = h.get("positivity")
+    max_force_raw = h.get("max_force_n")
     return Hold(
         hold_id=h["hold_id"],
         grid_x=int(h["grid_x"]),
@@ -219,9 +233,9 @@ def _hold_from_json(h: dict, cell_size_cm: float) -> Hold:
         color=h["color"],
         is_start=bool(h["is_start"]),
         is_finish=bool(h["is_finish"]),
-        friction_override=(float(h["friction"]) if "friction" in h else None),
-        positivity_override=(float(h["positivity"]) if "positivity" in h else None),
-        max_force_n=(float(h["max_force_n"]) if "max_force_n" in h else None),
+        friction_override=float(friction_raw) if friction_raw is not None else None,
+        positivity_override=float(positivity_raw) if positivity_raw is not None else None,
+        max_force_n=float(max_force_raw) if max_force_raw is not None else None,
     )
 
 

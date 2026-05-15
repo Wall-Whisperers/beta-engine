@@ -96,9 +96,9 @@ class BodyModel:
 
     @property
     def arm_length(self) -> float:
-        # Wingspan = full reach across both arms + shoulder width.
-        # ≈ 0.42 * wingspan per arm is a decent first-pass.
-        return 0.42 * self.wingspan_cm
+        # wingspan = 2 × arm_length + shoulder_width (≈ 2 × shoulder_offset).
+        # Solving: arm_length = (wingspan - 2 × shoulder_offset) / 2.
+        return (self.wingspan_cm - 2 * self.shoulder_offset) / 2
 
     @property
     def leg_length(self) -> float:
@@ -121,16 +121,18 @@ class BodyModel:
         return 0.30 * self.height_cm
 
     def upper_arm(self) -> float:
-        return 0.5 * self.arm_length
+        # Humerus : forearm ≈ 1.23 : 1.00 (anthropometric mean).
+        return self.arm_length * (1.23 / 2.23)
 
     def lower_arm(self) -> float:
-        return 0.5 * self.arm_length
+        return self.arm_length * (1.00 / 2.23)
 
     def upper_leg(self) -> float:
-        return 0.5 * self.leg_length
+        # Femur : tibia ≈ 1.28 : 1.00 (anthropometric mean).
+        return self.leg_length * (1.28 / 2.28)
 
     def lower_leg(self) -> float:
-        return 0.5 * self.leg_length
+        return self.leg_length * (1.00 / 2.28)
 
     def reach_radius(self, limb: Limb) -> float:
         """Maximum straight-line reach from the corresponding shoulder/hip."""
@@ -286,34 +288,89 @@ class Skeleton:
     end_effectors: dict[Limb, np.ndarray]
 
 
+def _unit_toward(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Unit vector from src toward dst; returns (0, 1) if they coincide."""
+    v = dst - src
+    n = float(np.linalg.norm(v))
+    return v / n if n > 1e-9 else np.array([0.0, 1.0])
+
+
+def _pick_arm_joint(
+    anchor: np.ndarray,
+    target: np.ndarray,
+    upper: float,
+    lower: float,
+    limb: Limb,
+) -> Optional[np.ndarray]:
+    """Pick the IK solution using pole-vector disambiguation.
+
+    The pole vector encodes the anatomical preference: elbows go outward
+    (away from body midline) and downward. LH elbow prefers left+down,
+    RH elbow prefers right+down. This is stable across all reach directions,
+    including crossover moves where a hand reaches past the midline.
+    """
+    return solve_2link_ik_pole(anchor, target, upper, lower, LIMB_POLES[limb])
+
+
+def _pick_leg_joint(
+    anchor: np.ndarray,
+    target: np.ndarray,
+    upper: float,
+    lower: float,
+    limb: Limb,
+    com_x: float,
+) -> Optional[np.ndarray]:
+    """Pick the IK solution using pole-vector disambiguation.
+
+    Knees always prefer the outward lateral direction: left knee goes left,
+    right knee goes right. This is the anatomically correct projection of
+    "knee bends forward" into the 2D wall plane, and is robust to all foot
+    positions (below, above, same height, crossover).
+    """
+    return solve_2link_ik_pole(anchor, target, upper, lower, LIMB_POLES[limb])
+
+
 def resolve_skeleton(
     body: BodyModel,
     com: np.ndarray,
     targets: dict[Limb, np.ndarray],
 ) -> Skeleton:
-    """Run IK for each limb. Joints unreachable by IK are placed at the
-    midpoint of anchor→target so the visualizer still has something to draw.
+    """Run IK for each limb.
+
+    When IK fails (hold out of reach), the limb is drawn fully extended
+    toward the target — clamped to arm_length / leg_length — so the visual
+    never stretches past the anatomical maximum.
     """
     shoulders: dict[Limb, np.ndarray] = {}
     hips: dict[Limb, np.ndarray] = {}
     elbows: dict[Limb, np.ndarray] = {}
     knees: dict[Limb, np.ndarray] = {}
+    end_effectors: dict[Limb, np.ndarray] = {}
 
     for limb in HAND_LIMBS:
         anchor = com + body.anchor_offset(limb)
         shoulders[limb] = anchor
-        joint = solve_2link_ik_pole(
-            anchor, targets[limb], body.upper_arm(), body.lower_arm(), LIMB_POLES[limb]
-        )
-        elbows[limb] = joint if joint is not None else 0.5 * (anchor + targets[limb])
+        joint = _pick_arm_joint(anchor, targets[limb], body.upper_arm(), body.lower_arm(), limb)
+        if joint is not None:
+            elbows[limb] = joint
+            end_effectors[limb] = targets[limb]
+        else:
+            d = _unit_toward(anchor, targets[limb])
+            elbows[limb] = anchor + body.upper_arm() * d
+            end_effectors[limb] = anchor + body.arm_length * d
 
     for limb in FOOT_LIMBS:
         anchor = com + body.anchor_offset(limb)
         hips[limb] = anchor
-        joint = solve_2link_ik_pole(
-            anchor, targets[limb], body.upper_leg(), body.lower_leg(), LIMB_POLES[limb]
-        )
-        knees[limb] = joint if joint is not None else 0.5 * (anchor + targets[limb])
+        joint = _pick_leg_joint(anchor, targets[limb], body.upper_leg(), body.lower_leg(),
+                                limb, float(com[0]))
+        if joint is not None:
+            knees[limb] = joint
+            end_effectors[limb] = targets[limb]
+        else:
+            d = _unit_toward(anchor, targets[limb])
+            knees[limb] = anchor + body.upper_leg() * d
+            end_effectors[limb] = anchor + body.leg_length * d
 
     return Skeleton(
         com=com,
@@ -321,5 +378,5 @@ def resolve_skeleton(
         hips=hips,
         elbows=elbows,
         knees=knees,
-        end_effectors=dict(targets),
+        end_effectors=end_effectors,
     )

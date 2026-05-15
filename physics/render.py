@@ -237,3 +237,53 @@ def render_still(world: ClimbWorld, out_path: str | Path) -> Path:
     fig.savefig(str(out_path), facecolor=fig.get_facecolor())
     plt.close(fig)
     return out_path
+
+
+def render_key_frames(
+    world: ClimbWorld,
+    moves: list[tuple[str, str]],
+    settle_steps: int = 80,
+) -> list[bytes]:
+    """Run the physics through a move sequence and return one PNG per pose.
+
+    One frame is captured after the initial settle, then one more after each
+    move settles — matching the solver visualiser's frame count so the UI
+    can reuse the same navigator.
+
+    Args:
+        world:        A ClimbWorld with a pose already seeded.
+        moves:        Sequence of (limb, hold_id) pairs.
+        settle_steps: Physics frames to run between renders.
+
+    Returns:
+        List of PNG bytes — frame 0 is the start pose, frame i+1 is after
+        move i.
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    frames: list[bytes] = []
+
+    def _snap() -> bytes:
+        fig, ax = plt.subplots(figsize=(6, 8), dpi=100)
+        fig.patch.set_facecolor("#0f172a")
+        t = len(frames) * settle_steps * cfg.PHYS_DT * cfg.SUBSTEPS_PER_FRAME
+        render_frame(world, ax, t=t)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    # Initial settle.
+    world.step(settle_steps)
+    frames.append(_snap())
+
+    for limb, hold_id in moves:
+        world.move_limb(limb, hold_id, mode="snap")
+        world.step(settle_steps)
+        frames.append(_snap())
+
+    return frames

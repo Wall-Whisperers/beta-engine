@@ -191,12 +191,20 @@ def pose_anatomy_ok(wall: Wall, pose: Pose) -> bool:
     if pts["LF"] is not None and pts["RF"] is not None:
         if pts["LF"][0] - pts["RF"][0] > FOOT_CROSSOVER_LIMIT_CM:
             return False
-    # No two end-effectors at the exact same patch of wall.
+    # No two end-effectors at the exact same patch of wall —
+    # except both hands matching the same finish hold is explicitly allowed.
+    finish_ids = {h.hold_id for h in wall.finishes()}
     placed = [(l, p) for l, p in pts.items() if p is not None]
-    for i, (_, a) in enumerate(placed):
-        for _, b in placed[i + 1:]:
+    for i, (la, a) in enumerate(placed):
+        for lb, b in placed[i + 1:]:
             if float(np.linalg.norm(a - b)) < END_EFFECTOR_MIN_SEPARATION_CM:
-                return False
+                matching_hands = (
+                    la in HAND_LIMBS and lb in HAND_LIMBS
+                    and pose.get(la) in finish_ids
+                    and pose.get(la) == pose.get(lb)
+                )
+                if not matching_hands:
+                    return False
     return True
 
 
@@ -219,10 +227,37 @@ def reachable_holds(
         candidates = (h for h in wall.holds if h.usable_for_foot())
 
     occupied = {pose.LH, pose.RH, pose.LF, pose.RF} - {None, pose.get(limb)}
-    return [
-        h for h in candidates
-        if h.hold_id not in occupied and can_reach(body, com, limb, h)
-    ]
+    finish_ids = {h.hold_id for h in wall.finishes()}
+
+    def _allowed(h: Hold) -> bool:
+        if h.hold_id in occupied:
+            # Allow both hands to match the same finish hold.
+            if limb in HAND_LIMBS and h.hold_id in finish_ids:
+                other_hand = "RH" if limb == "LH" else "LH"
+                return pose.get(other_hand) == h.hold_id
+            return False
+        return True
+
+    return [h for h in candidates if _allowed(h) and can_reach(body, com, limb, h)]
+
+
+def _all_limbs_reachable(body: BodyModel, wall: Wall, pose: Pose) -> bool:
+    """After a move, verify every stationary limb is still within reach.
+
+    When feet advance they pull the COM up, which can push a shoulder far
+    above a low hand hold. The one-limb reachability check doesn't catch
+    this because it computes COM *without* the moving limb. This check uses
+    the full 4-limb COM and is applied to the resulting pose.
+    """
+    com = estimate_com(wall, pose)
+    for limb in LIMBS:
+        hold_id = pose.get(limb)
+        if hold_id is None:
+            continue
+        h = wall.by_id(hold_id)
+        if not can_reach(body, com, limb, h):
+            return False
+    return True
 
 
 def reachable_moves(
@@ -234,7 +269,8 @@ def reachable_moves(
     when:
       - the *moving* state (limb in flight, 3 points of contact) is stable,
       - the *target* hold is reachable + inside the limb's envelope + IK-solvable,
-      - the *resulting* 4-limb pose is stable AND anatomically OK.
+      - the *resulting* 4-limb pose is stable, anatomically OK, AND all
+        stationary limbs remain within reach from the new COM.
     """
     moves: list[tuple[Limb, str]] = []
     for limb in LIMBS:
@@ -242,7 +278,9 @@ def reachable_moves(
             continue
         for target in reachable_holds(body, wall, pose, limb):
             new_pose = pose.with_limb(limb, target.hold_id)
-            if is_stable(wall, new_pose) and pose_anatomy_ok(wall, new_pose):
+            if (is_stable(wall, new_pose)
+                    and pose_anatomy_ok(wall, new_pose)
+                    and _all_limbs_reachable(body, wall, new_pose)):
                 moves.append((limb, target.hold_id))
     return moves
 
