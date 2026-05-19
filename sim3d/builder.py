@@ -163,7 +163,7 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
         <site name="site_com" pos="0 0 0" size="0.02" rgba="1 1 0 0.4"/>
 
         <body name="chest" pos="0 0 {0.12:.4f}">
-            <joint name="spine_lean" type="hinge" axis="1 0 0"
+            <joint name="spine_lean" type="hinge" axis="1 0 0" class="j_spine"
                    range="{R('spine_lean')}" {P('spine_lean')}/>
             <geom name="g_chest" type="ellipsoid"
                   size="{sw*0.9:.4f} 0.115 {s.spine/2:.4f}"
@@ -182,19 +182,19 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
 
             <!-- LEFT ARM -->
             <body name="l_upperarm" pos="{-sw:.4f} 0 {s.spine - 0.05:.4f}">
-                <joint name="l_shoulder_az"   type="hinge" axis="0 1 0"
+                <joint name="l_shoulder_az"   type="hinge" axis="0 1 0" class="j_shoulder"
                        range="{R('shoulder_az')}"   {P('shoulder_az')}/>
-                <joint name="l_shoulder_el"   type="hinge" axis="1 0 0"
+                <joint name="l_shoulder_el"   type="hinge" axis="1 0 0" class="j_shoulder"
                        range="{R('shoulder_el')}"   {P('shoulder_el')}/>
-                <joint name="l_shoulder_roll" type="hinge" axis="0 0 1"
+                <joint name="l_shoulder_roll" type="hinge" axis="0 0 1" class="j_shoulder"
                        range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
                 {capsule("g_l_upperarm", s.upper_arm, 0.051, m.upper_arm, skin)}
                 <body name="l_forearm" pos="0 0 {-s.upper_arm:.4f}">
-                    <joint name="l_elbow" type="hinge" axis="1 0 0"
+                    <joint name="l_elbow" type="hinge" axis="1 0 0" class="j_elbow"
                            range="{R('elbow')}" {P('elbow')}/>
                     {capsule("g_l_forearm", s.forearm, 0.046, m.forearm, skin)}
                     <body name="l_hand" pos="0 0 {-s.forearm:.4f}">
-                        <joint name="l_wrist" type="hinge" axis="1 0 0"
+                        <joint name="l_wrist" type="hinge" axis="1 0 0" class="j_wrist"
                                range="{R('wrist')}" {P('wrist')}/>
                         <geom name="g_l_hand" type="ellipsoid"
                               size="{hand_half[0]:.4f} {hand_half[1]:.4f} {hand_half[2]:.4f}"
@@ -212,19 +212,19 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
 
             <!-- RIGHT ARM -->
             <body name="r_upperarm" pos="{sw:.4f} 0 {s.spine - 0.05:.4f}">
-                <joint name="r_shoulder_az"   type="hinge" axis="0 1 0"
+                <joint name="r_shoulder_az"   type="hinge" axis="0 1 0" class="j_shoulder"
                        range="{R('shoulder_az')}"   {P('shoulder_az')}/>
-                <joint name="r_shoulder_el"   type="hinge" axis="1 0 0"
+                <joint name="r_shoulder_el"   type="hinge" axis="1 0 0" class="j_shoulder"
                        range="{R('shoulder_el')}"   {P('shoulder_el')}/>
-                <joint name="r_shoulder_roll" type="hinge" axis="0 0 1"
+                <joint name="r_shoulder_roll" type="hinge" axis="0 0 1" class="j_shoulder"
                        range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
                 {capsule("g_r_upperarm", s.upper_arm, 0.051, m.upper_arm, skin)}
                 <body name="r_forearm" pos="0 0 {-s.upper_arm:.4f}">
-                    <joint name="r_elbow" type="hinge" axis="1 0 0"
+                    <joint name="r_elbow" type="hinge" axis="1 0 0" class="j_elbow"
                            range="{R('elbow')}" {P('elbow')}/>
                     {capsule("g_r_forearm", s.forearm, 0.046, m.forearm, skin)}
                     <body name="r_hand" pos="0 0 {-s.forearm:.4f}">
-                        <joint name="r_wrist" type="hinge" axis="1 0 0"
+                        <joint name="r_wrist" type="hinge" axis="1 0 0" class="j_wrist"
                                range="{R('wrist')}" {P('wrist')}/>
                         <geom name="g_r_hand" type="ellipsoid"
                               size="{hand_half[0]:.4f} {hand_half[1]:.4f} {hand_half[2]:.4f}"
@@ -243,19 +243,19 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
 
         <!-- LEFT LEG -->
         <body name="l_thigh" pos="{-pw:.4f} 0 {-0.06:.4f}">
-            <joint name="l_hip_flex"   type="hinge" axis="1 0 0"
+            <joint name="l_hip_flex"   type="hinge" axis="1 0 0" class="j_hip"
                    range="{R('hip_flex')}"   {P('hip_flex')}/>
-            <joint name="l_hip_abduct" type="hinge" axis="0 1 0"
+            <joint name="l_hip_abduct" type="hinge" axis="0 1 0" class="j_hip"
                    range="{R('hip_abduct')}" {P('hip_abduct')}/>
-            <joint name="l_hip_rot"    type="hinge" axis="0 0 1"
+            <joint name="l_hip_rot"    type="hinge" axis="0 0 1" class="j_hip"
                    range="{R('hip_rot')}"    {P('hip_rot')}/>
             {capsule("g_l_thigh", s.thigh, 0.086, m.thigh, cloth)}
             <body name="l_shin" pos="0 0 {-s.thigh:.4f}">
-                <joint name="l_knee" type="hinge" axis="1 0 0"
+                <joint name="l_knee" type="hinge" axis="1 0 0" class="j_knee"
                        range="{R('knee')}" {P('knee')}/>
                 {capsule("g_l_shin", s.shin, 0.056, m.shin, skin)}
                 <body name="l_foot" pos="0 0 {-s.shin - foot_half[2]:.4f}">
-                    <joint name="l_ankle" type="hinge" axis="1 0 0"
+                    <joint name="l_ankle" type="hinge" axis="1 0 0" class="j_ankle"
                            range="{R('ankle')}" {P('ankle')}/>
                     <geom name="g_l_foot" type="ellipsoid"
                           size="{foot_half[0]:.4f} {foot_half[1]:.4f} {foot_half[2]:.4f}"
@@ -272,19 +272,19 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
 
         <!-- RIGHT LEG -->
         <body name="r_thigh" pos="{pw:.4f} 0 {-0.06:.4f}">
-            <joint name="r_hip_flex"   type="hinge" axis="1 0 0"
+            <joint name="r_hip_flex"   type="hinge" axis="1 0 0" class="j_hip"
                    range="{R('hip_flex')}"   {P('hip_flex')}/>
-            <joint name="r_hip_abduct" type="hinge" axis="0 1 0"
+            <joint name="r_hip_abduct" type="hinge" axis="0 1 0" class="j_hip"
                    range="{R('hip_abduct')}" {P('hip_abduct')}/>
-            <joint name="r_hip_rot"    type="hinge" axis="0 0 1"
+            <joint name="r_hip_rot"    type="hinge" axis="0 0 1" class="j_hip"
                    range="{R('hip_rot')}"    {P('hip_rot')}/>
             {capsule("g_r_thigh", s.thigh, 0.086, m.thigh, cloth)}
             <body name="r_shin" pos="0 0 {-s.thigh:.4f}">
-                <joint name="r_knee" type="hinge" axis="1 0 0"
+                <joint name="r_knee" type="hinge" axis="1 0 0" class="j_knee"
                        range="{R('knee')}" {P('knee')}/>
                 {capsule("g_r_shin", s.shin, 0.056, m.shin, skin)}
                 <body name="r_foot" pos="0 0 {-s.shin - foot_half[2]:.4f}">
-                    <joint name="r_ankle" type="hinge" axis="1 0 0"
+                    <joint name="r_ankle" type="hinge" axis="1 0 0" class="j_ankle"
                            range="{R('ankle')}" {P('ankle')}/>
                     <geom name="g_r_foot" type="ellipsoid"
                           size="{foot_half[0]:.4f} {foot_half[1]:.4f} {foot_half[2]:.4f}"
@@ -634,12 +634,38 @@ def _build_actuators() -> str:
     parts = []
     for joint, group in joints:
         cap = cfg.TORQUE_CAP_NM[group]
+        kp, kv = cfg.ACTUATOR_GAINS_BY_GROUP.get(
+            group, (cfg.ACTUATOR_KP, cfg.ACTUATOR_KV),
+        )
         parts.append(
             f'<position name="act_{joint}" joint="{joint}" '
-            f'kp="{cfg.ACTUATOR_KP}" kv="{cfg.ACTUATOR_KV}" '
+            f'kp="{kp}" kv="{kv}" '
             f'forcerange="{-cap} {cap}"/>'
         )
     return "\n".join(parts)
+
+
+# ─── Per-joint armature lookup ────────────────────────────────────────────
+_JOINT_GROUP = {
+    "spine_lean":    "spine",
+    "l_shoulder_az": "shoulder", "r_shoulder_az": "shoulder",
+    "l_shoulder_el": "shoulder", "r_shoulder_el": "shoulder",
+    "l_shoulder_roll": "shoulder", "r_shoulder_roll": "shoulder",
+    "l_elbow": "elbow", "r_elbow": "elbow",
+    "l_wrist": "wrist", "r_wrist": "wrist",
+    "l_hip_flex": "hip", "r_hip_flex": "hip",
+    "l_hip_abduct": "hip", "r_hip_abduct": "hip",
+    "l_hip_rot": "hip", "r_hip_rot": "hip",
+    "l_knee": "knee", "r_knee": "knee",
+    "l_ankle": "ankle", "r_ankle": "ankle",
+}
+
+
+def _armature_for_joint(joint_name: str) -> float:
+    group = _JOINT_GROUP.get(joint_name)
+    if group is None:
+        return 0.01
+    return cfg.JOINT_ARMATURE_BY_GROUP.get(group, 0.01)
 
 
 # ─── Top-level builder ────────────────────────────────────────────────────
@@ -700,7 +726,21 @@ def build_mjcf_xml(
 
   <default>
     <joint armature="0.01" damping="0.5"/>
-    <geom condim="3" margin="0.001"/>
+    <!-- Per-group joint armature. See cfg.JOINT_ARMATURE_BY_GROUP for why
+         the load-bearing joints (hip, spine) get an order of magnitude
+         more reflected inertia than the wrists/ankles. -->
+    <default class="j_shoulder"><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['shoulder']}"/></default>
+    <default class="j_elbow"   ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['elbow']}"/></default>
+    <default class="j_wrist"   ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['wrist']}"/></default>
+    <default class="j_spine"   ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['spine']}"/></default>
+    <default class="j_hip"     ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['hip']}"/></default>
+    <default class="j_knee"    ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['knee']}"/></default>
+    <default class="j_ankle"   ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['ankle']}"/></default>
+    <!-- Margin bumped from 0.001 → 0.005. A 1 mm margin is too thin for
+         fast-moving body parts to engage contact against the wall plate
+         before they penetrate; 5 mm gives the constraint solver enough
+         warning to push the head/torso back out. -->
+    <geom condim="3" margin="0.005"/>
   </default>
 
   <worldbody>

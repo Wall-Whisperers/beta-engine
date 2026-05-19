@@ -75,6 +75,8 @@ class TrainConfig:
     run_id: Optional[str] = None        # auto-generated from timestamp if None
     n_envs: int = 1                     # parallel CPU env workers
     device: str = "auto"                # SB3/PyTorch device: auto | cpu | cuda
+    video_freq: int = 100_000           # env-steps between mp4 rollouts (0 = disable)
+    checkpoint_first_at: int = 1024     # env-step at which to save model_first.zip
 
 
 class _EpisodeStatsCallback:
@@ -277,17 +279,50 @@ def train(cfg: TrainConfig) -> Path:
     )
 
     csv_cb = _EpisodeStatsCallback(out_dir / "episode_stats.csv", BaseCallback).build()
-    model.learn(total_timesteps=cfg.total_timesteps, callback=csv_cb,
+
+    # Compose the callback list: CSV stats + first/mid/last checkpoints +
+    # (optionally) the periodic mp4 video rollout.
+    from sim3d.callbacks import (
+        FirstMidLastCheckpointCallback,
+        VideoRolloutCallback,
+    )
+    callbacks = [
+        csv_cb,
+        FirstMidLastCheckpointCallback(
+            out_dir=str(out_dir),
+            total_timesteps=cfg.total_timesteps,
+            first_at=cfg.checkpoint_first_at,
+            verbose=1,
+        ),
+    ]
+    if cfg.video_freq > 0:
+        # Use a fresh env (not the vec_env) for deterministic eval rollouts.
+        eval_env = factory()
+        eval_env.reset(seed=cfg.seed + 9999)
+        callbacks.append(
+            VideoRolloutCallback(
+                eval_env=eval_env,
+                video_dir=str(out_dir / "videos"),
+                eval_freq=cfg.video_freq,
+                verbose=1,
+            )
+        )
+
+    model.learn(total_timesteps=cfg.total_timesteps, callback=callbacks,
                 progress_bar=False)
     model.save(out_dir / "model.zip")
 
     print(f"\nTraining complete. Run dir: {out_dir}")
-    print(f"  model:        {out_dir / 'model.zip'}")
-    print(f"  episode CSV:  {out_dir / 'episode_stats.csv'}")
+    print(f"  model:         {out_dir / 'model.zip'}")
+    print(f"  checkpoints:   {out_dir / 'model_first.zip'}, "
+          f"{out_dir / 'model_mid.zip'}, {out_dir / 'model_last.zip'}")
+    print(f"  episode CSV:   {out_dir / 'episode_stats.csv'}")
+    if cfg.video_freq > 0:
+        print(f"  videos:        {out_dir / 'videos'}/*.mp4")
     print(f"  env workers:   {n_envs}")
     print(f"  torch device:  {model.device}")
     if tb_log:
-        print(f"  tensorboard:  tensorboard --logdir {out_dir / 'tb'}")
+        print(f"  tensorboard:   tensorboard --logdir {out_dir / 'tb'}")
     replay_cmd = f"python -m sim3d --play {out_dir / 'model.zip'}"
     if cfg.moonboard_file:
         replay_cmd += f" --moonboard {cfg.moonboard_file}"
@@ -358,8 +393,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--move-frames", type=int, default=24)
     p.add_argument("--episode-steps", type=int, default=30)
     p.add_argument("--no-slip", "--no_slip", dest="no_slip", action="store_true")
-    p.add_argument("--body-intersection-penalty", type=float, default=2.0,
-                   help="Reward penalty per limb-vs-torso/pelvis intersection contact.")
+    p.add_argument("--body-intersection-penalty", type=float, default=20.0,
+                   help="Reward penalty per limb-vs-torso/pelvis intersection contact (gating coefficient).")
+    p.add_argument("--video-freq", type=int, default=100_000,
+                   help="Env-steps between mp4 rollouts. 0 disables video saving.")
+    p.add_argument("--checkpoint-first-at", type=int, default=1024,
+                   help="Env-step at which to save model_first.zip.")
     p.add_argument("--out-dir", default="data/runs/sim3d")
     p.add_argument("--run-id", default=None,
                    help="Custom run id; default = run_<timestamp>.")
@@ -397,6 +436,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         run_id=args.run_id,
         n_envs=args.n_envs,
         device=args.device,
+        video_freq=args.video_freq,
+        checkpoint_first_at=args.checkpoint_first_at,
     )
     train(cfg)
     return 0

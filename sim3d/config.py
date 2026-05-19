@@ -89,8 +89,14 @@ DEG = math.pi / 180.0
 # Range of Motion"; ACSM exercise physiology tables.
 JOINT_LIMITS_RAD = {
     # Spine — forward flex (climber tucks for high feet); we keep it
-    # single-axis to avoid the under-actuated lumbar mess.
-    "spine_lean":      (-15 * DEG, 30 * DEG),
+    # single-axis to avoid the under-actuated lumbar mess. Upper bound
+    # tightened from 30° → 15° because the upper-body gravity torque
+    # (~60 Nm at rest) used to pin the joint at +28° under the old
+    # actuator gains, which threw the head through the wall on overhangs.
+    # With the per-group spine gains in ACTUATOR_GAINS_BY_GROUP the
+    # equilibrium is now near 0° so this cap is a safety bound, not the
+    # operating point.
+    "spine_lean":      (-15 * DEG, 15 * DEG),
 
     # Shoulder (3-axis Euler around hinges). Order matters: az is
     # forward/back, then el (abduction), then roll (internal/external).
@@ -132,7 +138,7 @@ JOINT_LIMITS_RAD = {
 # natural hang; damping raised to overdamped so the settle phase converges
 # without ringing (ζ = d / (2√(k·I)) > 1 for each joint).
 JOINT_PASSIVE = {
-    "spine_lean":    ( 6.0, 5.0),   # was (15.0, 2.0) — allow forward lean; d raised for ζ≈0.75
+    "spine_lean":    (40.0, 8.0),   # raised: was (6, 5). Keeps the spine near 0° under upper-body gravity instead of pinned at the limit.
     "shoulder_az":   ( 5.0, 0.8),
     "shoulder_el":   ( 5.0, 0.8),
     "shoulder_roll": ( 3.0, 0.5),
@@ -152,8 +158,39 @@ JOINT_PASSIVE = {
 # brief said to "think about muscles" and we explicitly chose to model
 # them as torque-limited PD servos rather than Hill-type muscles, which
 # would 5× the simulator complexity for marginal RL benefit.
+#
+# Gains are *per joint group*, sized so each group is near-critically damped
+# under the segment it carries. Picked from ζ = kv / (2·√(kp·I)) with
+# segment inertia approximations for the default 70 kg / 175 cm climber.
+# A flat (kp=120, kv=8) made hips and shoulders ring (ζ≈0.3–0.6), which is
+# the "twisting weirdly" failure mode you see under random actions.
+ACTUATOR_GAINS_BY_GROUP: dict[str, tuple[float, float]] = {
+    # group:    (kp,   kv)
+    "shoulder": (220.0, 20.0),   # ζ ≈ 1.0 for ~3 kg arm at 0.35 m
+    "elbow":    ( 80.0,  6.0),
+    "wrist":    ( 15.0,  1.0),
+    "spine":    (250.0, 22.0),   # carries upper body — must be stiff
+    "hip":      (450.0, 45.0),   # ζ ≈ 1.0 for ~6 kg leg at 0.45 m
+    "knee":     (200.0, 17.0),
+    "ankle":    ( 40.0,  3.0),
+}
+# Legacy uniform defaults kept for backwards compat / debug experiments.
 ACTUATOR_KP = 120.0
 ACTUATOR_KV = 8.0
+
+# Per-joint armature (reflected motor inertia, kg·m²). Higher armature
+# damps high-frequency joint chatter without affecting steady-state pose.
+# A flat 0.01 is the MuJoCo default for tiny robots; for a 70 kg climber
+# the load-bearing joints need an order of magnitude more.
+JOINT_ARMATURE_BY_GROUP: dict[str, float] = {
+    "shoulder": 0.05,
+    "elbow":    0.02,
+    "wrist":    0.005,
+    "spine":    0.08,
+    "hip":      0.10,
+    "knee":     0.04,
+    "ankle":    0.01,
+}
 
 # Per-joint torque cap (Nm). Real climber peak ≈ 60–150 Nm shoulder,
 # 80 Nm spine, 200 Nm hip, 150 Nm knee. We keep these generous so failure

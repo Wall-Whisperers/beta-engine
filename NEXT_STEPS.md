@@ -167,6 +167,30 @@ import fails.
 
 ## Phase E — Body model and physics (longer horizon)
 
+### E0. Seed pose puts the right forearm 7 cm through the chest
+
+Confirmed at reset on the MoonBoard `sample-problems.json` problem 0:
+`body_intersection_count() == 1`, contact = `g_r_forearm` penetrating
+`g_chest` by 0.073 m. Root cause: `world.seed_pose` welds both hands to
+their start holds without computing elbow positions explicitly — the
+solver picks an arm configuration where the forearm capsule folds across
+the chest ellipsoid. Once welded, the contact constraint and the weld
+fight each other and the body twists trying to resolve both. Symptoms in
+the viewer: the body appears to "twist its body parts" at reset and the
+twist persists for the first few steps of each episode.
+
+Two clean fixes:
+
+- **(preferred)** Run a small explicit IK pass inside `seed_pose` after
+  the welds are placed: for each hand, compute a desired elbow position
+  that keeps the forearm away from the chest (elbow points outward, not
+  inward), set that joint target before the gravity ramp.
+- **(quick)** Reduce the chest ellipsoid depth from 0.115 → 0.085 in
+  `builder._build_climber_xml`. The chest then sits 3 cm thinner and the
+  forearm clears it on most start configurations. Loses a little
+  anatomical fidelity but eliminates the constant 1-intersection
+  background signal.
+
 ### E1. Validate the kickboard with the seed pose
 
 The kickboard's foot-only holds sit at `±0.244 m` and `z ≈ 0.27 m`. The

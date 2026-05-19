@@ -23,6 +23,54 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 
+class FirstMidLastCheckpointCallback(BaseCallback):
+    """Save the policy at three named points: first, mid, last.
+
+    Args:
+        out_dir: directory to write the .zip files into.
+        total_timesteps: matches the ``learn(total_timesteps=...)`` call.
+        first_at: env-step count at which to save ``model_first.zip``.
+            Defaults to a small value so you get an "untrained-ish" baseline
+            that still has the first PPO update applied (so it isn't pure
+            random init).
+    """
+
+    def __init__(
+        self,
+        out_dir: str,
+        total_timesteps: int,
+        first_at: int = 1024,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self._out_dir = out_dir
+        self._first_at = int(first_at)
+        self._mid_at = int(total_timesteps // 2)
+        self._saved_first = False
+        self._saved_mid = False
+        os.makedirs(self._out_dir, exist_ok=True)
+
+    def _on_step(self) -> bool:
+        if not self._saved_first and self.num_timesteps >= self._first_at:
+            self._save("model_first.zip")
+            self._saved_first = True
+        if not self._saved_mid and self.num_timesteps >= self._mid_at:
+            self._save("model_mid.zip")
+            self._saved_mid = True
+        return True
+
+    def _on_training_end(self) -> None:
+        # `model.zip` (final) is saved by train.py; we save `model_last.zip`
+        # alongside it so the three named files have parallel names.
+        self._save("model_last.zip")
+
+    def _save(self, name: str) -> None:
+        path = os.path.join(self._out_dir, name)
+        self.model.save(path)
+        if self.verbose:
+            print(f"[FirstMidLastCheckpointCallback] saved {path} at step {self.num_timesteps}")
+
+
 class VideoRolloutCallback(BaseCallback):
     """Save an mp4 rollout of the current policy every N training timesteps.
 
