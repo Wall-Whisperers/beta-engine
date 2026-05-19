@@ -464,6 +464,87 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
     return wall_xml, hold_meta
 
 
+# ─── Kickboard ────────────────────────────────────────────────────────────
+def _build_kickboard_xml(
+    wall: Wall,
+) -> tuple[str, list[dict]]:
+    """Emit a near-vertical kickboard plate below/in front of the main wall.
+
+    Returns (xml, foothold_meta). Each foothold is synthesized as a real hold
+    (contype=2 cylinder) so the env's grip machinery treats it identically to
+    a wall hold. IDs are prefixed ``kb_`` and ``hold_type`` is set to
+    ``foothold`` so hands cannot use them.
+    """
+    width = cfg.KICKBOARD_WIDTH_M
+    height = cfg.KICKBOARD_HEIGHT_M
+    thickness = cfg.KICKBOARD_THICKNESS_M
+    angle = math.radians(cfg.KICKBOARD_ANGLE_DEG)
+
+    # Position the kickboard centred at x=0, sitting on the floor in front of
+    # the main wall surface. We push it forward in +Y so the plate's front
+    # face is slightly in front of the main wall's lowest hold protrude depth.
+    plate_cx = 0.0
+    # Main wall bottom sits at z=0; kickboard rises from z=0 to height.
+    plate_cz = height / 2.0
+    # In front of the main wall: a small positive Y so the upper edge of the
+    # kickboard sits clear of the main plate's near face.
+    plate_cy = 0.35
+
+    # Slight backward tilt (top toward main wall) so feet press into it.
+    plate_axisangle = f"1 0 0 {-angle:.5f}"
+    plate_half = (width / 2.0, thickness / 2.0, height / 2.0)
+
+    xml_parts = [
+        f'<body name="kickboard" pos="{plate_cx:.5f} {plate_cy:.5f} {plate_cz:.5f}" '
+        f'axisangle="{plate_axisangle}">',
+        f'<geom name="g_kickboard" type="box" '
+        f'size="{plate_half[0]:.4f} {plate_half[1]:.4f} {plate_half[2]:.4f}" '
+        f'rgba="0.40 0.30 0.22 1" friction="1.0 0.005 0.001" '
+        f'contype="1" conaffinity="1"/>',
+    ]
+
+    foothold_meta: list[dict] = []
+    cyl_axisangle = "1 0 0 -1.5708"
+    cos_a = math.cos(-angle)
+    sin_a = math.sin(-angle)
+    nx, ny, nz = 0.0, cos_a, -sin_a
+    for hid_suffix, lx, lz in cfg.KICKBOARD_FOOTHOLDS:
+        local_x = lx
+        local_z_plane = lz - height / 2.0  # plate-local z (plate origin at centre)
+        local_y_out = plate_half[1] + cfg.HOLD_PROTRUDE_M / 2.0
+        radius = cfg.HOLD_RADIUS_BY_SIZE_M["large"]
+        xml_parts.append(
+            f'<geom name="hold_kb_{hid_suffix}" type="cylinder" '
+            f'pos="{local_x:.4f} {local_y_out:.4f} {local_z_plane:.4f}" '
+            f'size="{radius:.4f} {cfg.HOLD_PROTRUDE_M/2:.4f}" '
+            f'axisangle="{cyl_axisangle}" '
+            f'rgba="0.85 0.65 0.20 1.0" '
+            f'friction="1.4 0.01 0.005" contype="2" conaffinity="2"/>'
+        )
+        # World position of the hold tip.
+        local_y_tip = local_y_out + cfg.HOLD_PROTRUDE_M / 2.0
+        world_x = plate_cx + local_x
+        world_y = plate_cy + local_y_tip * cos_a + local_z_plane * sin_a
+        world_z = plate_cz - local_y_tip * sin_a + local_z_plane * cos_a
+        hold_id = f"kb_{hid_suffix}"
+        foothold_meta.append({
+            "hold_id": hold_id,
+            "world_pos": (world_x, world_y, world_z),
+            "wall_normal": (nx, ny, nz),
+            "geom_name": f"hold_kb_{hid_suffix}",
+            "friction": 1.4,
+            "positivity": 1.0,
+            "max_force_n": None,
+            "is_start": False,
+            "is_finish": False,
+            "hold_type": "foothold",
+            "color": "#d8a020",
+            "is_foothold_only": True,
+        })
+    xml_parts.append("</body>")
+    return "\n".join(xml_parts), foothold_meta
+
+
 # ─── Mocap targets + equality constraints ─────────────────────────────────
 def _build_mocap_targets() -> str:
     """One mocap body per limb. Mocap bodies are kinematic — physics
@@ -562,7 +643,12 @@ def _build_actuators() -> str:
 
 
 # ─── Top-level builder ────────────────────────────────────────────────────
-def build_mjcf_xml(wall: Wall, profile: ClimberProfile | None = None) -> tuple[str, list[dict]]:
+def build_mjcf_xml(
+    wall: Wall,
+    profile: ClimberProfile | None = None,
+    *,
+    include_kickboard: bool = False,
+) -> tuple[str, list[dict]]:
     """Return (xml_string, hold_meta) for the given wall + climber.
 
     The caller passes the result to `mujoco.MjModel.from_xml_string`.
@@ -579,6 +665,10 @@ def build_mjcf_xml(wall: Wall, profile: ClimberProfile | None = None) -> tuple[s
 
     climber_xml = _build_climber_xml(profile, start_pos)
     wall_xml, hold_meta = _build_wall_xml(wall)
+    kickboard_xml = ""
+    if include_kickboard:
+        kickboard_xml, kb_meta = _build_kickboard_xml(wall)
+        hold_meta = hold_meta + kb_meta
     mocap_xml = _build_mocap_targets()
     eq_xml = _build_equalities_v2()
     act_xml = _build_actuators()
@@ -618,6 +708,7 @@ def build_mjcf_xml(wall: Wall, profile: ClimberProfile | None = None) -> tuple[s
     <light name="side" pos="-3 -2 4" dir="0.5 0.3 -0.7" diffuse="0.4 0.4 0.4"/>
     {floor_xml}
     {wall_xml}
+    {kickboard_xml}
     {mocap_xml}
     {climber_xml}
   </worldbody>

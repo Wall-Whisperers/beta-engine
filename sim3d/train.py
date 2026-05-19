@@ -70,7 +70,7 @@ class TrainConfig:
     move_frames: int = 24               # shorter for snap, longer for reach
     max_episode_steps: int = 30
     enable_slip: bool = True
-    body_intersection_penalty: float = 2.0
+    body_intersection_penalty: float = 20.0
     out_dir: str = "data/runs/sim3d"
     run_id: Optional[str] = None        # auto-generated from timestamp if None
     n_envs: int = 1                     # parallel CPU env workers

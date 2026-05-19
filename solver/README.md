@@ -19,7 +19,7 @@ vision or a heavier physics engine gets layered on top.
 > approximated by 2D joint-angle envelopes — the constants in
 > `body.py`. The intent is to ship a working pipeline first; the next
 > phase swaps in Pymunk for proper 2D physics, and then 3D + MuJoCo
-> later. See [`planning-gabe.md`](../planning-gabe.md) for the long arc.
+> later. See [`../CLAUDE.md`](../CLAUDE.md) for the current architecture.
 
 ---
 
@@ -90,8 +90,7 @@ to push it.
 **Produces:** `Wall` and `Hold` dataclasses with positions in **cm**, not grid cells.
 
 Grid cells are converted with `cell_size_cm` (defaults to `20` cm with a
-warning — see [`planning-gabe.md`](../planning-gabe.md), this is the
-single biggest open schema question). Each hold's centre is at
+warning — the single biggest open schema question). Each hold's centre is at
 `((grid_x + 0.5) * cell_size_cm, (grid_y + 0.5) * cell_size_cm)`. y grows
 upward (climbing convention).
 
@@ -285,10 +284,8 @@ interface, deliberately, so the project now also includes SB3-compatible environ
 
 **When to upgrade to PPO:**
 - Walls bigger than ~20 holds (state space starts to explode).
-- Procedural-generation training (the original plan in
-  [`planning-gabe.md`](../planning-gabe.md) §3 — train on 1000 random
-  walls so the agent learns *principles* rather than memorizing one
-  route).
+- Procedural-generation training — train on many random walls so the
+  agent learns *principles* rather than memorizing one route.
 - Continuous-action body models (the next step beyond pose-graph search,
   if you want the agent to learn smooth dynamic moves).
 

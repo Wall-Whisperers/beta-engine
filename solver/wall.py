@@ -5,8 +5,7 @@ into world-space (cm) coordinates the body model can reason about.
 
 The locked schema (`schemas/wall.schema.json`) does not yet carry a real
 cell size, so we hard-default `cell_size_cm = DEFAULT_CELL_SIZE_CM` and
-emit a warning. See `planning-gabe.md` — this is a Phase-2 schema
-discussion item.
+emit a warning.
 """
 from __future__ import annotations
 
@@ -172,7 +171,7 @@ def load_wall(
     if cell_size_cm is None and schema_cell is None:
         warnings.warn(
             f"wall '{payload.get('wall_id')}' has no cell_size_cm; defaulting "
-            f"to {DEFAULT_CELL_SIZE_CM} cm. See planning-gabe.md.",
+            f"to {DEFAULT_CELL_SIZE_CM} cm.",
             stacklevel=2,
         )
     resolved_cell = float(

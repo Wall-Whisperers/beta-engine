@@ -4,12 +4,12 @@ A deliberately tiny RL implementation, dependency-free beyond NumPy. The
 state is the pose tuple `(LH, RH, LF, RF)`; the action is the
 `(limb, target_hold)` pair returned by `reachable_moves`.
 
-This is the "REALLY basic 2D RL" piece called for in CLAUDE.md and
-planning-gabe.md. It's not meant to scale beyond a handful of holds —
-once the wall gets bigger we should swap in PPO + Stable Baselines3 by
-keeping the same env semantics (step/reset/reward).
+A "really basic 2D RL" reference implementation. It's not meant to scale
+beyond a handful of holds — once the wall gets bigger we should swap in
+PPO + Stable Baselines3 by keeping the same env semantics
+(step/reset/reward).
 
-Reward shaping (matches planning-gabe.md §3.2):
+Reward shaping:
     + progress_reward   — COM closer to the finish (per step)
     + completion_bonus  — large reward for landing a hand on a finish hold
     - efficiency_penalty — small fixed cost per move

@@ -105,11 +105,16 @@ class Climb3DWorld:
         self,
         wall: Wall,
         profile: Optional[ClimberProfile] = None,
+        *,
+        include_kickboard: bool = False,
     ) -> None:
         self.wall = wall
         self.profile = profile or ClimberProfile()
+        self.include_kickboard = include_kickboard
 
-        xml, hold_meta = build_mjcf_xml(wall, self.profile)
+        xml, hold_meta = build_mjcf_xml(
+            wall, self.profile, include_kickboard=include_kickboard,
+        )
         self._xml = xml
         self.model = mujoco.MjModel.from_xml_string(xml)
         self.data = mujoco.MjData(self.model)
@@ -524,10 +529,10 @@ class Climb3DWorld:
         raise ValueError(f"unknown mode: {mode!r}")
 
     def _max_force_for(self, limb: Limb, meta: dict) -> float:
-        base = (
-            self.profile.grip_force_n if limb in HAND_LIMBS
-            else self.profile.foot_push_force_n
-        )
+        if limb in HAND_LIMBS:
+            base = self.profile.grip_force_n
+        else:
+            base = self.profile.foot_push_force_n * cfg.FOOT_FORCE_MULTIPLIER
         cap = base * meta["positivity"]
         if meta["max_force_n"] is not None:
             cap = min(cap, meta["max_force_n"])
@@ -723,15 +728,27 @@ class Climb3DWorld:
 
     def _check_slip(self) -> int:
         """Detect any hold whose limb is exceeding its rated capacity
-        and release it. Logs a SlipEvent for each release."""
+        and release it. Logs a SlipEvent for each release.
+
+        Single-substep dedup: cfrc_int sums contributions from ALL active
+        equality constraints onto a body, so when multiple welds are active
+        the per-limb force estimate over-counts. We accept at most one slip
+        per substep to avoid releasing several limbs from a single shared
+        spike. Known limitation; revisit if/when MuJoCo exposes a per-eq
+        constraint-force accessor.
+        """
         slip_count = 0
+        slipped_this_substep = False
         for limb in LIMBS:
+            if slipped_this_substep:
+                break
             attach = self._on_hold[limb]
             if attach is None:
                 continue
             f_mag = self._weld_force_magnitude(self._eq_idx[limb], limb)
             cap = attach.max_force_n * cfg.SLIP_FORCE_SLACK
             if f_mag > cap:
+                slipped_this_substep = True
                 self.data.eq_active[self._eq_idx[limb]] = 0
                 if len(self.slip_events) < self._max_slip_log:
                     self.slip_events.append(SlipEvent(

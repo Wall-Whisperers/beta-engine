@@ -1,41 +1,27 @@
 """Gymnasium environment for the 3D climbing simulator.
 
-Two flavours of action space, picked at construction time:
+Primary action mode: ``continuous-joint``. The agent emits a flat
+``Box(nu + 4,)`` action — the first ``nu`` values are normalised joint
+targets in [-1, 1] (rescaled per-joint), and the last 4 are per-limb grip
+intents in [LH, RH, LF, RF]. A grip engages iff its intent is > 0 AND the
+limb tip is within ``GRIP_PROXIMITY_M`` of an unoccupied, valid hold. Non-
+positive intents release any active weld. There is no auto-grip.
 
-    "discrete-move"  (default) — high-level "move limb X to hold Y".
-        action = limb_id * n_holds + hold_id
-        Best for the kind of beta-finding RL the project wants.
-        Episode is a sequence of moves; each move runs `move_frames`
-        of physics afterwards to let the body settle.
+``discrete-move`` mode is preserved behind ``EnvConfig.action_mode`` as a
+debug / curriculum tool that picks (limb, hold) and uses the Cartesian-
+impedance reach controller. It is NOT the default and should not be used
+for the primary training experiments.
 
-    "continuous-joint" — direct joint-target control.
-        action ∈ Box(-1, 1, (n_actuators,)) scaled to joint range.
-        For learning low-level motor control. Much harder to train,
-        but gives the agent full flexibility.
+Observation: see ``sim3d.obs.build_observation``.
 
-Observation (both modes) packs:
-    - pelvis world pos (3)
-    - pelvis quat (4)
-    - centre-of-mass world pos (3)
-    - joint qpos[7:] (n_actuators)
-    - joint qvel[6:] (n_actuators)
-    - per-limb tip world pos (4 × 3)
-    - per-limb on-hold one-hot (4 × n_holds)  — masked to which holds
-      the limb is *eligible* for (e.g. hands can't use foothold-only).
-    - distance from highest hand to finish hold (1)
-
-Reward (per step):
-    + UPWARD_REWARD × (com_z - prev_com_z)         # progress
-    + ON_FINISH_BONUS if a hand is on a finish hold
-    - PER_STEP_PENALTY                             # be efficient
-    - FALL_PENALTY (terminal) if pelvis_z < FALL_Z
-    - SLIP_PENALTY × n_slips                       # don't blow up grips
-    - BODY_INTERSECTION_PENALTY × n_intersections  # no limbs through torso
-
-Termination:
-    - hand on finish hold for ≥ FINISH_HOLD_FRAMES
-    - pelvis_z < FALL_Z (fell off)
-    - max_steps reached (truncation)
+Reward (per step, continuous-joint):
+    + 5.0 × max(0, com_z − episode_max_com_z)       # high-water-mark progress
+    + 5.0 (rising-edge, deduped per (limb, hold) per episode)
+    − 5.0 × n_slips
+    − 20.0 × n_body_intersections                   # gating, not shaping
+    − 0.25 if action was invalid (discrete-move only)
+    − 0.005 × Σ ctrl²                               # energy
+    + 100.0 on_finish_bonus, − 50.0 fall_penalty (terminal)
 """
 from __future__ import annotations
 
@@ -55,50 +41,47 @@ except ImportError as e:  # pragma: no cover
 
 from sim3d import config as cfg
 from sim3d.body import HAND_LIMBS, FOOT_LIMBS, LIMBS, ClimberProfile, Limb
+from sim3d.obs import build_observation, observation_dim
 from sim3d.world import Climb3DWorld
 from solver.wall import Wall
 
 
 @dataclass
 class EnvConfig:
-    action_mode: str = "discrete-move"           # or "continuous-joint"
-    move_mode: str = "reach"                     # "snap" | "reach" | "dyno"
-    move_frames: int = 60                        # physics frames between actions (1s @ 60Hz)
-    max_steps: int = 60                          # episode cap
-    fall_z: float = 0.20                         # below this pelvis-z = fall
-    finish_hold_frames: int = 6                  # hand must stay on finish for this long
-    upward_reward: float = 8.0
+    action_mode: str = "continuous-joint"        # "continuous-joint" | "discrete-move"
+    move_mode: str = "reach"                     # discrete-move only: "snap"|"reach"|"dyno"
+    move_frames: int = 60                        # discrete-move only
+    sim_substeps: int = 8                        # physics substeps per env.step() in continuous mode
+    max_steps: int = 2000
+    fall_z: float = 0.20
+    finish_hold_frames: int = 6
+    # Reward coefficients.
+    hwm_height_scale: float = 5.0                # × max(0, com_z − max_com_z)
+    hold_match_bonus: float = 5.0                # rising-edge first-touch
     on_finish_bonus: float = 100.0
-    per_step_penalty: float = 0.02
     fall_penalty: float = 50.0
     slip_penalty: float = 5.0
-    body_intersection_penalty: float = 2.0       # discourage limbs passing through torso/pelvis
-    enable_slip: bool = True                     # hold-overload model on by default for training
+    # Body intersection penalty raised to GATE (not shape) — coefficient
+    # chosen so a single intersection wipes out roughly the largest possible
+    # single-step HWM gain. This makes self-intersecting poses an outright
+    # negative-EV action rather than a shaping nudge.
+    body_intersection_penalty: float = 20.0
+    energy_penalty_coeff: float = 0.005          # × Σ ctrl²
+    invalid_action_penalty: float = 0.25
+    enable_slip: bool = True
     seed_pose: bool = True
     seed_kwargs: dict = field(default_factory=dict)
-    start_mode: str = "seed"                    # "seed" | "ground-reach"
-    official_route_only: bool = False          # MoonBoard: reject off-route hand/foot contacts
-    invalid_action_penalty: float = 0.25       # small repeated-attempt penalty for masked holds
+    start_mode: str = "seed"                     # "seed" | "ground-reach"
+    official_route_only: bool = False
+    reset_max_retries: int = 5
+    include_kickboard: bool = False
 
 
 class Climbing3DEnv(gym.Env):
     """Single-wall single-climber Gymnasium environment.
 
-    Used like any other gym env:
-
-        from solver.wall import load_wall
-        from sim3d import ClimberProfile
-        from sim3d.env import Climbing3DEnv, EnvConfig
-
-        env = Climbing3DEnv(load_wall("example-v2-boulder"))
-        obs, info = env.reset()
-        for _ in range(60):
-            action = env.action_space.sample()
-            obs, reward, term, trunc, info = env.step(action)
-            if term or trunc: break
-
-    Drop-in compatible with Stable-Baselines3 `PPO("MlpPolicy", env)`
-    and RLlib `AlgorithmConfig().environment(env_creator=...)`.
+    Continuous-joint is the canonical training mode. Drop-in compatible
+    with SB3 ``PPO("MlpPolicy", env)``.
     """
 
     metadata = {"render_modes": ["pose-snapshot"], "render_fps": 30}
@@ -121,14 +104,13 @@ class Climbing3DEnv(gym.Env):
         if self.cfg_env.start_mode not in ("seed", "ground-reach"):
             raise ValueError(f"unknown start_mode: {self.cfg_env.start_mode}")
 
-        self.world = Climb3DWorld(wall, self.profile)
+        self.world = Climb3DWorld(
+            wall, self.profile, include_kickboard=self.cfg_env.include_kickboard,
+        )
         self._hold_ids: list[str] = list(self.world._hold_meta_by_id.keys())
         self.n_holds = len(self._hold_ids)
         self._hold_index: dict[str, int] = {h: i for i, h in enumerate(self._hold_ids)}
 
-        # Eligibility masks. Hands can't use "foothold-only" holds. In
-        # MoonBoard full-board mode, off-route gray holds are present only to
-        # keep a fixed 11×18 action index and are not legal contacts.
         self._route_eligible = np.array([
             self._is_official_route_hold(h) for h in self._hold_ids
         ], dtype=np.bool_)
@@ -147,48 +129,44 @@ class Climbing3DEnv(gym.Env):
             if self.world._hold_meta_by_id[h]["is_finish"]
         ]
         if not self._finish_hold_ids:
-            # Treat the highest hold as the finish if none marked.
             self._finish_hold_ids = [
                 max(self._hold_ids,
                     key=lambda h: self.world._hold_meta_by_id[h]["world_pos"][2])
             ]
-        self._finish_z = max(
-            self.world._hold_meta_by_id[h]["world_pos"][2]
-            for h in self._finish_hold_ids
-        )
 
-        # Action space
+        # ── Action space ─────────────────────────────────────────────
         n_act = self.world.model.nu
+        self._n_act = n_act
+        # Cache per-joint ctrl ranges (for normalised → world rescaling).
+        self._act_lo = np.zeros(n_act, dtype=np.float64)
+        self._act_hi = np.zeros(n_act, dtype=np.float64)
+        for i in range(n_act):
+            jid = int(self.world.model.actuator_trnid[i, 0])
+            self._act_lo[i] = self.world.model.jnt_range[jid, 0]
+            self._act_hi[i] = self.world.model.jnt_range[jid, 1]
+
         if self.cfg_env.action_mode == "discrete-move":
             self.action_space = spaces.Discrete(4 * self.n_holds)
         else:
+            # nu joint targets in [-1, 1] + 4 grip intents in [-1, 1].
+            low = np.full(n_act + 4, -1.0, dtype=np.float32)
+            high = np.full(n_act + 4, 1.0, dtype=np.float32)
             self.action_space = spaces.Box(
-                low=-1.0, high=1.0, shape=(n_act,), dtype=np.float32,
+                low=low, high=high, shape=(n_act + 4,), dtype=np.float32,
             )
-            # Cache joint ranges for action-scaling.
-            self._act_lo = np.zeros(n_act, dtype=np.float64)
-            self._act_hi = np.zeros(n_act, dtype=np.float64)
-            for i in range(n_act):
-                jid = int(self.world.model.actuator_trnid[i, 0])
-                self._act_lo[i] = self.world.model.jnt_range[jid, 0]
-                self._act_hi[i] = self.world.model.jnt_range[jid, 1]
 
-        # Observation space — large flat vector.
-        obs_dim = (
-            3 + 4 + 3                              # pelvis pos, quat, com
-            + n_act + n_act                        # qpos[7:], qvel[6:]
-            + 4 * 3                                # 4 limb tips
-            + 4 * self.n_holds                     # one-hot per limb
-            + 1                                    # finish-distance
-        )
+        # ── Observation space ────────────────────────────────────────
+        obs_dim = observation_dim(self.world)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32,
         )
 
-        self._n_act = n_act
+        # Episode state.
         self._step_count = 0
         self._finish_streak = 0
-        self._prev_com_z = 0.0
+        self._max_com_z = 0.0
+        self._holds_matched_this_episode: set[tuple[str, str]] = set()
+        self._prev_grip: dict[Limb, Optional[str]] = {l: None for l in LIMBS}
 
     # ─── Gym API ──────────────────────────────────────────────────────
     def reset(
@@ -198,26 +176,51 @@ class Climbing3DEnv(gym.Env):
         options: Optional[dict] = None,
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
-        self.world.reset()
-        if self.cfg_env.seed_pose:
-            if self.cfg_env.start_mode == "ground-reach":
-                self._begin_ground_reach_start()
-            else:
-                kw = dict(self.cfg_env.seed_kwargs)
-                if not kw:
-                    kw = self._default_seed_kwargs()
-                self.world.seed_pose(**kw)
+        last_err: Optional[str] = None
+        for attempt in range(max(1, self.cfg_env.reset_max_retries)):
+            self.world.reset()
+            try:
+                if self.cfg_env.seed_pose:
+                    if self.cfg_env.start_mode == "ground-reach":
+                        self._begin_ground_reach_start()
+                    else:
+                        kw = dict(self.cfg_env.seed_kwargs)
+                        if not kw:
+                            kw = self._default_seed_kwargs()
+                        self.world.seed_pose(**kw)
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                continue
+
+            n_grips = sum(
+                1 for l in LIMBS if self.world.on_hold(l) is not None
+            )
+            if n_grips >= 3 or not self.cfg_env.seed_pose:
+                break
+
+            if attempt < self.cfg_env.reset_max_retries - 1 and self.np_random is not None:
+                # Perturb pelvis xy with a small random offset so the next
+                # settle starts from a slightly different basin.
+                jitter = self.np_random.normal(scale=0.02, size=2)
+                self.world.data.qpos[0] += float(jitter[0])
+                self.world.data.qpos[1] += float(jitter[1])
         else:
-            # Reset and let the climber dangle from gravity.
-            pass
+            # Loop exhausted without break. Warn and proceed.
+            print(
+                f"[sim3d.env] WARNING: reset settled with <3 grips after "
+                f"{self.cfg_env.reset_max_retries} attempts ({last_err}). "
+                "Continuing — episode may be unstable."
+            )
 
         self._step_count = 0
         self._finish_streak = 0
-        self._prev_com_z = float(self.world.com()[2])
+        self._max_com_z = float(self.world.com()[2])
+        self._holds_matched_this_episode = set()
+        self._prev_grip = {l: self.world.on_hold(l) for l in LIMBS}
         return self._obs(), self._info()
 
+    # ─── Pose seeding helpers (unchanged from prior implementation) ──
     def _default_seed_kwargs(self) -> dict[str, str]:
-        """Choose a stable debug/curriculum pose on route holds."""
         kw: dict[str, str] = {}
         starts = self.wall.starts()
         if len(starts) >= 2:
@@ -233,7 +236,6 @@ class Climbing3DEnv(gym.Env):
             key=lambda h: h.y_cm,
         )
         if len(feet_candidates) < 2:
-            # Fallback: any non-start, non-finish route hold sorted by height.
             used_for_hands = {kw.get("lh"), kw.get("rh")}
             extras = sorted(
                 (h for h in self.wall.holds
@@ -244,7 +246,6 @@ class Climbing3DEnv(gym.Env):
             )
             feet_candidates = (feet_candidates or []) + extras
         if len(feet_candidates) >= 2:
-            # Pick the lowest left-side and lowest right-side hold.
             left = next((h for h in feet_candidates if h.grid_x <= self.wall.cols / 2), None)
             right = next((h for h in feet_candidates if h.grid_x > self.wall.cols / 2), None)
             if left is None:
@@ -256,7 +257,6 @@ class Climbing3DEnv(gym.Env):
         return kw
 
     def _start_hand_targets(self) -> tuple[str | None, str | None]:
-        """Return route start holds for LH/RH, duplicating one start if needed."""
         starts = sorted(self.wall.starts(), key=lambda h: h.x_cm)
         if len(starts) >= 2:
             return starts[0].hold_id, starts[-1].hold_id
@@ -274,13 +274,6 @@ class Climbing3DEnv(gym.Env):
         return None, None
 
     def _begin_ground_reach_start(self) -> None:
-        """Start at the model's ground-level default pose, then reach to starts.
-
-        This is useful for visual/debug simulations where we want to see the
-        body initiate the climb instead of being welded directly onto the route.
-        No welds are pre-attached here; stepping the world runs the existing
-        continuous reach controller toward the official start hand hold(s).
-        """
         self.world._sync_actuator_targets_to_pose()
         lh, rh = self._start_hand_targets()
         if lh is not None:
@@ -288,50 +281,57 @@ class Climbing3DEnv(gym.Env):
         if rh is not None:
             self.world.move_limb("RH", rh, mode=self.cfg_env.move_mode)
 
+    # ─── Step ────────────────────────────────────────────────────────
     def step(self, action) -> tuple[np.ndarray, float, bool, bool, dict]:
         self._step_count += 1
         info: dict[str, Any] = {}
-        slips = 0
+        invalid = False
+        ctrl_l2_sq = 0.0
 
         if self.cfg_env.action_mode == "discrete-move":
-            limb_id = int(action) // self.n_holds
-            hold_id_idx = int(action) % self.n_holds
-            limb = LIMBS[limb_id % 4]
-            hold_id = self._hold_ids[hold_id_idx]
-            invalid_reason = self._invalid_move_reason(limb, hold_id_idx)
+            slips, invalid_reason = self._step_discrete(action)
             if invalid_reason is not None:
+                invalid = True
                 info["invalid_action"] = invalid_reason
-            else:
-                self.world.move_limb(limb, hold_id, mode=self.cfg_env.move_mode)
-            slips = self.world.step(
-                self.cfg_env.move_frames,
-                check_slip=self.cfg_env.enable_slip,
-            )
         else:
-            # Continuous: action ∈ [-1, 1] → joint angle in joint range.
-            action = np.asarray(action, dtype=np.float64).clip(-1.0, 1.0)
-            ctrl = 0.5 * (action + 1.0) * (self._act_hi - self._act_lo) + self._act_lo
-            self.world.data.ctrl[:self._n_act] = ctrl
-            slips = self.world.step(
-                1, check_slip=self.cfg_env.enable_slip,
-            )
+            slips, ctrl_l2_sq = self._step_continuous(action)
 
-        # ── Reward shaping ─────────────────────────────────────────
+        # ── Reward ───────────────────────────────────────────────────
         body_intersections = self.world.body_intersection_count()
         com_z = float(self.world.com()[2])
-        progress = com_z - self._prev_com_z
-        self._prev_com_z = com_z
+
+        # High-water-mark progress.
+        height_reward = 0.0
+        if com_z > self._max_com_z:
+            height_reward = self.cfg_env.hwm_height_scale * (com_z - self._max_com_z)
+            self._max_com_z = com_z
+
+        # Rising-edge per (limb, hold) hold-match bonus.
+        match_bonus = 0.0
+        for limb in LIMBS:
+            cur = self.world.on_hold(limb)
+            prev = self._prev_grip.get(limb)
+            if cur is not None and cur != prev:
+                key = (limb, cur)
+                if key not in self._holds_matched_this_episode:
+                    self._holds_matched_this_episode.add(key)
+                    match_bonus += self.cfg_env.hold_match_bonus
+            self._prev_grip[limb] = cur
 
         reward = (
-            self.cfg_env.upward_reward * progress
-            - self.cfg_env.per_step_penalty
+            height_reward
+            + match_bonus
             - self.cfg_env.slip_penalty * slips
             - self.cfg_env.body_intersection_penalty * body_intersections
+            - self.cfg_env.energy_penalty_coeff * ctrl_l2_sq
         )
-        if "invalid_action" in info:
+        if invalid:
             reward -= self.cfg_env.invalid_action_penalty
 
-        # Finish hold — either hand counts.
+        # ── Termination ──────────────────────────────────────────────
+        terminated = False
+        truncated = False
+        pelvis_z = float(self.world.pelvis_pos()[2])
         on_finish = (
             self.world.on_hold("LH") in self._finish_hold_ids
             or self.world.on_hold("RH") in self._finish_hold_ids
@@ -341,9 +341,6 @@ class Climbing3DEnv(gym.Env):
         else:
             self._finish_streak = 0
 
-        terminated = False
-        truncated = False
-        pelvis_z = float(self.world.pelvis_pos()[2])
         if self._finish_streak >= self.cfg_env.finish_hold_frames:
             reward += self.cfg_env.on_finish_bonus
             terminated = True
@@ -359,32 +356,97 @@ class Climbing3DEnv(gym.Env):
         info.update(self._info())
         info["slips"] = slips
         info["body_intersections"] = body_intersections
-        info["progress"] = progress
+        info["height_reward"] = float(height_reward)
+        info["hold_match_bonus"] = float(match_bonus)
         return self._obs(), float(reward), terminated, truncated, info
 
+    # ─── Action handling ─────────────────────────────────────────────
+    def _step_continuous(self, action) -> tuple[int, float]:
+        """Apply joint targets + grip intents; return (slips, Σctrl²)."""
+        action = np.asarray(action, dtype=np.float64)
+        n = self._n_act
+        joint_norm = np.clip(action[:n], -1.0, 1.0)
+        ctrl = 0.5 * (joint_norm + 1.0) * (self._act_hi - self._act_lo) + self._act_lo
+        self.world.data.ctrl[:n] = ctrl
+
+        # Grip intents come *before* stepping physics so the welds can hold
+        # the body through the upcoming substeps.
+        intents = action[n: n + 4]
+        for i, limb in enumerate(LIMBS):
+            intent = float(intents[i]) if i < len(intents) else -1.0
+            if intent > 0.0:
+                self._maybe_engage_grip(limb)
+            else:
+                if self.world.on_hold(limb) is not None:
+                    self.world.release_limb(limb)
+
+        slips = self.world.step(
+            self.cfg_env.sim_substeps,
+            check_slip=self.cfg_env.enable_slip,
+        )
+        return slips, float(np.sum(ctrl * ctrl))
+
+    def _maybe_engage_grip(self, limb: Limb) -> None:
+        """Engage the weld if the tip is within proximity of a valid,
+        unoccupied hold. Picks the closest eligible hold within range."""
+        if self.world.on_hold(limb) is not None:
+            return
+        tip = self.world.limb_tip_pos(limb)
+        # Holds currently occupied by another limb are off limits.
+        occupied = {
+            self.world.on_hold(l) for l in LIMBS if l != limb
+        }
+        occupied.discard(None)
+
+        best_id: Optional[str] = None
+        best_d = cfg.GRIP_PROXIMITY_M
+        for i, hid in enumerate(self._hold_ids):
+            if hid in occupied:
+                continue
+            if limb in HAND_LIMBS and not self._hand_eligible[i]:
+                continue
+            if limb in FOOT_LIMBS and not self._foot_eligible[i]:
+                continue
+            meta = self.world._hold_meta_by_id[hid]
+            d = float(np.linalg.norm(np.array(meta["world_pos"]) - tip))
+            if d <= best_d:
+                best_d = d
+                best_id = hid
+        if best_id is not None:
+            self.world.attach_limb(limb, best_id)
+
+    def _step_discrete(self, action) -> tuple[int, Optional[str]]:
+        limb_id = int(action) // self.n_holds
+        hold_id_idx = int(action) % self.n_holds
+        limb = LIMBS[limb_id % 4]
+        hold_id = self._hold_ids[hold_id_idx]
+        invalid_reason = self._invalid_move_reason(limb, hold_id_idx)
+        if invalid_reason is None:
+            self.world.move_limb(limb, hold_id, mode=self.cfg_env.move_mode)
+        slips = self.world.step(
+            self.cfg_env.move_frames,
+            check_slip=self.cfg_env.enable_slip,
+        )
+        return slips, invalid_reason
+
+    # ─── Misc helpers ────────────────────────────────────────────────
     def render(self) -> Optional[dict]:
         if self.render_mode == "pose-snapshot":
             return self.world.pose_snapshot()
         return None
 
     def close(self) -> None:
-        # MuJoCo data is GC-managed, nothing to release.
         pass
 
-    # ─── Action helpers ───────────────────────────────────────────────
     def _is_official_route_hold(self, hold_id: str) -> bool:
         meta = self.world._hold_meta_by_id[hold_id]
-        # Start and finish are explicit schema flags. MoonBoard middle holds
-        # are colored blue by the adapter, while off-route fixed-board holds
-        # are gray. Generic non-MoonBoard walls remain all-route unless this
-        # option is explicitly enabled with gray helper holds.
         return bool(
             meta["is_start"]
             or meta["is_finish"]
             or str(meta.get("color", "")).lower() != "#888888"
         )
 
-    def _invalid_move_reason(self, limb: Limb, hold_id_idx: int) -> str | None:
+    def _invalid_move_reason(self, limb: Limb, hold_id_idx: int) -> Optional[str]:
         if self.cfg_env.official_route_only and not self._route_eligible[hold_id_idx]:
             return "off-route hold"
         if limb in HAND_LIMBS and not self._hand_eligible[hold_id_idx]:
@@ -394,45 +456,14 @@ class Climbing3DEnv(gym.Env):
         return None
 
     def encode_move(self, limb: Limb, hold_id: str) -> int:
-        """For tests / scripted policies."""
         return LIMBS.index(limb) * self.n_holds + self._hold_index[hold_id]
 
     def decode_move(self, action: int) -> tuple[Limb, str]:
         return LIMBS[action // self.n_holds], self._hold_ids[action % self.n_holds]
 
-    # ─── Observation builder ──────────────────────────────────────────
+    # ─── Observation / info ──────────────────────────────────────────
     def _obs(self) -> np.ndarray:
-        d = self.world.data
-        m = self.world.model
-        n_act = self._n_act
-
-        pelvis = np.array(d.qpos[0:3])
-        pelvis_quat = np.array(d.qpos[3:7])
-        com = self.world.com()
-        joint_pos = np.array(d.qpos[7: 7 + n_act])
-        # qvel for non-free joints starts at index 6 (free is 6 DOF in qvel).
-        joint_vel = np.array(d.qvel[6: 6 + n_act])
-
-        tips = np.concatenate([self.world.limb_tip_pos(l) for l in LIMBS])
-
-        onehot = np.zeros(4 * self.n_holds, dtype=np.float32)
-        for li, l in enumerate(LIMBS):
-            hid = self.world.on_hold(l)
-            if hid is not None:
-                onehot[li * self.n_holds + self._hold_index[hid]] = 1.0
-
-        hand_z = max(
-            float(self.world.limb_tip_pos("LH")[2]),
-            float(self.world.limb_tip_pos("RH")[2]),
-        )
-        finish_dist = np.array([self._finish_z - hand_z], dtype=np.float32)
-
-        obs = np.concatenate([
-            pelvis, pelvis_quat, com,
-            joint_pos, joint_vel,
-            tips, onehot, finish_dist,
-        ]).astype(np.float32)
-        return obs
+        return build_observation(self.world, self.cfg_env)
 
     def _info(self) -> dict[str, Any]:
         return {

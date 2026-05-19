@@ -222,6 +222,35 @@ DYNO_DURATION_S = 0.35
 # setting < 1.0 makes them slip more easily.
 SLIP_FORCE_SLACK = 1.25
 
+# ─── Continuous-joint grip control ──────────────────────────────────────────
+# In continuous-joint mode the agent emits a per-limb grip intent in addition
+# to the joint targets. A grip can only engage when the limb tip is within
+# GRIP_PROXIMITY_M of an unoccupied valid hold. There is no auto-grip — the
+# agent must explicitly raise the intent above 0.0.
+GRIP_PROXIMITY_M = 0.05
+
+# Feet push on overhangs; hands pull. Per-limb capacity multiplier so feet can
+# generate more reaction force than the hands' rated grip strength.
+FOOT_FORCE_MULTIPLIER = 1.5
+
+# ─── Kickboard ─────────────────────────────────────────────────────────────
+# A "kickboard" is a secondary near-vertical plate below the main wall with a
+# small handful of foot-only holds. MoonBoard uses this for the canonical
+# starting foot position. Sizes are SI metres; foothold positions are in
+# kickboard-local (X-along, Z-up) coordinates centred on the kickboard.
+KICKBOARD_WIDTH_M = 1.30
+KICKBOARD_HEIGHT_M = 0.30
+KICKBOARD_THICKNESS_M = 0.04
+# Vertical gap between top of kickboard and bottom of main wall.
+KICKBOARD_GAP_M = 0.02
+# Approx near-vertical (slight backward tilt so feet press into it).
+KICKBOARD_ANGLE_DEG = -5.0
+# Two upper foot holds, narrowed inward to match the climber's hip range.
+KICKBOARD_FOOTHOLDS = [
+    ("KB_LU", -0.244, 0.20),
+    ("KB_RU",  0.244, 0.20),
+]
+
 # Friction on the bare wall surface (used for slab smearing). Holds
 # carry their own per-hold friction patch.
 DEFAULT_WALL_FRICTION = (0.7, 0.005, 0.001)  # (slide, spin, roll)

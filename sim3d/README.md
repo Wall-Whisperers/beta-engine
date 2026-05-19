@@ -1,17 +1,22 @@
 # sim3d — 3D climbing simulator
 
-A MuJoCo-driven 3D successor to the 2D `physics/` package. Built so
-the rest of the project (solver, RL env, eventual photo→pipeline) can
-treat the climber as a real articulated body in 3D space.
+The MuJoCo-driven 3D climbing simulator that the whole project trains
+against. Includes a custom 27-DOF humanoid, the wall + kickboard MJCF
+builder, the Gymnasium env, the observation builder, the PPO trainer, and
+the browser viewer bridge.
 
-> **Current status — research prototype.** This package now includes the
-> MuJoCo 3D world, a Gymnasium wrapper, and an SB3 PPO training entry
-> point. The high-level RL action space can choose limb→hold moves while
-> MuJoCo still integrates the body continuously between decisions. It is
-> good enough for experiments and demos, but it is not yet a production
-> climbing model: observations are wall-size dependent, reward shaping is
-> early, and policies must be replayed with the same wall/config used for
-> training.
+> **Current status — research prototype, single canonical action mode.**
+> The primary action mode is `continuous-joint`: the policy emits joint
+> targets for every actuated joint plus four grip intents (one per limb).
+> The observation is fixed-shape regardless of wall size (K-nearest holds,
+> not a board-sized one-hot), so a saved policy is portable across walls
+> as long as the climber body is unchanged.
+>
+> Concrete shapes (no need to run the code):
+> ```
+> action_space      : Box(-1, 1, (25,), float32)   # 21 joint targets + 4 grip intents
+> observation_space : Box(-inf, inf, (127,), float32)
+> ```
 
 ---
 
@@ -38,17 +43,19 @@ that share our exact toolchain. We're explicitly building the
 
 ```
 sim3d/
-├── config.py        # tunable constants (timestep, joint limits, masses, ...)
-├── body.py          # ClimberProfile dataclass + segment math + limb names
-├── builder.py       # build_mjcf_xml(wall, profile) → (xml, hold_meta)
-├── world.py         # Climb3DWorld — owns MjModel + MjData + slip detection +
-│                    #   continuous-reach Cartesian-impedance controller
-├── env.py           # Climbing3DEnv — Gymnasium wrapper for RL training
-├── moonboard.py     # MoonBoard problem JSON → Wall adapter
-├── train.py         # PPO trainer (SB3) + episode CSV logger
-├── viewer.py        # native MuJoCo viewer wrapper
-├── web.py           # Flask blueprint for the three.js front-end
-└── __main__.py      # `python -m sim3d` CLI demo (incl. --play <model>)
+├── config.py          # tunable constants (timestep, joint limits, masses, grip, kickboard)
+├── body.py            # ClimberProfile dataclass + segment math + limb names
+├── builder.py         # build_mjcf_xml(wall, profile, include_kickboard) → (xml, hold_meta)
+├── world.py           # Climb3DWorld — MjModel + MjData + grip welds + slip + reach
+├── obs.py             # build_observation(world, env_cfg) → fixed-shape (127,) vector
+├── env.py             # Climbing3DEnv — Gymnasium wrapper (continuous-joint default)
+├── moonboard_env.py   # MoonboardClimbing3DEnv — samples a problem per reset
+├── moonboard.py       # MoonBoard problem JSON → Wall adapter
+├── callbacks.py       # VideoRolloutCallback — mp4 every N steps
+├── train.py           # SB3 PPO trainer + episode CSV logger
+├── viewer.py          # native MuJoCo viewer wrapper
+├── web.py             # Flask blueprint for the three.js front-end
+└── __main__.py        # `python -m sim3d` CLI demo (incl. --play <model>)
 ```
 
 **The data flow on each step:**
@@ -110,13 +117,16 @@ recompile needed → fast for RL resets. The weld's `relpose` is set so
 the limb's *tip site* (fingertips / toe) lands on the hold rather
 than the wrist / ankle.
 
-**Continuous limb motion.** `move_limb` supports three modes:
+**Continuous limb motion (debug / discrete-move only).** `world.move_limb`
+supports three modes. These are used by the `discrete-move` action mode
+(curriculum / debug) — in the canonical `continuous-joint` mode the policy
+moves limbs by driving joint torques directly.
 
 | Mode | Behaviour | Use when |
 |---|---|---|
-| `snap` | Instant teleport. | Fast RL training where you only care which holds the limb visits. |
-| `reach` (default) | Cartesian-impedance PD pulls the limb tip toward the target through space. Body sways under gravity + the reach force. Welds when the tip is within 5 cm or after 1.5 s. | Manual play, dynamic visualisation, realistic RL. |
-| `dyno` | Same as reach plus an explosive leg-extension push during the first 0.35 s — for moves that would be out of static reach. | Long throws between holds. |
+| `snap` | Instant teleport. | Fast scripted policies where you only care which holds the limb visits. |
+| `reach` (default) | Cartesian-impedance PD pulls the limb tip toward the target through space. Body sways under gravity + the reach force. Welds when the tip is within 5 cm or after 1.5 s. | Manual play in the viewer, dynamic visualisation. |
+| `dyno` | Same as reach plus an explosive leg-extension push during the first 0.35 s. | Long throws between holds. |
 
 While a limb is reaching, its actuator KP is temporarily zeroed so
 the per-joint hold-pose servo doesn't fight the impedance controller.
@@ -154,9 +164,14 @@ Tune it with `--body-intersection-penalty` in `sim3d.train`; set it to
 
 **Coordinate convention.** `+X` along the wall, `+Y` away from the wall
 (toward the climber/camera), `+Z` up. Gravity is fixed at world `-Z`;
-slab/overhang is implemented by tilting the wall, not gravity. The
-opposite of `physics/world.py` (which tilts gravity) — but more
-natural in MuJoCo where geometry is mobile and gravity is a global.
+slab/overhang is implemented by tilting the wall, not gravity.
+
+**Kickboard.** When `EnvConfig.include_kickboard=True` (default for
+`MoonboardClimbing3DEnv`), the builder adds a generic near-vertical plate
+in front of the main wall with foot-only holds at `cfg.KICKBOARD_FOOTHOLDS`
+positions. Holds are synthesised as full members of `hold_meta` with
+`hold_type="foothold"`, so the env's grip machinery treats them identically
+to a wall hold.
 
 **Wall angle.**
 
@@ -339,16 +354,34 @@ for _ in range(30):
 
 Two action modes are available:
 
-- **`discrete-move`** (default): `Discrete(4 * n_holds)` — pick a limb
-  and a hold. Best for the high-level beta-finding RL the project is
-  built around.
-- **`continuous-joint`**: `Box(-1, 1, (n_actuators,))` — direct joint
-  targets, scaled into each joint's range. For low-level motor
-  control. Trains slower but is more flexible.
+- **`continuous-joint`** (default, canonical training mode):
+  `Box(-1, 1, (nu + 4,))`. For the default 27-DOF climber this is
+  `Box(-1, 1, (25,))` — 21 joint targets in `[-1, 1]` rescaled per joint
+  to its MuJoCo ctrlrange, plus 4 grip intents for `[LH, RH, LF, RF]`.
+  A grip engages iff intent > 0 AND the limb tip is within
+  `cfg.GRIP_PROXIMITY_M` of an unoccupied valid hold; non-positive intent
+  releases. There is no auto-grip.
+- **`discrete-move`** (debug / curriculum only): `Discrete(4 * n_holds)`
+  — pick (limb, hold), uses the Cartesian-impedance reach controller.
+  Not used for the primary training experiments.
 
-Observation is a flat 117-d vector (for 13-hold walls; scales with
-hold count): pelvis pose + COM + joint angles + joint velocities +
-limb-tip positions + per-limb on-hold one-hot + distance-to-finish.
+Observation is fixed-shape `(127,)` regardless of wall size: pelvis pos +
+rot6d + COM + qpos[7:] + qvel[6:] + 4 grip flags + K=8 nearest holds × 7
+(rel-pos-in-pelvis, role one-hot, gripping flag) + 4 anchor/goal vectors +
+finish-distance scalar. See [`CLAUDE.md`](../CLAUDE.md) for the byte-level
+breakdown. All streams are NaN/Inf-guarded.
+
+Reward per step (continuous-joint):
+
+| Component | Coefficient | Notes |
+|---|---|---|
+| HWM height gain | `+5.0 × max(0, com_z − episode_max_com_z)` | not farmable by oscillation |
+| First-touch hold-match | `+5.0` rising-edge | deduped per `(limb, hold_id)` per episode |
+| Slip | `−5.0 × n_slips` | grip force exceeded capacity |
+| Body intersection | `−20.0 × n_contacts` | gates, not shapes |
+| Energy | `−0.005 × Σ ctrl²` | discourages max-torque jitter |
+| Invalid action | `−0.25` | discrete-move only |
+| Terminal | `+100` finish / `−50` fall | |
 
 Drop-in compatible with Stable-Baselines3:
 
@@ -458,20 +491,17 @@ to the next hold rather than teleporting.
 - Stream poses to a browser without exposing MuJoCo to the network.
 
 **You can't yet (next phases):**
-- Solve a route — the A\* solver in `solver/` runs against the 2D
-  reachability checker. A 3D reachability checker on top of
-  `Climb3DWorld` is the natural next step.
-- Use a Hill-type muscle model. The brief asked us to "think about
-  muscles" — we considered it, but a torque-limited PD position
-  servo is the right level of detail for the MVP. Hill muscles add a
-  ~5× model-complexity cost for a marginal RL benefit.
+- Use a Hill-type muscle model. Considered and rejected for the MVP — a
+  torque-limited PD position servo is the right level of detail. Hill
+  muscles add ~5× model complexity for marginal RL benefit.
 - Train policies that complete unseen MoonBoard problems with high
-  reliability — the env runs, but procedural curriculum (random
-  walls of increasing difficulty) is needed to get there.
-- Train policies that generalize to arbitrary unseen walls from a
-  single saved `MlpPolicy` — browser replay now works, but the current
-  observation shape still depends on hold count, so a saved policy is
-  wall/config specific.
+  reliability — the env runs and the observation is wall-size-portable,
+  but a procedural curriculum across many problems is still needed.
+
+**You can now:**
+- Train and replay policies across MoonBoard problems with a single
+  saved `MlpPolicy` — the (127,) observation is invariant to hold count
+  as long as the climber body is unchanged.
 
 ---
 
