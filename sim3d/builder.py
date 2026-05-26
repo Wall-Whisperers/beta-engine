@@ -181,13 +181,15 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
             </body>
 
             <!-- LEFT ARM -->
-            <body name="l_upperarm" pos="{-sw:.4f} 0 {s.spine - 0.05:.4f}">
+            <body name="l_upperarm" pos="{-sw:.4f} 0 {s.spine - 0.12:.4f}">
                 <joint name="l_shoulder_az"   type="hinge" axis="0 1 0" class="j_shoulder"
                        range="{R('shoulder_az')}"   {P('shoulder_az')}/>
                 <joint name="l_shoulder_el"   type="hinge" axis="1 0 0" class="j_shoulder"
                        range="{R('shoulder_el')}"   {P('shoulder_el')}/>
                 <joint name="l_shoulder_roll" type="hinge" axis="0 0 1" class="j_shoulder"
                        range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
+                <geom name="g_l_shoulder" type="sphere" size="0.080" pos="0 0 0"
+                      mass="0.0" rgba="{skin}" contype="0" conaffinity="0"/>
                 {capsule("g_l_upperarm", s.upper_arm, 0.051, m.upper_arm, skin)}
                 <body name="l_forearm" pos="0 0 {-s.upper_arm:.4f}">
                     <joint name="l_elbow" type="hinge" axis="1 0 0" class="j_elbow"
@@ -210,14 +212,22 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                 </body>
             </body>
 
-            <!-- RIGHT ARM -->
-            <body name="r_upperarm" pos="{sw:.4f} 0 {s.spine - 0.05:.4f}">
-                <joint name="r_shoulder_az"   type="hinge" axis="0 1 0" class="j_shoulder"
+            <!-- RIGHT ARM. The body is mirrored across the sagittal (x=0)
+                 plane, so the Y-axis (az) and Z-axis (roll) hinges are
+                 negated relative to the left arm. Without this, a positive
+                 shoulder_az adducts the right arm across the chest instead of
+                 abducting it outward (the "bends the wrong way" bug). X-axis
+                 flexion joints (el, elbow, wrist) stay un-negated — flexion is
+                 mirror-symmetric in the same rotational sense. -->
+            <body name="r_upperarm" pos="{sw:.4f} 0 {s.spine - 0.12:.4f}">
+                <joint name="r_shoulder_az"   type="hinge" axis="0 -1 0" class="j_shoulder"
                        range="{R('shoulder_az')}"   {P('shoulder_az')}/>
                 <joint name="r_shoulder_el"   type="hinge" axis="1 0 0" class="j_shoulder"
                        range="{R('shoulder_el')}"   {P('shoulder_el')}/>
-                <joint name="r_shoulder_roll" type="hinge" axis="0 0 1" class="j_shoulder"
+                <joint name="r_shoulder_roll" type="hinge" axis="0 0 -1" class="j_shoulder"
                        range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
+                <geom name="g_r_shoulder" type="sphere" size="0.080" pos="0 0 0"
+                      mass="0.0" rgba="{skin}" contype="0" conaffinity="0"/>
                 {capsule("g_r_upperarm", s.upper_arm, 0.051, m.upper_arm, skin)}
                 <body name="r_forearm" pos="0 0 {-s.upper_arm:.4f}">
                     <joint name="r_elbow" type="hinge" axis="1 0 0" class="j_elbow"
@@ -241,9 +251,14 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
             </body>
         </body>
 
-        <!-- LEFT LEG -->
+        <!-- LEFT LEG. hip_flex axis is -X (not +X): the climber faces the wall
+             at -Y, so anatomical hip flexion must swing the knee toward the
+             wall (-Y) for high steps. With +X the leg could only flex 20°
+             forward vs 140° backward, so the welds contorted the knee to reach
+             footholds (the "knee bends backward" bug). Foot tip sites point -Y
+             (toes toward the wall), not +Y. -->
         <body name="l_thigh" pos="{-pw:.4f} 0 {-0.06:.4f}">
-            <joint name="l_hip_flex"   type="hinge" axis="1 0 0" class="j_hip"
+            <joint name="l_hip_flex"   type="hinge" axis="-1 0 0" class="j_hip"
                    range="{R('hip_flex')}"   {P('hip_flex')}/>
             <joint name="l_hip_abduct" type="hinge" axis="0 1 0" class="j_hip"
                    range="{R('hip_abduct')}" {P('hip_abduct')}/>
@@ -262,21 +277,22 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                           mass="{m.foot:.3f}" rgba="0.10 0.10 0.10 1"
                           friction="{foot_fric}"/>
                     <site name="{LIMB_TIP_SITE['LF']}"
-                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
+                          pos="0 {-foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
                           size="0.015" rgba="0 1 0 0.6"/>
                     <body name="{LIMB_TIP_BODY['LF']}"
-                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
+                          pos="0 {-foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
                 </body>
             </body>
         </body>
 
-        <!-- RIGHT LEG -->
+        <!-- RIGHT LEG. Y-axis (abduct) and Z-axis (rot) hinges negated vs the
+             left leg for the same mirror reason as the right arm. -->
         <body name="r_thigh" pos="{pw:.4f} 0 {-0.06:.4f}">
-            <joint name="r_hip_flex"   type="hinge" axis="1 0 0" class="j_hip"
+            <joint name="r_hip_flex"   type="hinge" axis="-1 0 0" class="j_hip"
                    range="{R('hip_flex')}"   {P('hip_flex')}/>
-            <joint name="r_hip_abduct" type="hinge" axis="0 1 0" class="j_hip"
+            <joint name="r_hip_abduct" type="hinge" axis="0 -1 0" class="j_hip"
                    range="{R('hip_abduct')}" {P('hip_abduct')}/>
-            <joint name="r_hip_rot"    type="hinge" axis="0 0 1" class="j_hip"
+            <joint name="r_hip_rot"    type="hinge" axis="0 0 -1" class="j_hip"
                    range="{R('hip_rot')}"    {P('hip_rot')}/>
             {capsule("g_r_thigh", s.thigh, 0.086, m.thigh, cloth)}
             <body name="r_shin" pos="0 0 {-s.thigh:.4f}">
@@ -291,10 +307,10 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                           mass="{m.foot:.3f}" rgba="0.10 0.10 0.10 1"
                           friction="{foot_fric}"/>
                     <site name="{LIMB_TIP_SITE['RF']}"
-                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
+                          pos="0 {-foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
                           size="0.015" rgba="0 1 0 0.6"/>
                     <body name="{LIMB_TIP_BODY['RF']}"
-                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
+                          pos="0 {-foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
                 </body>
             </body>
         </body>

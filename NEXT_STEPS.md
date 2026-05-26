@@ -5,237 +5,292 @@
 > roadmap. Prune aggressively; don't let this drift into an audit doc that
 > rots while the code moves.
 >
-> Last reviewed: 2026-05-19.
+> Last reviewed: 2026-05-26.
 
 ---
 
 ## Where we are
 
 The sim3d/ merge landed: one canonical 3D MuJoCo env, fixed-shape (127,)
-observation, `Box(25,)` continuous-joint action with explicit grip intents,
-HWM reward, kickboard support, video rollout callback, no more
-`physics/`/`rl/`/`moonboard-rl/`. Smoke test passes; the env constructs,
-resets without raising, and steps without NaN.
+observation, `Box(25,)` continuous-joint action (21 joint targets in
+[-1,1] + 4 per-limb grip intents), HWM reward, kickboard support, video
+rollout callback (now wired into `train.py` by default), curriculum env,
+MoonBoard train/val/test split. The env constructs, resets to a 4-grip
+seed pose, and steps without NaN.
 
-What we **don't** have yet:
+**The body is a custom 21-DOF humanoid (27 total with the free root) —
+NOT the stock MuJoCo humanoid.** It is anatomically grounded (Winter mass
+fractions, measured segment ratios, climbing-realistic joint limits, PD
+position actuators tuned near critical damping per joint group). This is
+the right accuracy/complexity balance and should be kept.
 
-- A trained policy that completes any MoonBoard problem with > 0% success.
-- A curriculum.
-- Behavior-cloning bootstrap data.
-- An evaluation harness that reports success rate (we only have per-step
-  reward in `episode_stats.csv`).
+**Body fixes landed 2026-05-26** (found by viewing it in `mjpython`): the
+right-side abduction/rotation hinge axes weren't mirrored (so "abduct"
+adducted the right limbs across the body); `hip_flex` pointed the wrong
+way for a wall-facing climber (knee could only flex 20° toward the wall vs
+140° backward, forcing the "knee bends backward" contortion to reach
+footholds); the feet pointed away from the wall (+Y); and the arms floated
+11 cm off the torso (chest ellipsoid tapers to a point at shoulder height).
+Fixed by negating the four mirrored axes + both `hip_flex` axes, flipping
+the foot tip sites to −Y, lowering the shoulder mount, and adding deltoid
+spheres. Symmetric commands now produce symmetric poses; the seed pose
+settles stably with 0 self-intersections on the example wall.
 
-The honest framing: the foundation is in place, but the agent has not yet
-been shown how to climb. The work below is what bridges that gap.
+The lever for "can it learn to climb" is **not** the body — it's the
+training setup below. Do not add DOF until basic climbing trains (more DOF
+= harder exploration).
+
+What we still **don't** have:
+
+- A policy that completes any problem with > 0% success.
+- An episode long enough to climb (see 0.1 — this is the headline bug).
+- A first task the agent can actually solve from random init (curriculum
+  "hang" mode does not exist yet).
+- Obs/reward normalization, or any dense signal toward the next hold.
+- A success-rate eval harness on a held-out split.
+
+Honest framing: the simulator is solid; the **training loop is configured
+in a way that cannot produce a climb**, and the reward landscape has no
+gradient out of "hang still." Phase 0 + Phase A bridge that gap.
 
 ---
 
-## Top priority — make PPO actually learn (Phase A)
+## Phase 0 — train.py defaults make learning impossible (DO THESE FIRST)
 
-These items unblock the first signs of life. Without them, you will burn
-GPU hours watching reward stay flat.
+These are not tuning items. With them unfixed, every run wastes GPU/CPU
+hours producing flat reward, regardless of algorithm.
 
-### A1. Curriculum: start with "hang"
+### 0.1 Episode length is 3.84 s in continuous mode — THE bug
 
-Train a much easier task before climbing: from a 4-point grip on the start
-holds + kickboard, **survive N seconds without falling**. Action space and
-observation are unchanged. Reward is just `+1 per step survived,
-−50 on fall`. This teaches the policy:
+`TrainConfig.max_episode_steps = 30` is passed straight into
+`EnvConfig.max_steps`. In continuous-joint mode each `env.step()` advances
+`sim_substeps(8) × SUBSTEPS_PER_FRAME(8) × PHYS_DT(0.002) = 0.128 s`
+(≈ 7.8 Hz control). So **30 steps = 3.84 s of simulated time** — a human
+takes 10–60 s to climb a MoonBoard problem. The `30` / `move_frames=24`
+defaults are holdovers from `discrete-move` (where 1 step = 1 full limb
+move). Fix: set `max_episode_steps` to **~800–1500** for continuous mode
+(≈ 100–190 s), and stop threading `move_frames`/`move_mode` into the
+continuous env config. Verify with `episode_stats.csv` `length` column.
 
-- Which grip intents keep welds engaged.
-- How to balance joint torques against gravity.
-- The cost of body intersection (so it tucks rather than crosses itself).
+### 0.2 MoonBoard seed pose puts the feet ABOVE the hands
 
-A policy that solves "hang for 10 s" is a much better init for the full
-climb task than random weights. Plan: add `EnvConfig.task_mode` with
-values `hang | reach-one | climb` and gate the reward function on it.
+Confirmed on `sample-problems.json` problem 0 (`Far from the Madding
+Crowd`, starts C5/E6): `_default_seed_kwargs` returns hands on the start
+holds (good) but feet on `mb_E8` (row 8) and `mb_F11` (row 11) — *above*
+the hands at rows 5–6. Root cause: MoonBoard holds are all `hold_type=
+"jug"`, so the `hold_type=="foothold"` foot search finds nothing and
+falls back to "two lowest non-hand route holds," which for a real problem
+are mid-route holds high on the wall. The kickboard exists for exactly
+this (canonical low foot start) but its holds are only appended to
+`hold_meta`, never to `wall.holds`, so `_default_seed_kwargs` can't see
+them (confirmed: feet never land on `kb_*`). Fix: expose kickboard holds
+through the `Wall` object (or have `_default_seed_kwargs` consult
+`hold_meta`) and prefer kickboard/low footholds for the foot seed. Until
+this is fixed, MoonBoard episodes start from a physically absurd pose.
 
-### A2. Behavior cloning from the discrete-move expert
+### 0.3 Seed pose looks like a deep frog squat (naturalness, not joints)
 
-`discrete-move` still works. It uses the Cartesian-impedance reach
-controller, which is a hand-tuned "expert" that succeeds on simple beta
-sequences. Idea:
+The forearm-through-chest intersection that used to fire here is now gone
+(lowering the shoulder mount fixed it — 0 intersections at the example-wall
+seed). What remains is *pose quality*: `seed_pose` drops the pelvis low
+(crouch branch sets `pelvis_z = 0.5·(foot_z + hand_z)`), so on the example
+wall the hips flex ~100–120° and the legs splay horizontally to reach
+wide-spaced footholds. The joints are anatomically correct now; the pose
+just isn't a natural climbing stance. Fix: bias the seed pelvis higher
+(more leg extension) and prefer narrower/lower footholds, then re-view in
+`mjpython`. Verify the 0-intersection result also holds on a MoonBoard
+problem (only checked the example wall so far).
 
-1. Generate ~10k (obs, joint-target, grip-intent) tuples by running
-   discrete-move with a scripted beta on each MoonBoard problem.
-2. BC-pretrain the PPO MlpPolicy on those tuples (Stable-Baselines3
-   supports this via `imitation` library or a custom dataset).
-3. Fine-tune with PPO on the full reward.
+### 0.4 The neutral action releases every grip
 
-This avoids the "random 25-D Gaussian for 1M steps does nothing" failure
-mode that pure-from-scratch PPO has on humanoid manipulation.
+Action grip-intent semantics: `intent > 0` engages, `intent ≤ 0` releases.
+SB3's Gaussian policy initializes at mean 0, `log_std=0` (std 1.0), so on
+step 1 each of the 4 grips is positive ~50% of the time and the 21 joint
+targets are ~N(0,1) noise → the body releases ~2 limbs and flails off the
+wall almost immediately. Combined with 0.1/0.3 this means early training
+is dominated by `fall (−50)` and intersection penalties. Options: (a) lower
+`log_std_init` (e.g. −1.5) so the policy starts near "hold the seed pose";
+(b) flip semantics so the *zero* action holds the current grips and the
+agent must act to release; (c) forbid releasing a grip when it would drop
+below 2 contacts. (a) is the cheapest and should be done alongside A3.
 
-### A3. Pretrain on jug walls before MoonBoard
+---
+
+## Phase A — make PPO actually learn (after Phase 0)
+
+### A1. Curriculum: start with "hang", then "reach-one"
+
+Add `EnvConfig.task_mode ∈ {hang, reach-one, climb}` and gate the reward:
+
+- **hang** — from the 4-grip seed, reward `+1 per step survived, −50 on
+  fall`, episode caps at N seconds. Teaches which grip intents keep welds
+  engaged and how to balance joint torque against gravity. Solvable from
+  near-random init, unlike the full climb.
+- **reach-one** — hang, then move one hand to a single target hold for a
+  big bonus. Teaches release→reach→regrip.
+- **climb** — the current full reward.
+
+A policy that solves "hang 10 s" is a far better init than random weights.
+This is the single most important new capability — without an achievable
+first task the reward is flat and PPO converges to "do nothing."
+
+### A2. Dense potential-based shaping toward the next hold (NEW)
+
+The goal vectors are already in the observation but **not in the reward**.
+Add a potential-based shaping term `γ·Φ(s') − Φ(s)` where `Φ` is e.g.
+`−(distance from the nearest free limb to the nearest higher on-route
+hold)`. Potential-based shaping does not change the optimal policy but
+gives a smooth gradient that turns "randomly land within 5 cm of a hold"
+(near-zero probability) into a climbable hill. Pairs with A1; arguably do
+both before reaching for BC.
+
+### A3. VecNormalize + continuous-control PPO hyperparameters (NEW)
+
+`train.py` wraps the env in a bare `DummyVecEnv`/`SubprocVecEnv` — **no
+`VecNormalize`**, and PPO runs on SB3 defaults (no `gae_lambda`,
+`ent_coef`, `n_epochs`, `clip_range`, `log_std_init`). The observation
+contains raw world positions (pelvis up to ~3 m, com, hold offsets) and
+joint velocities at very different scales — unnormalized this is a known
+PPO failure mode on MuJoCo. Do: wrap in `VecNormalize(norm_obs=True,
+norm_reward=True, clip_obs=10)` (and save/load its stats with the model);
+bump `gamma` to ~0.997 (the effective horizon at 7.8 Hz and 0.99 is only
+~13 s); raise `n_steps × n_envs` to ≥ 2048–4096; set a small `ent_coef`
+(e.g. 0.001) for exploration; lower `log_std_init` per 0.4.
+
+### A4. Behavior cloning from the discrete-move expert
+
+`discrete-move` + the Cartesian-impedance reach controller is a working
+hand-tuned expert. Generate ~10k `(obs, joint-target, grip-intent)` tuples
+by running scripted betas, BC-pretrain the MlpPolicy, then PPO fine-tune.
+Avoids the "random 25-D Gaussian for 1 M steps does nothing" mode. Do this
+only if A1–A3 still stall — it's more work than the shaping/curriculum.
+
+### A5. Pretrain on jug walls before MoonBoard
 
 `data/walls/` has hand-designed walls with `jug` holds and generous
-spacing. Train on those first (positivity 1.0, max_force_n high). Move
-the trained checkpoint to MoonBoard crimps as a starting point. The
-observation shape is the same, so weights transfer directly.
+spacing (positivity 1.0, high max_force). Train there first; transfer the
+checkpoint to MoonBoard crimps. Obs shape is identical, so weights port
+directly. Note: jug walls already carry `foothold`-type holds, so they
+avoid the 0.2 feet-above-hands seed problem — a good reason to start here.
 
-### A4. Reduce GRIP_PROXIMITY_M and / or require proximity + alignment
+### A6. Tighten grip engagement (proximity + alignment)
 
-At 5 cm with K-nearest sort, a flailing limb can accidentally engage a
-grip without the policy ever learning to "place" the limb. Either drop
-proximity to 2 cm, or require both proximity AND a positive dot product
-between the limb's contact normal and the hold's outward normal (use the
-`wall_normal` field already in `hold_meta`).
+At 5 cm with a closest-hold sort, a flailing limb can engage a grip the
+policy never learned to "place." Either drop `GRIP_PROXIMITY_M` to ~2 cm,
+or require both proximity AND a positive dot product between the limb's
+approach direction and the hold's `wall_normal` (already in `hold_meta`).
 
 ---
 
-## Phase B — Reward and observation tuning (after Phase A shows signal)
+## Phase B — reward & observation tuning (after Phase A shows signal)
 
 ### B1. Profile the energy penalty
 
-`−0.005 × Σ ctrl²` over 21 joints with [-1, 1] ranges can easily reach
-~0.1 per step. HWM gains for a typical 1-cm com_z increment are
-`5.0 × 0.01 = 0.05`. The energy penalty currently dominates small-
-progress steps, which may discourage the slow careful moves we want.
-Either:
-
-- Drop `energy_penalty_coeff` to 0.001.
-- Normalise the penalty by `nu` so it doesn't scale with body DOF.
-- Switch to penalising squared torque output (post-ctrl) rather than
-  ctrl input.
+`−0.005 × Σ ctrl²` over 21 joints can reach ~0.1/step; a 1 cm com_z HWM
+gain is only +0.05. The penalty currently outweighs the slow careful
+moves we want. Drop `energy_penalty_coeff` to ~0.001, or normalize by
+`nu`, or penalize post-clip torque rather than ctrl input.
 
 ### B2. Smooth the finish-distance observation
 
-`obs[-1]` is the distance from the highest gripped hand to the nearest
-finish. When the agent releases its highest hand, this number jumps
-discontinuously to a (lower) hand's height. Could destabilise the value
-function. Options: EMA over the last few steps, or always use the
-geometric max of all four limb tips.
+`obs[-1]` (highest gripped hand → nearest finish) jumps discontinuously
+when the highest hand releases. EMA it, or always use the geometric max
+of all four limb tips, to avoid destabilizing the value function.
 
-### B3. Per-hold capacity sanity check
+### B3. Add an on-route / grippable flag to the K-nearest holds (NEW)
+
+With MoonBoard `include_full_board=True` there are 198 holds and
+`official_route_only=True` masks all but the current route — but the
+observation's per-hold role one-hot is only `[start, mid, finish]`, so an
+**off-route grey hold and an on-route mid hold look identical** to the
+policy. The 8 nearest holds may be mostly ungrippable, and the agent can't
+tell. Add an `is_eligible_for_this_limb` channel (or drop ineligible holds
+from the K-nearest sort). High impact for the generalized MoonBoard task.
+
+### B4. Per-hold capacity sanity check
 
 `FOOT_FORCE_MULTIPLIER = 1.5` is a guess. Compare against real climber
-power output (Goddard & Neumann, or the Lattice grip-strength dataset).
-If feet are over-strong, the agent will discover unphysical heel-hook
-betas that aren't representative.
+power (Goddard & Neumann, or the Lattice grip dataset). Over-strong feet
+let the agent discover unphysical heel-hook betas.
 
 ---
 
-## Phase C — Evaluation infrastructure (mostly missing)
+## Phase C — evaluation infrastructure (mostly missing)
 
-### C1. Success rate, not just reward
+### C1. Success rate, not just per-episode outcome
 
-Add `success` and `n_finished_seeds` columns to `episode_stats.csv`.
-Write a `sim3d/eval.py` that runs N=100 episodes with different seeds
-on a held-out problem and prints `success rate ± stderr`. Wire it into
-`train.py` as a periodic callback.
+`episode_stats.csv` already logs an `outcome` column, so success rate is
+derivable post-hoc — but there is no `sim3d/eval.py` that runs N=100 seeds
+on a held-out problem and reports `success rate ± stderr`, and no periodic
+eval callback. Build it and wire it into `train.py`.
 
-### C2. Video callback should ship by default
+### C2. Held-out validation is configured but never evaluated
 
-`sim3d/callbacks.py::VideoRolloutCallback` exists but is not wired into
-`sim3d/train.py`. Add a `--video-freq` CLI flag (0 = disabled, > 0 =
-mp4 every N steps). This is the single most useful thing for noticing
-"the policy looks crazy but reward is going up" failure modes.
-
-### C3. Held-out split is configured but unverified
-
-`TrainConfig` has `moonboard_split=train|validation|test`. The split is
-deterministic given `split_seed`, but no evaluation actually loads the
-validation split mid-training. Add a periodic eval-on-validation in the
-callback chain so we can detect overfitting to a single problem.
+`TrainConfig.moonboard_split` splits train/val/test deterministically, but
+nothing loads the validation split mid-training. Add a periodic
+eval-on-validation callback so we can detect overfitting to a single
+problem. (Video rollout already ships by default — that earlier TODO is
+done; don't re-add it.)
 
 ---
 
-## Phase D — Performance and infra
+## Phase D — performance & infra
 
 ### D1. MoonboardClimbing3DEnv rebuilds the MjModel every reset
 
-`_build_env` is called from `reset` to swap the problem. Building MJCF
-and compiling `MjModel.from_xml_string` takes ~30–100 ms. With ~2000
-steps per episode and ~5–20 episodes/min, this is bearable; with PPO
-vec-envs hitting reset on done flags, it can dominate. Caching trick:
-maintain a dict `{problem_id: MoonboardClimbing3DEnv}` and round-robin
-through it instead of rebuilding.
+`_build_env` recompiles MJCF on every `reset` to swap the problem
+(~30–100 ms). With vec-envs hitting reset on done flags this can dominate.
+Cache `{problem_id: env}` and round-robin instead of rebuilding.
 
-### D2. The grip search is O(n_holds) per intent per step
+### D2. Grip search is O(n_holds) per intent per step
 
-`_maybe_engage_grip` scans every hold in the wall on every step where
-any limb intent is positive. For MoonBoard's 198 holds × 4 limbs ×
-2000 steps × 8 vec-envs, that's ~12M distance checks per minute. Use a
-KD-tree built once at construction.
+`_maybe_engage_grip` scans every hold whenever any intent is positive
+(198 holds × 4 limbs × ~1000 steps × n_envs). Build a KD-tree once at
+construction.
 
-### D3. Wire `imageio` into the default install if we ship videos
+### D3. Pin imageio in requirements
 
-`requirements.txt` should pin `imageio` and `imageio-ffmpeg` so the
-video callback works out of the box. Today it silently no-ops if the
-import fails.
+`requirements.txt` should pin `imageio` + `imageio-ffmpeg` so the video
+callback works out of the box instead of silently no-opping.
 
 ---
 
-## Phase E — Body model and physics (longer horizon)
+## Phase E — body model & physics (longer horizon, only after it climbs)
 
-### E0. Seed pose puts the right forearm 7 cm through the chest
+### E1. Spine has 1 DOF (forward lean only)
 
-Confirmed at reset on the MoonBoard `sample-problems.json` problem 0:
-`body_intersection_count() == 1`, contact = `g_r_forearm` penetrating
-`g_chest` by 0.073 m. Root cause: `world.seed_pose` welds both hands to
-their start holds without computing elbow positions explicitly — the
-solver picks an arm configuration where the forearm capsule folds across
-the chest ellipsoid. Once welded, the contact constraint and the weld
-fight each other and the body twists trying to resolve both. Symptoms in
-the viewer: the body appears to "twist its body parts" at reset and the
-twist persists for the first few steps of each episode.
+Real climbers twist and lean laterally (gaston, drop-knee, cross-through).
+The single `spine_lean` hinge blocks all of these. Two more spine hinges
+(lateral + rotational) unlock the most common 3D moves the policy
+currently cannot perform — but they also enlarge the action space and make
+exploration harder, so defer until the agent reliably climbs with 1-DOF.
 
-Two clean fixes:
+### E2. No finger DOF
 
-- **(preferred)** Run a small explicit IK pass inside `seed_pose` after
-  the welds are placed: for each hand, compute a desired elbow position
-  that keeps the forearm away from the chest (elbow points outward, not
-  inward), set that joint target before the gravity ramp.
-- **(quick)** Reduce the chest ellipsoid depth from 0.115 → 0.085 in
-  `builder._build_climber_xml`. The chest then sits 3 cm thinner and the
-  forearm clears it on most start configurations. Loses a little
-  anatomical fidelity but eliminates the constant 1-intersection
-  background signal.
-
-### E1. Validate the kickboard with the seed pose
-
-The kickboard's foot-only holds sit at `±0.244 m` and `z ≈ 0.27 m`. The
-default `_default_seed_kwargs` looks for foot holds in `self.wall.holds`
-by `hold_type == "foothold"`. The kickboard holds are *added to
-`hold_meta`* but not back-propagated into `self.wall.holds`. So the seed
-pose for MoonBoard problems probably uses route holds as foot anchors,
-not the kickboard. **Open question: is the kickboard ever actually
-engaged at reset?** Fix: expose kickboard holds through the Wall object
-or extend `_default_seed_kwargs` to consult `hold_meta`.
-
-### E2. Custom body has wrist hinges but no finger DOF
-
-This is by design (CLAUDE.md), but it means the policy can't model
-crimp vs jug differently except through grip-force capacity. If we
-later want to predict per-hold grade difficulty for specific climber
-strengths, finger flexor strength becomes a missing feature.
-
-### E3. Spine has 1 DOF (forward lean only)
-
-Real climbers twist the torso to reach across (gaston, drop-knee). The
-current spine joint blocks any such move. Two more spine hinges
-(lateral and rotational) would unlock the most common 3D climbing moves
-the policy currently cannot perform.
+By design (CLAUDE.md): crimp vs jug is modeled only through grip-force
+capacity, not finger flexion. Fine for now; revisit only if we later
+predict per-hold grade difficulty for specific climber strengths.
 
 ---
 
 ## Things you should NOT do
 
-- Switch the default action mode back to `discrete-move` because PPO is
-  slow to converge in continuous-joint. The discrete mode hides the
-  problem we're actually trying to solve. Use it only as an expert for
-  BC pretraining (A2).
-- Replace the custom climber with the stock Gymnasium humanoid because
-  "the stock one trains faster." It trains faster because it's tuned
-  for locomotion, not climbing. Climbing reward signals are sparse; the
-  body's anatomical constraints matter.
-- Add `KNOWN_ISSUES.md`, `ARCH_REVIEW.md`, or per-Phase progress
-  trackers. This file is the only roadmap. Keep it pruned.
+- Switch to `discrete-move` as the default because continuous PPO is slow.
+  That hides the problem we're solving. Keep it only as the BC expert (A4).
+- Replace the custom climber with the stock Gymnasium humanoid because "it
+  trains faster." It trains faster because it's tuned for locomotion, not
+  climbing; switching throws away the anatomical grounding, joint limits,
+  and the hold-attach machinery. The training-loop fixes (Phase 0/A), not
+  the body, are what unblock learning.
+- Add DOF to the body before it can climb with the current DOF. More joints
+  = harder exploration; earn the complexity later (E1).
+- Add `KNOWN_ISSUES.md`, `ARCH_REVIEW.md`, or per-phase trackers. This file
+  is the only roadmap. Keep it pruned.
 
 ---
 
 ## Tracking
 
 When you finish an item, **delete it from this file**, then add one or two
-sentences to the relevant section of `CLAUDE.md` if the item changed the
-permanent architectural contract. Cumulative changelog lives in git; this
-file is for "what's next."
+sentences to `CLAUDE.md` if it changed the permanent architectural
+contract. Cumulative changelog lives in git; this file is for "what's next."
