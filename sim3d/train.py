@@ -77,6 +77,18 @@ class TrainConfig:
     device: str = "auto"                # SB3/PyTorch device: auto | cpu | cuda
     video_freq: int = 100_000           # env-steps between mp4 rollouts (0 = disable)
     checkpoint_first_at: int = 1024     # env-step at which to save model_first.zip
+    # Curriculum training (procedural wall generator + auto difficulty)
+    curriculum: bool = False
+    curriculum_start_difficulty: float = 0.0
+    curriculum_min_difficulty: float = 0.0
+    curriculum_max_difficulty: float = 1.0
+    curriculum_window: int = 20
+    curriculum_up_threshold: float = 0.60
+    curriculum_down_threshold: float = 0.20
+    curriculum_difficulty_step: float = 0.05
+    curriculum_gen_cols: int = 12
+    curriculum_gen_rows: int = 18
+    curriculum_fallback_wall: str = "example-v2-boulder"
 
 
 class _EpisodeStatsCallback:
@@ -105,6 +117,7 @@ class _EpisodeStatsCallback:
                 outer._writer.writerow([
                     "episode", "total_steps", "reward", "length",
                     "outcome", "final_com_z", "n_slips", "body_intersections",
+                    "curriculum_difficulty",
                 ])
 
             def _on_step(self) -> bool:
@@ -135,6 +148,7 @@ class _EpisodeStatsCallback:
                         round(float(com[2]), 3),
                         int(info.get("slips", 0)),
                         int(info.get("body_intersections", 0)),
+                        round(float(info.get("curriculum_difficulty", 0.0)), 4),
                     ])
                 outer._fh.flush()
                 return True
@@ -214,6 +228,24 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
                 config=env_cfg,
                 vertical_projection=cfg.moonboard_vertical_projection,
             )
+
+        if cfg.curriculum:
+            from sim3d.curriculum import CurriculumEnv, CurriculumConfig
+            from solver.wall import DEFAULT_CELL_SIZE_CM
+            cur_cfg = CurriculumConfig(
+                start_difficulty=cfg.curriculum_start_difficulty,
+                min_difficulty=cfg.curriculum_min_difficulty,
+                max_difficulty=cfg.curriculum_max_difficulty,
+                window=cfg.curriculum_window,
+                up_threshold=cfg.curriculum_up_threshold,
+                down_threshold=cfg.curriculum_down_threshold,
+                difficulty_step=cfg.curriculum_difficulty_step,
+                gen_cols=cfg.curriculum_gen_cols,
+                gen_rows=cfg.curriculum_gen_rows,
+                gen_cell_size_cm=DEFAULT_CELL_SIZE_CM,
+                fallback_wall=cfg.curriculum_fallback_wall,
+            )
+            return CurriculumEnv(cur_cfg, profile=profile, env_config=env_cfg)
 
         wall = load_wall(cfg.wall)
         return Climbing3DEnv(wall, profile=profile, config=env_cfg)
@@ -406,6 +438,26 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Parallel environment workers. Use >1 to speed up CPU-bound MuJoCo rollouts.")
     p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
                    help="PyTorch device for PPO policy updates. Env simulation still runs on CPU.")
+    p.add_argument("--curriculum", action="store_true",
+                   help="Train on procedurally generated walls with automatic difficulty scheduling.")
+    p.add_argument("--curriculum-start-difficulty", type=float, default=0.0,
+                   help="Starting difficulty level (0.0=easy jugs, 1.0=hard crimps). Default: 0.0")
+    p.add_argument("--curriculum-max-difficulty", type=float, default=1.0,
+                   help="Difficulty ceiling. Default: 1.0")
+    p.add_argument("--curriculum-window", type=int, default=20,
+                   help="Rolling window of episodes for success-rate computation. Default: 20")
+    p.add_argument("--curriculum-up-threshold", type=float, default=0.60,
+                   help="Success rate above which difficulty increases. Default: 0.60")
+    p.add_argument("--curriculum-down-threshold", type=float, default=0.20,
+                   help="Success rate below which difficulty decreases. Default: 0.20")
+    p.add_argument("--curriculum-difficulty-step", type=float, default=0.05,
+                   help="Difficulty increment per up-tick (halved for down-ticks). Default: 0.05")
+    p.add_argument("--curriculum-cols", type=int, default=12,
+                   help="Grid columns for generated walls. Default: 12")
+    p.add_argument("--curriculum-rows", type=int, default=18,
+                   help="Grid rows for generated walls. Default: 18")
+    p.add_argument("--curriculum-fallback-wall", default="example-v2-boulder",
+                   help="Wall id to use if generation fails. Default: example-v2-boulder")
     args = p.parse_args(argv)
 
     cfg = TrainConfig(
@@ -438,6 +490,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         device=args.device,
         video_freq=args.video_freq,
         checkpoint_first_at=args.checkpoint_first_at,
+        curriculum=args.curriculum,
+        curriculum_start_difficulty=args.curriculum_start_difficulty,
+        curriculum_max_difficulty=args.curriculum_max_difficulty,
+        curriculum_window=args.curriculum_window,
+        curriculum_up_threshold=args.curriculum_up_threshold,
+        curriculum_down_threshold=args.curriculum_down_threshold,
+        curriculum_difficulty_step=args.curriculum_difficulty_step,
+        curriculum_gen_cols=args.curriculum_cols,
+        curriculum_gen_rows=args.curriculum_rows,
+        curriculum_fallback_wall=args.curriculum_fallback_wall,
     )
     train(cfg)
     return 0
