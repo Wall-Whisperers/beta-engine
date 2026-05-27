@@ -66,9 +66,23 @@ class EnvConfig:
     # single-step HWM gain. This makes self-intersecting poses an outright
     # negative-EV action rather than a shaping nudge.
     body_intersection_penalty: float = 20.0
-    energy_penalty_coeff: float = 0.005          # × Σ ctrl²
+    energy_penalty_coeff: float = 0.001          # × Σ ctrl² (was 0.005 — too large vs HWM)
     invalid_action_penalty: float = 0.25
+    # Dense finish-approach shaping (potential-based).
+    # Per-step reward = finish_approach_coeff × (prev_dist − cur_dist).
+    # Positive when the highest gripped hand moves closer to the finish hold.
+    # Gives a smooth gradient across the whole episode; set ~1.0–3.0.
+    finish_approach_coeff: float = 0.0
+    # Per-step survival bonus — fraction of limbs currently gripped × coeff.
+    # Teaches "stay on the wall" before the height signal kicks in.
+    survival_bonus_coeff: float = 0.0
     enable_slip: bool = True
+    # Grip intent deadband.  Any intent in (-grip_intent_deadband,
+    # +grip_intent_deadband) leaves the current grip state unchanged.
+    # A zero-centred Gaussian policy (SB3 default) releases grips on
+    # ~50 % of steps when deadband=0, causing an immediate fall.  Set
+    # to ~0.2 so near-zero actions default to "hold what you have".
+    grip_intent_deadband: float = 0.0
     seed_pose: bool = True
     seed_kwargs: dict = field(default_factory=dict)
     start_mode: str = "seed"                     # "seed" | "ground-reach"
@@ -167,6 +181,7 @@ class Climbing3DEnv(gym.Env):
         self._max_com_z = 0.0
         self._holds_matched_this_episode: set[tuple[str, str]] = set()
         self._prev_grip: dict[Limb, Optional[str]] = {l: None for l in LIMBS}
+        self._prev_finish_dist: float = 0.0    # for dense finish-approach shaping
 
     # ─── Gym API ──────────────────────────────────────────────────────
     def reset(
@@ -217,6 +232,7 @@ class Climbing3DEnv(gym.Env):
         self._max_com_z = float(self.world.com()[2])
         self._holds_matched_this_episode = set()
         self._prev_grip = {l: self.world.on_hold(l) for l in LIMBS}
+        self._prev_finish_dist = self._finish_dist()
         return self._obs(), self._info()
 
     # ─── Pose seeding helpers (unchanged from prior implementation) ──
@@ -318,8 +334,31 @@ class Climbing3DEnv(gym.Env):
                     match_bonus += self.cfg_env.hold_match_bonus
             self._prev_grip[limb] = cur
 
+        # Dense finish-approach shaping — potential-based so it cannot be
+        # exploited by oscillating near the finish without touching it.
+        # Φ(s) = −dist(highest_hand, finish).  Shaping = Φ(s') − Φ(s)
+        #       = prev_dist − cur_dist  (positive when hand moved closer).
+        approach_reward = 0.0
+        if self.cfg_env.finish_approach_coeff > 0.0:
+            cur_dist = self._finish_dist()
+            approach_reward = self.cfg_env.finish_approach_coeff * (
+                self._prev_finish_dist - cur_dist
+            )
+            self._prev_finish_dist = cur_dist
+
+        # Per-step survival bonus: fraction of 4 limbs currently gripped.
+        # Teaches the agent to hold the wall before it learns to climb it.
+        survival_reward = 0.0
+        if self.cfg_env.survival_bonus_coeff > 0.0:
+            n_gripped = sum(
+                1 for l in LIMBS if self.world.on_hold(l) is not None
+            )
+            survival_reward = self.cfg_env.survival_bonus_coeff * n_gripped / len(LIMBS)
+
         reward = (
             height_reward
+            + approach_reward
+            + survival_reward
             + match_bonus
             - self.cfg_env.slip_penalty * slips
             - self.cfg_env.body_intersection_penalty * body_intersections
@@ -371,14 +410,27 @@ class Climbing3DEnv(gym.Env):
 
         # Grip intents come *before* stepping physics so the welds can hold
         # the body through the upcoming substeps.
+        #
+        # Deadband semantics (grip_intent_deadband = db):
+        #   intent >  db  →  try to engage (if tip near an eligible hold)
+        #   intent < -db  →  release (if currently gripping)
+        #   else          →  hold current grip state unchanged
+        #
+        # With SB3's default Gaussian init (mean=0, std=1), without a
+        # deadband every limb releases on ~50% of steps → immediate fall.
+        # A deadband of 0.2 combined with log_std_init=-1.5 (std≈0.22)
+        # means ~85% of steps hold the current grip, giving PPO time to
+        # discover the height reward before the body hits the floor.
+        db = self.cfg_env.grip_intent_deadband
         intents = action[n: n + 4]
         for i, limb in enumerate(LIMBS):
-            intent = float(intents[i]) if i < len(intents) else -1.0
-            if intent > 0.0:
+            intent = float(intents[i]) if i < len(intents) else 0.0
+            if intent > db:
                 self._maybe_engage_grip(limb)
-            else:
+            elif intent < -db:
                 if self.world.on_hold(limb) is not None:
                     self.world.release_limb(limb)
+            # else: inside deadband — leave grip state unchanged
 
         slips = self.world.step(
             self.cfg_env.sim_substeps,
@@ -460,6 +512,22 @@ class Climbing3DEnv(gym.Env):
 
     def decode_move(self, action: int) -> tuple[Limb, str]:
         return LIMBS[action // self.n_holds], self._hold_ids[action % self.n_holds]
+
+    # ─── Helpers ─────────────────────────────────────────────────────
+    def _finish_dist(self) -> float:
+        """Euclidean distance from the highest gripped hand (or highest hand
+        tip if no hand is gripped) to the nearest finish hold."""
+        finish_positions = [
+            np.array(self.world._hold_meta_by_id[h]["world_pos"])
+            for h in self._finish_hold_ids
+        ]
+        hand_tips = [(self.world.limb_tip_pos(l), l) for l in ("LH", "RH")]
+        gripped = [(pos, l) for pos, l in hand_tips
+                   if self.world.on_hold(l) is not None]
+        ref_pos = max(gripped or hand_tips, key=lambda pl: pl[0][2])[0]
+        return float(min(
+            np.linalg.norm(fp - ref_pos) for fp in finish_positions
+        ))
 
     # ─── Observation / info ──────────────────────────────────────────
     def _obs(self) -> np.ndarray:

@@ -1,55 +1,273 @@
-# Climbing Beta Engine — Team Context
+# Climbing Beta Engine — Architectural Contract
 
-## What This Is
-
-An app that takes a photo of a climbing wall, extracts hold positions into a structured world model, and generates a personalized move sequence (beta) based on the user's height and wingspan.
-
-The core insight: don't feed raw images into a solver. Extract a structured representation first, then solve on that. This makes the system tractable and debuggable.
-
-**Pipeline:**
-```
-Photo(s) → Hold Detection → World Model (JSON) → Body Model + IK → Solver → Move Sequence
-```
+> This file is the authoritative reference for AI collaborators and human
+> developers alike. It captures decisions, invariants, and things that must
+> **not** change without team discussion. Keep it accurate; delete stale
+> sections rather than appending to them. Cumulative history lives in git.
 
 ---
 
-## Current Status
+## What This Is
 
-**Phase 1 is complete.** The wall grid editor (`beta-engine`) is built and running:
-- Flask backend serving a REST API for wall CRUD (`/api/walls`)
-- Vanilla JS frontend with a grid-based hold editor
-- Hold placement, types, orientations, start/finish markers
-- Save/load/delete walls as JSON, download/upload, live JSON panel
-- Docker + docker-compose for consistent dev environments
-- Example wall seeded on startup (`example-v2-boulder`)
+An RL agent that learns to climb a MoonBoard by **continuously controlling a
+custom 27-DOF humanoid** in MuJoCo. The agent emits joint position targets
+and grip intents every control step — there is no discrete "snap to hold"
+teleportation in the primary training mode. The body must discover climbing
+from proprioception plus the 3D positions of the holds around it.
 
-**What's missing before Phase 2:**
-- No body model or IK solver yet
-- No reachability checker
-- No route/move-sequence concept in the schema (holds aren't ordered)
-- No real-world scale (cells have no cm/inch mapping — reachability can't be computed)
+```
+Wall JSON  →  MuJoCo MJCF  →  27-DOF climber  →  Gymnasium env  →  PPO policy
+                                                      ↑ Box(25,) action
+                                                      ↓ (127,) observation
+```
+
+**The long-term goal is continuous muscle-level control** — an agent that
+drives joint torques coordinated by something closer to muscle activation
+patterns, the way a real climber uses their body. The current PD-servo
+actuators are a tractable first step toward that goal.
+
+---
+
+## Repository Layout
+
+```
+beta-engine/
+├── grid_editor/         # Flask backend + REST API for the wall editor
+│   └── server.py
+├── solver/              # 2D IK + A* (editor planning preview + wall gen)
+│   ├── wall.py          # JSON loader + grid-to-cm conversion
+│   ├── body.py          # 5-point stick figure + 2-link IK
+│   ├── reachability.py
+│   ├── astar.py
+│   └── generate.py      # procedural wall generator for curriculum
+├── sim3d/               # MuJoCo 3D simulator + Gymnasium env + PPO trainer
+│   ├── config.py        # all physics + reward constants (single source of truth)
+│   ├── body.py          # ClimberProfile dataclass + segment math + limb names
+│   ├── builder.py       # build_mjcf_xml(wall, profile) → (xml, hold_meta)
+│   ├── world.py         # Climb3DWorld: MjModel/MjData + grip + slip + reach
+│   ├── obs.py           # build_observation → fixed-shape (127,) vector
+│   ├── env.py           # Climbing3DEnv — Gymnasium wrapper
+│   ├── moonboard_env.py # MoonboardClimbing3DEnv — samples problems per reset
+│   ├── moonboard.py     # MoonBoard problem JSON → Wall adapter
+│   ├── curriculum.py    # CurriculumEnv — new synthetic wall every episode
+│   ├── callbacks.py     # VideoRolloutCallback, FirstMidLastCheckpointCallback
+│   ├── train.py         # SB3 PPO trainer + episode CSV logger
+│   ├── viewer.py        # native MuJoCo viewer wrapper
+│   ├── web.py           # Flask blueprint for the Three.js browser viewer
+│   └── __main__.py      # `python -m sim3d` CLI (incl. --play <model.zip>)
+├── schemas/             # wall.schema.json (locked — see §Hold JSON Schema)
+├── static/              # vanilla-JS editor + sim3d browser viewer
+└── data/
+    ├── examples/        # seeded example walls (in git)
+    ├── walls/           # user-saved walls (gitignored)
+    ├── moonboard/       # MoonBoard problem corpus
+    └── runs/sim3d/      # PPO run outputs (gitignored except config.json)
+```
 
 ---
 
 ## Stack
 
-| Layer | Choice |
-|---|---|
-| Backend | Python 3.11+, Flask (MVP) → FastAPI (later) |
-| Frontend | Vanilla JS + HTML canvas (current) → React (later) |
-| ML / CV | YOLOv8 (hold detection), PyTorch (RL solver) |
-| IK / Math | NumPy, ikpy or custom 2D geometric solver |
-| Infra | Docker + docker-compose |
-| Data | JSON files in `/data/walls/` |
+| Layer | Choice | Notes |
+|---|---|---|
+| Backend | Python 3.11+, Flask | REST API for wall CRUD + sim3d web bridge |
+| Frontend | Vanilla JS + HTML | No build step. Three.js for 3D viewer. |
+| 3D Physics | MuJoCo 3.2.6 | Industry-standard humanoid RL; great contact solver |
+| RL | Stable-Baselines3 2.x, PPO | MlpPolicy, continuous action |
+| RL Interface | Gymnasium 1.x | Drop-in SB3 compatible |
+| IK / Math | NumPy | Custom 2D geometric IK for the editor solver |
+| Infra | Docker + docker-compose | Consistent dev env |
+| Data | JSON files in `data/` | Wall schema is the contract |
 
 ---
 
-## Hold JSON Schema (locked — discuss before changing)
+## Current Status (as of 2026-05-27)
+
+### ✅ Done
+
+- **Wall grid editor** — Flask REST API + vanilla-JS frontend. Hold
+  placement, types (jug/crimp/sloper/pinch/foothold), orientations,
+  start/finish markers. Save/load/delete JSON walls. Docker + compose.
+- **3D MuJoCo simulator** — custom 27-DOF anatomically-grounded humanoid,
+  wall/kickboard MJCF builder, grip via mocap+weld constraints, slip model,
+  Cartesian-impedance reach controller, body intersection penalty.
+- **Body physics correct** — right-side hinge axes mirrored; hip_flex
+  points the right way for a wall-facing climber; feet toward wall; shoulder
+  mount at correct height; deltoid spheres added. Zero self-intersections
+  at seed pose on the example wall (verified in `mjpython` 2026-05-26).
+- **Gymnasium env** — `Climbing3DEnv` + `MoonboardClimbing3DEnv`. Fixed
+  obs shape (127,) and action shape (25,) regardless of wall size.
+  Drop-in compatible with SB3 `PPO("MlpPolicy", env)`.
+- **PPO training pipeline** — `sim3d.train`, episode CSV + TensorBoard,
+  video rollout callback, first/mid/last checkpoints, parallel envs, GPU.
+- **MoonBoard adapter** — loads problem JSON, kickboard support, train/val/
+  test split, vertical-projection geometry option.
+- **Curriculum env** — generates new synthetic walls per episode, automatic
+  difficulty scheduling by rolling success rate.
+- **Browser viewer** — Flask blueprint + Three.js client; replay a trained
+  `model.zip` without a native display.
+
+### ⚠️ What Doesn't Work Yet
+
+The simulator and body are solid. **The training loop has known blockers
+that prevent any learning**, documented fully in `NEXT_STEPS.md`:
+
+1. **Episode length = 30 steps = 3.84 s** — a real MoonBoard problem
+   takes 10–60 s. Fix: `max_episode_steps` → 800–1500.
+2. **MoonBoard seed pose puts feet above hands** — kickboard holds not
+   exposed to `_default_seed_kwargs`. Fix: expose kickboard holds through
+   the Wall object.
+3. **Neutral action releases all grips** — SB3's Gaussian policy init
+   (mean=0, std=1) releases ~2 limbs on step 1 → immediate fall.
+4. **No VecNormalize** — raw world positions at very different scales; known
+   PPO failure mode on MuJoCo environments.
+5. **No dense reward signal** — goal vectors are in the observation but not
+   the reward; no gradient toward the next hold.
+
+**A policy has never completed a problem. Success rate = 0%.**
+The blockers above (not the body) are why. Fix Phase 0 before anything else.
+
+---
+
+## Body Model — The 27-DOF Humanoid
+
+**This is a custom climbing-specific body, NOT the stock MuJoCo humanoid.**
+Do not replace it. It has anatomically motivated joint limits, mass
+distributions (Winter biomechanics), and per-group actuator gains tuned for
+climbing.
+
+### Degrees of Freedom
+
+| Joint | DOF | Limits | Notes |
+|---|---|---|---|
+| pelvis root | 6 | free | position + quaternion; not actuated |
+| spine_lean | 1 | −15° → +15° | forward lean; raised stiffness keeps near 0° |
+| shoulder_az (×2) | 2 | −50° → +180° | forward/back swing |
+| shoulder_el (×2) | 2 | 0° → +180° | abduction (full overhead reach) |
+| shoulder_roll (×2) | 2 | −80° → +80° | internal/external rotation |
+| elbow (×2) | 2 | 0° → +150° | **no hyperextension** |
+| wrist (×2) | 2 | −70° → +70° | flex/extend; no radial deviation |
+| hip_flex (×2) | 2 | −20° → +140° | high-step capable |
+| hip_abduct (×2) | 2 | −20° → +70° | drop-knee, frog flag |
+| hip_rot (×2) | 2 | −40° → +40° | |
+| knee (×2) | 2 | 0° → +150° | **no hyperextension** |
+| ankle (×2) | 2 | −25° → +45° | dorsi/plantar |
+| **Total actuated** | **21** | | |
+| **Total DOF** | **27** | | (6 free + 21 actuated) |
+
+### Actuator Model
+
+**Position actuators with per-group PD gains** (`config.py:
+ACTUATOR_GAINS_BY_GROUP`). Tuned near critical damping for the load each
+joint carries:
+
+| Group | Kp (N·m/rad) | Kv (N·m·s/rad) |
+|---|---|---|
+| shoulder | 220 | 20 |
+| elbow | 80 | 6 |
+| wrist | 15 | 1 |
+| spine | 250 | 22 |
+| hip | 450 | 45 |
+| knee | 200 | 17 |
+| ankle | 40 | 3 |
+
+Per-joint torque caps and armature are also in `config.py`. Change them
+only with a measured justification — the comments explain the rationale.
+
+### Hold Attachment
+
+One mocap body + weld equality per limb. To attach: position the mocap at
+the hold, set `data.eq_active[i] = 1`. To release: `eq_active[i] = 0`.
+**No MJCF recompile needed** → fast RL resets. The weld `relpose` is set
+so the **tip site** (fingertip / toe) lands on the hold, not the wrist /
+ankle.
+
+---
+
+## Action Space (Canonical: `continuous-joint`)
+
+```
+Box(low=-1, high=1, shape=(25,), dtype=float32)
+
+  action[:21]   normalised joint targets in [-1, 1]
+                → rescaled per joint to its MuJoCo ctrlrange
+  action[21:25] grip intents for [LH, RH, LF, RF]
+                > 0  →  engage weld if tip is within GRIP_PROXIMITY_M (0.05 m)
+                        of an unoccupied eligible hold
+                ≤ 0  →  release weld (if active)
+```
+
+There is **no auto-grip**. The agent must raise grip intent above 0 AND
+be within 5 cm of a valid hold. Proximity alone does not engage.
+
+`discrete-move` (pick limb + hold; Cartesian-impedance reach controller) is
+preserved **only** as a debug / curriculum / behavior-cloning tool. It is
+not the canonical training mode.
+
+---
+
+## Observation Space
+
+```
+Box(low=-inf, high=inf, shape=(127,), dtype=float32)
+
+[  0:  3)  pelvis world position          (3)
+[  3:  9)  pelvis rot6d (cols 0,1 of R)  (6)
+[  9: 12)  centre-of-mass world pos       (3)
+[ 12: 33)  joint qpos[7:]               (21)   n_act
+[ 33: 54)  joint qvel[6:]               (21)   n_act
+[ 54: 58)  per-limb grip flags           (4)   LH RH LF RF
+[ 58:114)  K=8 nearest holds × 7        (56)
+               per hold: rel_pos_in_pelvis_frame (3)
+                         role_onehot [start, mid, finish] (3)
+                         is_gripping (1)
+[114:126)  per-limb anchor/goal vectors  (12)
+               zero when gripped; (finish_world − tip_world) otherwise
+[126:127)  Euclidean dist: highest gripped hand → nearest finish (1)
+```
+
+**Invariants:**
+- Shape is always (127,) regardless of wall size or hold count. A saved
+  policy is portable to any wall, as long as the climber body is unchanged.
+- Every stream is NaN/Inf-guarded with a one-time stderr warning (`obs.py`).
+- Hold positions expressed in pelvis-local frame so the representation is
+  pose-relative, not world-absolute.
+
+---
+
+## Reward Function (per step, `continuous-joint`)
+
+| Component | Value | Notes |
+|---|---|---|
+| HWM height gain | `+5.0 × max(0, com_z − episode_max_com_z)` | Not farmable by oscillation |
+| First-touch hold match | `+5.0` rising-edge | Deduped per `(limb, hold_id)` per episode |
+| Slip | `−5.0 × n_slips` | Grip force exceeded hold capacity |
+| Body intersection | `−20.0 × n_contacts` | Hard gate, not shaping nudge |
+| Energy | `−0.005 × Σ ctrl²` | Discourages max-torque jitter |
+| Invalid action | `−0.25` | Discrete-move only |
+| Terminal: finish | `+100` | One hand on finish hold ≥ 6 consecutive steps |
+| Terminal: fall | `−50` | pelvis_z < 0.20 m |
+
+**Known issue (NEXT_STEPS §B1):** energy penalty (~0.1/step) currently
+outweighs a 1 cm HWM gain (~0.05). Fix: lower `energy_penalty_coeff` to
+~0.001.
+
+---
+
+## Coordinate System
+
+`+X` along the wall (left→right), `+Y` away from the wall (climber side),
+`+Z` up. Gravity is world `−Z`. Wall base sits at `z = 0`. Slab/overhang
+is implemented by tilting the wall plate, not rotating gravity.
+
+---
+
+## Wall JSON Schema (locked — discuss before changing)
 
 ```json
 {
   "wall_id": "my-wall",
-  "grid": { "cols": 15, "rows": 20, "cell_size_cm": null },
+  "grid": { "cols": 15, "rows": 20, "cell_size_cm": 20.0 },
   "holds": [
     {
       "hold_id": "h_001",
@@ -68,166 +286,164 @@ Photo(s) → Hold Detection → World Model (JSON) → Body Model + IK → Solve
 
 **Hold types:** `jug`, `crimp`, `sloper`, `pinch`, `foothold`
 **Sizes:** `small`, `medium`, `large`
-**Orientation:** float 0.0–359.9°, stored precisely, rendered snapped to 5° in UI
-**cell_size_cm:** `null` for now — must be set before reachability can be computed
+**Orientation:** float 0.0–359.9°, stored precisely, rendered snapped to 5°
+**cell_size_cm:** required for real-world scale — IK and 3D builder both
+need it; set to 20 cm by the MoonBoard adapter.
 
-**What the schema cannot express yet:**
-- Ordered move sequence (no route object)
-- Which limb goes to which hold
-- Real-world scale
-
----
-
-## MVP vs Ideal
-
-### MVP
-- Manual hold placement (user taps grid — no CV)
-- Fixed body model using average height (175cm) and wingspan (175cm)
-- 2D IK solver (law of cosines, geometric — no library needed)
-- Graph search (A* or BFS) to find a valid move sequence
-- Output: text sequence of moves (`LH → h_003, RF → h_007...`)
-- No photo input yet
-
-**Why manual first:** CV is the hardest part. Build the solver and body model first so you know the pipeline works. If CV output is bad you'll know it's CV, not the solver.
-
-### Ideal
-- Photo/video sweep → YOLOv8 hold detection → JSON world model
-- User correction layer on detected holds (non-optional fallback)
-- Personalized body model: user inputs height, wingspan, flexibility, strength proxy
-- 3D IK with hip twist, drop-knee, flagging
-- RL solver (PPO or SAC) trained on synthetic walls, generalizes to new routes
-- AR overlay showing next move in real time (gym-mounted camera or phone)
-- Route difficulty estimator as byproduct of solver
-- B2B setter tool: design routes on a tablet before physically placing holds
+The schema is the contract. Every subpackage reads this format. Changes
+require migration of all saved walls and team approval.
 
 ---
 
-## Build Phases
+## Architecture Decisions
 
-### Phase 1 — Data Foundation ✅ DONE
-Wall editor, JSON schema, Docker, save/load.
+### 1. Continuous joint control is the primary mode
 
-### Phase 2 — Body Model + IK (next)
-- `BodyModel` class: height, wingspan, arm/leg segment lengths
-- 2D IK for arms and legs (geometric, law of cosines)
-- Joint constraint checks (no hyperextension, angle limits)
-- Center of mass validator (is this position stable?)
-- Stick figure overlay rendered on the grid
-- Manual drag test: move limbs to holds, system flags valid vs invalid
+The agent controls every actuated joint simultaneously every step, like a
+neural motor cortex commanding all muscles at once. This is harder to learn
+than discrete-move but is the correct framing for the long-term goal of
+muscle-level control. Discrete-move remains available as a curriculum
+bootstrap only.
 
-**Key decision:** start with 2D projection. 3D (hip twist, drop-knee) comes later.
+### 2. Custom body — not the stock MuJoCo humanoid
 
-### Phase 3 — Reachability + Solver
-- Reachability checker: given body position, which holds can each limb reach?
-- Hold graph: nodes = holds, edges = valid moves
-- A* or BFS to find path from start to finish
-- Text move sequence output
-- Basic difficulty estimator (how many near-max-reach moves?)
+The stock humanoid is tuned for locomotion. It has wrong joint limits for
+climbing (no high-step, no overhead reach), wrong mass distribution, and no
+hold-attachment machinery. The custom body is anatomically grounded. Do not
+swap it out.
 
-**Missing prerequisite:** `cell_size_cm` must be added to the schema before this phase. Without real-world scale, reachability is meaningless.
+### 3. Hold attachment via mocap+weld
 
-### Phase 4 — Synthetic Wall Generator
-- Procedural hold placer with solvability check
-- Randomized rendering: lighting, chalk dust, wall texture
-- 100+ labeled walls with known solutions → CV training data
-- RL training environment
+A connect constraint only constrains position. A weld without a mocap
+requires recompiling MJCF to move the target. Mocap+weld lets us teleport
+the anchor without model recompile — essential for fast RL resets.
 
-**Why this matters:** without synthetic data, CV training requires hand-labeling thousands of real gym photos. The generator sidesteps this.
+### 4. Fixed-shape observation (K-nearest holds, not a board one-hot)
 
-### Phase 5 — Computer Vision
-- Fine-tune YOLOv8 on Phase 4 synthetic renders + real gym photos
-- Output: Hold JSON (same schema as manual editor)
-- User correction UI: overlay detected holds on photo, tap to fix
-- Hold orientation detection
+A board-sized one-hot would be wall-specific (MoonBoard 11×18 vs 15×20
+editor wall) and a policy would not transfer. K=8 nearest holds in pelvis
+frame is wall-size-agnostic. This is the invariant that makes a single
+saved policy work across any wall with the same body.
 
-### Phase 6 — Full Pipeline + App
-- Photo → CV → JSON → user corrections → solver → move sequence overlaid on photo
-- User onboarding: height + wingspan
-- Internal beta test on a real gym wall
-- Performance target: end-to-end in < 5 seconds
+### 5. Do not model fingers
 
----
+Crimp vs jug is modeled through grip-force capacity (`max_force_n` per
+hold), not finger flexion. This is the right complexity/fidelity tradeoff
+for the current phase. Revisit only when predicting per-hold grade difficulty
+for specific climber strength profiles.
 
-## IK Approach
+### 6. MuJoCo over PyBullet / Genesis / Brax
 
-Use a custom 2D geometric solver — not a library. A climber has exactly 4 contact points. Each limb is a 3-joint chain (short enough for closed-form solutions, no iteration needed).
+MuJoCo's contact solver is stable under tendon-like weld constraints.
+PyBullet jitters under force-limited grips. Genesis is too bleeding-edge.
+We can move to MJX (MuJoCo on JAX) for GPU-scale training without
+rewriting the model.
 
-```python
-import numpy as np
+### 7. PD servos now, torque / muscle later
 
-def solve_arm_ik_2d(shoulder_pos, target_pos, upper_len, lower_len):
-    dx = target_pos[0] - shoulder_pos[0]
-    dy = target_pos[1] - shoulder_pos[1]
-    dist = np.sqrt(dx**2 + dy**2)
-    if dist > upper_len + lower_len:
-        return None  # out of reach
-    if dist < abs(upper_len - lower_len):
-        return None  # too close
-    cos_angle = (upper_len**2 + dist**2 - lower_len**2) / (2 * upper_len * dist)
-    angle_to_target = np.arctan2(dy, dx)
-    elbow_angle = np.arccos(np.clip(cos_angle, -1, 1))
-    elbow_x = shoulder_pos[0] + upper_len * np.cos(angle_to_target + elbow_angle)
-    elbow_y = shoulder_pos[1] + upper_len * np.sin(angle_to_target + elbow_angle)
-    return np.array([elbow_x, elbow_y])
-```
-
-Use `ikpy` as a reference/sanity check. Only move to a full 3D library if 2D projection is fundamentally insufficient.
+Hill-type muscles add ~5× model complexity. PD position servos are the
+right level of detail for the current phase. Once PPO learns to climb with
+servos, migrating to torque actuators (and eventually muscle activation) is
+the next step — not a prerequisite.
 
 ---
 
-## RL Solver Design (Phase 4+)
+## Future Direction: Toward Muscle-Level Control
 
-- **State:** current hand/foot positions + remaining holds + body position
-- **Action:** move a limb to a target hold
-- **Reward:** +reaching the top; −invalid body states, excessive moves, near-falls
-- **Architecture:** Graph Neural Network policy (holds as nodes, reachability as weighted edges) — naturally generalizes to any wall
-- **Training:** PPO or SAC, start entirely on synthetic walls, then transfer to real
-- **Why RL over hardcoded:** generalizes to any new wall automatically without reprogramming
+The current PD-servo architecture is a stepping stone. The full roadmap:
 
----
+**Step 1 — Get PPO working with position servos (Phase 0–A)**
+Fix the training-loop blockers: episode length, VecNormalize, seed pose,
+grip semantics, dense shaping reward. First targets: hang stably → reach
+one hold → climb a route.
 
-## Key Architecture Decisions
+**Step 2 — Torque actuators**
+Replace position actuators with torque-limited motors. The policy now
+commands effort, not target angle. This forces the policy to implicitly
+learn stiffness and damping — physically closer to muscle activation.
+Action space shape stays the same; MuJoCo actuator gear type changes.
 
-1. **Manual input before CV.** Build the solver first so you can isolate bugs. CV is a separate failure mode.
-2. **Store orientation as float, render snapped.** `orientation_deg` is a float in JSON. UI snaps to 5° increments. Never lose precision in the data layer.
-3. **cell_size_cm must be added before Phase 3.** Reachability is physically meaningless without real-world scale.
-4. **Schema is the contract.** Every phase depends on the same JSON format. Don't change it without team discussion.
-5. **User correction is non-optional.** CV will be wrong sometimes. Always give the user a way to fix detections before the solver runs.
-6. **Synthetic generator enables everything.** It is CV training data, RL environment, and a standalone product (setter tool, personalized home board generator) simultaneously.
+**Step 3 — Hill-type muscle model (long-term)**
+Each actuator becomes a muscle: `force = f(activation, length, velocity)`
+following the Hill model. The agent can then discover stretch-shortening
+cycles, pre-activation, and elastic energy storage — real biomechanics.
+Adds ~5× model complexity; defer until Step 2 trains.
 
----
+**Step 4 — MJX / GPU-scale training**
+The same MJCF runs on MuJoCo's JAX backend (MJX) with minimal code
+changes. This unlocks massive parallelism for the rollouts that muscle-level
+training demands.
 
-## Market + Value Prop
-
-**Who needs this most:** intermediate climbers (V3–V7 / 5.10–5.12) who have plateaued and want to understand why a route is hard for their specific body.
-
-**B2B angle (stronger GTM):** Sell a setter tool to gyms. Given a target grade, suggest hold placements. Simulate how a route solves for different body types before any hold is physically placed. ~600 US climbing gyms, $500–1000/month each = real ARR.
-
-**Consumer:** 25M climbers globally, ~5M regular gym climbers. 2% at $8/month = ~$96M theoretical ceiling. Consumer is harder to monetize but builds brand.
-
-**Cultural note:** a large portion of climbers actively do not want to be told the beta — the puzzle-solving is the point. Make beta sharing optional and default off.
-
-**Long-term:** personalized home board generation (Kilter/Moon Board competitor), outdoor rock face identification (harder — 5–10 years out), competition prep tools for elite climbers.
+**Why continuous over discrete-move:**
+A discrete-move agent solves a wall by pattern-matching (hold_A → limb_B).
+A continuous-control agent discovers movement from physics and generalises
+to any wall, any body proportions — because the solution is understanding
+how the body works, not memorising hold sequences.
 
 ---
 
-## Git Conventions
+## What NOT to Do
 
-- `main` — always working, protected, no direct pushes
-- `dev` — integration branch
-- `feature/your-name/description` — personal branches
-- One person owns merging to main
-- Review each other's PRs before merging to dev
+- **Switch back to `discrete-move` as the default.** Discrete-move hides
+  the real problem. Keep it only as a curriculum bootstrap / expert for BC.
+- **Replace the custom climber with the stock Gymnasium humanoid.** It
+  trains faster on locomotion tasks; it is not a climbing body.
+- **Add DOF before the agent can climb with the current DOF.** More joints =
+  harder exploration. Add spine lateral + rotation (E1) only after the agent
+  reliably climbs with the current 21 actuated joints.
+- **Change obs/action shape without updating this file.** A shape mismatch
+  silently produces garbage predictions on checkpoint load.
+- **Add `KNOWN_ISSUES.md`, `ARCH_REVIEW.md`, or per-phase trackers.**
+  `NEXT_STEPS.md` is the only roadmap. Keep it pruned.
 
 ---
 
 ## Running Locally
 
 ```bash
-git clone <repo>
-cd beta-engine
-docker compose up          # starts at http://localhost:8000
-docker compose up --build  # after dependency changes
+python -m venv .venv
+.venv\Scripts\Activate.ps1          # Windows
+source .venv/bin/activate           # Linux / macOS
+pip install -r requirements.txt
+
+# Wall editor + 3D browser viewer (port 8000)
+python -m grid_editor.server
+
+# Headless smoke test (no display needed)
+python -m sim3d --headless --frames 120
+
+# Env / obs sanity check
+python -c "
+from sim3d.moonboard_env import MoonboardClimbing3DEnv
+from sim3d.moonboard import load_moonboard_problems
+from sim3d.env import EnvConfig
+problems = load_moonboard_problems('data/moonboard/sample-problems.json')
+env = MoonboardClimbing3DEnv(problems[:1], config=EnvConfig())
+obs, _ = env.reset(seed=0)
+print('obs', obs.shape, 'action', env.action_space.shape)  # (127,) (25,)
+"
 ```
 
-Walls are persisted to `./data/walls/` on the host (bind-mounted into the container).
+## Running with Docker
+
+```bash
+docker compose up --build
+# http://localhost:8000          → 2D wall editor
+# http://localhost:8000/sim3d/   → 3D browser viewer
+
+# Train
+docker compose exec beta-engine \
+  python -m sim3d.train --steps 200_000 --n-envs 8 --run-id my_run
+
+# Replay
+docker compose exec beta-engine \
+  python -m sim3d --play data/runs/sim3d/my_run/model.zip
+```
+
+## Git Conventions
+
+- `main` — protected, always working, no direct pushes
+- `dev` — integration branch
+- `feature/<name>` — branch from dev, PR back to dev
+- One person owns merging to main
+- Review PRs before merging to dev

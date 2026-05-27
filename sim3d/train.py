@@ -75,6 +75,29 @@ class TrainConfig:
     run_id: Optional[str] = None        # auto-generated from timestamp if None
     n_envs: int = 1                     # parallel CPU env workers
     device: str = "auto"                # SB3/PyTorch device: auto | cpu | cuda
+    # ── PPO algorithm knobs ──────────────────────────────────────────
+    # Policy init — lower log_std_init shrinks the initial action std so
+    # grips aren't randomly released on the first step.  -1.5 → std≈0.22.
+    log_std_init: float = 0.0
+    # Grip deadband — intents in (-db, +db) hold current grip state.
+    # Pair with log_std_init=-1.5 and db=0.2 for stable early training.
+    grip_intent_deadband: float = 0.0
+    # PPO clip range. Default SB3=0.2. Lower (0.1) for more conservative
+    # updates — important when clip_fraction is high (>0.4).
+    clip_range: float = 0.2
+    # Entropy coefficient. Small positive value (0.005) encourages
+    # exploration past "hang still forever."
+    ent_coef: float = 0.0
+    # Number of PPO optimisation epochs per rollout batch.
+    n_epochs: int = 10
+    # ── Reward coefficients (matched to EnvConfig) ───────────────────
+    # Dense shaping toward finish hold (per-step, potential-based).
+    finish_approach_coeff: float = 0.0
+    # Per-step survival bonus (fraction of 4 limbs gripped × coeff).
+    survival_bonus_coeff: float = 0.0
+    # Energy penalty. Default env=0.001 (lowered from 0.005 which
+    # swamped the HWM height signal).
+    energy_penalty_coeff: float = 0.001
     video_freq: int = 100_000           # env-steps between mp4 rollouts (0 = disable)
     checkpoint_first_at: int = 1024     # env-step at which to save model_first.zip
     # Curriculum training (procedural wall generator + auto difficulty)
@@ -198,6 +221,10 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         max_steps=cfg.max_episode_steps,
         enable_slip=cfg.enable_slip,
         body_intersection_penalty=cfg.body_intersection_penalty,
+        grip_intent_deadband=cfg.grip_intent_deadband,
+        finish_approach_coeff=cfg.finish_approach_coeff,
+        survival_bonus_coeff=cfg.survival_bonus_coeff,
+        energy_penalty_coeff=cfg.energy_penalty_coeff,
     )
 
     def _factory():
@@ -297,17 +324,25 @@ def train(cfg: TrainConfig) -> Path:
         print("(tensorboard not installed — skipping TB logging. "
               "Install with `pip install tensorboard` to enable.)")
 
+    policy_kwargs = {}
+    if cfg.log_std_init != 0.0:
+        policy_kwargs["log_std_init"] = cfg.log_std_init
+
     model = sb3.PPO(
         "MlpPolicy",
         vec_env,
         learning_rate=cfg.learning_rate,
         n_steps=cfg.n_steps,
         batch_size=cfg.batch_size,
+        n_epochs=cfg.n_epochs,
         gamma=cfg.gamma,
+        clip_range=cfg.clip_range,
+        ent_coef=cfg.ent_coef,
         seed=cfg.seed,
         tensorboard_log=tb_log,
         device=cfg.device,
         verbose=1,
+        policy_kwargs=policy_kwargs if policy_kwargs else None,
     )
 
     csv_cb = _EpisodeStatsCallback(out_dir / "episode_stats.csv", BaseCallback).build()
@@ -438,6 +473,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Parallel environment workers. Use >1 to speed up CPU-bound MuJoCo rollouts.")
     p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
                    help="PyTorch device for PPO policy updates. Env simulation still runs on CPU.")
+    p.add_argument("--log-std-init", type=float, default=0.0,
+                   help="Initial log-std for the Gaussian policy. -1.5 → std≈0.22, "
+                        "keeps early actions small so grips aren't randomly dropped on step 1.")
+    p.add_argument("--grip-deadband", type=float, default=0.0,
+                   help="Grip intent deadband. Intents in (-db, +db) hold current grip state. "
+                        "Use 0.2 with --log-std-init -1.5 for stable early training.")
+    p.add_argument("--clip-range", type=float, default=0.2,
+                   help="PPO clip range. Lower (0.1) when clip_fraction is high (>0.4).")
+    p.add_argument("--ent-coef", type=float, default=0.0,
+                   help="PPO entropy coefficient. Small value (0.005) encourages exploration.")
+    p.add_argument("--n-epochs", type=int, default=10,
+                   help="PPO optimisation epochs per rollout. Default SB3=10.")
+    p.add_argument("--finish-approach-coeff", type=float, default=0.0,
+                   help="Dense shaping reward: coeff × (prev_dist_to_finish − cur_dist). "
+                        "Set 1.0–3.0 to give the agent a gradient toward the finish hold.")
+    p.add_argument("--survival-bonus-coeff", type=float, default=0.0,
+                   help="Per-step reward: coeff × (gripped_limbs / 4). "
+                        "Teaches the agent to stay on the wall. Try 0.05.")
+    p.add_argument("--energy-penalty-coeff", type=float, default=0.001,
+                   help="Per-step energy penalty: coeff × Σctrl². "
+                        "Default 0.001 (was 0.005 which swamped the height signal).")
     p.add_argument("--curriculum", action="store_true",
                    help="Train on procedurally generated walls with automatic difficulty scheduling.")
     p.add_argument("--curriculum-start-difficulty", type=float, default=0.0,
@@ -490,6 +546,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         device=args.device,
         video_freq=args.video_freq,
         checkpoint_first_at=args.checkpoint_first_at,
+        log_std_init=args.log_std_init,
+        grip_intent_deadband=args.grip_deadband,
+        clip_range=args.clip_range,
+        ent_coef=args.ent_coef,
+        n_epochs=args.n_epochs,
+        finish_approach_coeff=args.finish_approach_coeff,
+        survival_bonus_coeff=args.survival_bonus_coeff,
+        energy_penalty_coeff=args.energy_penalty_coeff,
         curriculum=args.curriculum,
         curriculum_start_difficulty=args.curriculum_start_difficulty,
         curriculum_max_difficulty=args.curriculum_max_difficulty,

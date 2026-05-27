@@ -167,6 +167,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Render frames per policy action when replaying (default 120 = 2 s).",
     )
     p.add_argument(
+        "--slowmo", type=float, default=1.0,
+        help="Replay slow-motion factor. 1.0=real time, 4.0=4x slower, "
+             "10.0=ultra slow. Each policy action's physics is broken into "
+             "single-frame chunks with viewer.sync + sleep between them.",
+    )
+    p.add_argument(
         "--move-mode", default="reach", choices=("snap", "reach", "dyno"),
         help="Limb-move mode for scripted betas and policy replay.",
     )
@@ -362,20 +368,69 @@ def main(argv: list[str] | None = None) -> int:
 
         # Drive the env's world (which the viewer attaches to).
         from sim3d.viewer import native_viewer
+        from sim3d import config as cfg
         obs, info = env.reset()
+        # One env.step() advances sim_substeps (default 8) render frames
+        # of physics. For smooth slow-motion we want the viewer to refresh
+        # *during* that physics chunk, not just at the end. So in slow-mo
+        # mode we manually apply the action's ctrl + grip intents (mirror
+        # of Climbing3DEnv._step_continuous) and then call world.step(1)
+        # in a tight loop with viewer.sync() + sleep between frames.
+        slowmo = max(1.0, float(args.slowmo))
+        substeps = env.cfg_env.sim_substeps
+        frame_dt = 1.0 / cfg.RENDER_HZ
+        sleep_per_frame = (slowmo - 1.0) * frame_dt
         with native_viewer(env.world) as viewer:
             done = False
             while viewer.is_running() and not done:
                 action, _ = model.predict(obs, deterministic=True)
-                a_int = int(action) if hasattr(action, "__int__") else action
-                limb, hold_id = env.decode_move(a_int) \
-                    if env.cfg_env.action_mode == "discrete-move" \
-                    else (None, None)
-                if limb is not None:
+                if env.cfg_env.action_mode == "discrete-move":
+                    limb, hold_id = env.decode_move(int(action))
                     print(f"  policy: {limb} → {hold_id}")
-                obs, r, term, trunc, info = env.step(action)
-                viewer.sync()
-                done = term or trunc
+                    obs, r, term, trunc, info = env.step(action)
+                    viewer.sync()
+                    if sleep_per_frame > 0:
+                        time.sleep(sleep_per_frame * substeps)
+                elif slowmo > 1.0:
+                    # Slow-mo: apply ctrl + grip intents, then step one
+                    # render frame at a time so the viewer can refresh
+                    # mid-physics-chunk.
+                    import numpy as np
+                    from sim3d.body import LIMBS
+                    a = np.asarray(action, dtype=np.float64)
+                    n = env._n_act
+                    joint_norm = np.clip(a[:n], -1.0, 1.0)
+                    ctrl = (0.5 * (joint_norm + 1.0)
+                            * (env._act_hi - env._act_lo) + env._act_lo)
+                    env.world.data.ctrl[:n] = ctrl
+                    db = env.cfg_env.grip_intent_deadband
+                    for i, limb in enumerate(LIMBS):
+                        intent = float(a[n + i]) if n + i < len(a) else 0.0
+                        if intent > db:
+                            env._maybe_engage_grip(limb)
+                        elif intent < -db:
+                            if env.world.on_hold(limb) is not None:
+                                env.world.release_limb(limb)
+                    for _ in range(substeps):
+                        env.world.step(1, check_slip=env.cfg_env.enable_slip)
+                        viewer.sync()
+                        if sleep_per_frame > 0:
+                            time.sleep(sleep_per_frame)
+                    # Bookkeeping step (no extra physics) — env.step would
+                    # advance physics again, so build obs/info manually:
+                    obs = env._obs()
+                    # Update HWM + done flags by calling env.step with a
+                    # neutral action would re-physics; instead just check
+                    # the basic done conditions.
+                    pelvis_z = float(env.world.pelvis_pos()[2])
+                    done = pelvis_z < 0.20
+                    info = {"com": env.world.com(), "outcome": "running"}
+                    if done:
+                        info["outcome"] = "fell"
+                else:
+                    obs, r, term, trunc, info = env.step(action)
+                    viewer.sync()
+                    done = term or trunc
             print(f"Outcome: {info.get('outcome')} | "
                   f"final COM_z = {info['com'][2]:.2f} m")
         return 0
