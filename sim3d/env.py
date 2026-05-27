@@ -73,9 +73,13 @@ class EnvConfig:
     # Positive when the highest gripped hand moves closer to the finish hold.
     # Gives a smooth gradient across the whole episode; set ~1.0–3.0.
     finish_approach_coeff: float = 0.0
-    # Per-step survival bonus — fraction of limbs currently gripped × coeff.
+    # Per-step survival bonus — weighted fraction of limbs currently gripped.
+    # Hands are weighted 2× feet (max value = coeff when all 4 limbs gripped).
     # Teaches "stay on the wall" before the height signal kicks in.
     survival_bonus_coeff: float = 0.0
+    # Penalty per limb that was gripping last step but isn't now. Without
+    # this, releasing is free and dangling-off-the-wall becomes an attractor.
+    grip_release_penalty: float = 0.0
     enable_slip: bool = True
     # Grip intent deadband.  Any intent in (-grip_intent_deadband,
     # +grip_intent_deadband) leaves the current grip state unchanged.
@@ -229,7 +233,11 @@ class Climbing3DEnv(gym.Env):
 
         self._step_count = 0
         self._finish_streak = 0
-        self._max_com_z = float(self.world.com()[2])
+        # Init HWM at floor (0.0), not the seed com_z. Otherwise the agent
+        # starts at the maximum height it will see and has no path to earn
+        # height_reward until it climbs above the seed pose — a structural
+        # zero-gradient region across the first ~hundred steps.
+        self._max_com_z = 0.0
         self._holds_matched_this_episode = set()
         self._prev_grip = {l: self.world.on_hold(l) for l in LIMBS}
         self._prev_finish_dist = self._finish_dist()
@@ -322,8 +330,9 @@ class Climbing3DEnv(gym.Env):
             height_reward = self.cfg_env.hwm_height_scale * (com_z - self._max_com_z)
             self._max_com_z = com_z
 
-        # Rising-edge per (limb, hold) hold-match bonus.
+        # Rising-edge per (limb, hold) hold-match bonus; also count releases.
         match_bonus = 0.0
+        n_released = 0
         for limb in LIMBS:
             cur = self.world.on_hold(limb)
             prev = self._prev_grip.get(limb)
@@ -332,6 +341,8 @@ class Climbing3DEnv(gym.Env):
                 if key not in self._holds_matched_this_episode:
                     self._holds_matched_this_episode.add(key)
                     match_bonus += self.cfg_env.hold_match_bonus
+            if prev is not None and cur is None:
+                n_released += 1
             self._prev_grip[limb] = cur
 
         # Dense finish-approach shaping — potential-based so it cannot be
@@ -346,20 +357,28 @@ class Climbing3DEnv(gym.Env):
             )
             self._prev_finish_dist = cur_dist
 
-        # Per-step survival bonus: fraction of 4 limbs currently gripped.
+        # Per-step survival bonus: weighted fraction of limbs gripped.
+        # Hands count 2×, feet count 1×; max weighted sum = 6 → normalize so
+        # all-4-gripped == coeff (i.e. the bonus is capped at coeff/step).
         # Teaches the agent to hold the wall before it learns to climb it.
         survival_reward = 0.0
         if self.cfg_env.survival_bonus_coeff > 0.0:
-            n_gripped = sum(
-                1 for l in LIMBS if self.world.on_hold(l) is not None
-            )
-            survival_reward = self.cfg_env.survival_bonus_coeff * n_gripped / len(LIMBS)
+            n_hand = sum(1 for l in HAND_LIMBS if self.world.on_hold(l) is not None)
+            n_foot = sum(1 for l in FOOT_LIMBS if self.world.on_hold(l) is not None)
+            weighted = (2 * n_hand + n_foot) / 6.0
+            survival_reward = self.cfg_env.survival_bonus_coeff * weighted
+
+        # Penalty for each limb that released a grip this step. Combined with
+        # the grip_intent_deadband this discourages the "let go and dangle"
+        # local optimum.
+        release_penalty = self.cfg_env.grip_release_penalty * n_released
 
         reward = (
             height_reward
             + approach_reward
             + survival_reward
             + match_bonus
+            - release_penalty
             - self.cfg_env.slip_penalty * slips
             - self.cfg_env.body_intersection_penalty * body_intersections
             - self.cfg_env.energy_penalty_coeff * ctrl_l2_sq

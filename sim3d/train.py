@@ -93,8 +93,11 @@ class TrainConfig:
     # ── Reward coefficients (matched to EnvConfig) ───────────────────
     # Dense shaping toward finish hold (per-step, potential-based).
     finish_approach_coeff: float = 0.0
-    # Per-step survival bonus (fraction of 4 limbs gripped × coeff).
+    # Per-step survival bonus (weighted fraction of limbs gripped × coeff;
+    # hands 2× feet, max == coeff when all 4 are on).
     survival_bonus_coeff: float = 0.0
+    # Per-limb penalty applied on the step a grip releases.
+    grip_release_penalty: float = 0.0
     # Energy penalty. Default env=0.001 (lowered from 0.005 which
     # swamped the HWM height signal).
     energy_penalty_coeff: float = 0.001
@@ -224,6 +227,7 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         grip_intent_deadband=cfg.grip_intent_deadband,
         finish_approach_coeff=cfg.finish_approach_coeff,
         survival_bonus_coeff=cfg.survival_bonus_coeff,
+        grip_release_penalty=cfg.grip_release_penalty,
         energy_penalty_coeff=cfg.energy_penalty_coeff,
     )
 
@@ -489,8 +493,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Dense shaping reward: coeff × (prev_dist_to_finish − cur_dist). "
                         "Set 1.0–3.0 to give the agent a gradient toward the finish hold.")
     p.add_argument("--survival-bonus-coeff", type=float, default=0.0,
-                   help="Per-step reward: coeff × (gripped_limbs / 4). "
-                        "Teaches the agent to stay on the wall. Try 0.05.")
+                   help="Per-step reward: coeff × weighted_grip_fraction "
+                        "(hands 2×, feet 1×; capped at coeff). "
+                        "Teaches the agent to stay on the wall. Try 0.5.")
+    p.add_argument("--grip-release-penalty", type=float, default=0.0,
+                   help="Per-limb penalty when a grip releases this step. "
+                        "Discourages 'let go and dangle'. Try 1.0.")
     p.add_argument("--energy-penalty-coeff", type=float, default=0.001,
                    help="Per-step energy penalty: coeff × Σctrl². "
                         "Default 0.001 (was 0.005 which swamped the height signal).")
@@ -553,6 +561,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         n_epochs=args.n_epochs,
         finish_approach_coeff=args.finish_approach_coeff,
         survival_bonus_coeff=args.survival_bonus_coeff,
+        grip_release_penalty=args.grip_release_penalty,
         energy_penalty_coeff=args.energy_penalty_coeff,
         curriculum=args.curriculum,
         curriculum_start_difficulty=args.curriculum_start_difficulty,
