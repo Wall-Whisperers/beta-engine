@@ -14,14 +14,23 @@ for the primary training experiments.
 
 Observation: see ``sim3d.obs.build_observation``.
 
-Reward (per step, continuous-joint):
-    + 5.0 × max(0, com_z − episode_max_com_z)       # high-water-mark progress
-    + 5.0 (rising-edge, deduped per (limb, hold) per episode)
-    − 5.0 × n_slips
+Reward (per step, continuous-joint) — designed to be un-hackable:
+    + 50.0 × max(0, com_z − episode_max_com_z)      # HWM progress (state-based)
+    + 10.0 rising-edge per (limb, hold) per episode # base match
+    + 75.0 when a grip event raises episode_max_grip_z (NEW high mark)
+    + 5.0  × (prev_finish_dist − cur_finish_dist)   # potential-based approach
+    + 0.1  × weighted_grip_fraction (hand-gated)    # tiny stay-on-wall bonus
+    − 1.0  × n_limbs_released_this_step             # discourages dangle, not climbing
+    − 5.0  × n_slips
     − 20.0 × n_body_intersections                   # gating, not shaping
     − 0.25 if action was invalid (discrete-move only)
-    − 0.005 × Σ ctrl²                               # energy
-    + 100.0 on_finish_bonus, − 50.0 fall_penalty (terminal)
+    − 0.0005 × Σ ctrl²                              # energy
+    + 200.0 on_finish_bonus, − 50.0 fall_penalty (terminal)
+
+`upward_velocity_coeff` is retained for back-compat but is now GATED on HWM
+gain (so it becomes a multiplier on the HWM term, not a separate path-
+dependent farm). Default 0.0 — leave it off unless you intentionally want
+to scale HWM further.
 """
 from __future__ import annotations
 
@@ -56,9 +65,14 @@ class EnvConfig:
     fall_z: float = 0.20
     finish_hold_frames: int = 6
     # Reward coefficients.
-    hwm_height_scale: float = 5.0                # × max(0, com_z − max_com_z)
-    hold_match_bonus: float = 5.0                # rising-edge first-touch
-    on_finish_bonus: float = 100.0
+    hwm_height_scale: float = 50.0               # × max(0, com_z − max_com_z)
+    hold_match_bonus: float = 10.0               # rising-edge first-touch
+    # Bonus paid when a grip event raises the episode's max gripped-hold z.
+    # Big discrete jackpot for *vertical* progress through grips; each height
+    # level only pays once, so it can't be re-claimed by swapping limbs onto
+    # holds at the same height.
+    new_high_grip_bonus: float = 75.0
+    on_finish_bonus: float = 200.0
     fall_penalty: float = 50.0
     slip_penalty: float = 5.0
     # Body intersection penalty raised to GATE (not shape) — coefficient
@@ -71,21 +85,28 @@ class EnvConfig:
     # Dense finish-approach shaping (potential-based).
     # Per-step reward = finish_approach_coeff × (prev_dist − cur_dist).
     # Positive when the highest gripped hand moves closer to the finish hold.
-    # Gives a smooth gradient across the whole episode; set ~1.0–3.0.
+    # Total reward for a full climb = coeff × route_length_m. At coeff=100
+    # a 2 m route gives +200 approach reward — comparable to the finish bonus.
+    # Must be large enough to beat the fall-penalty on every path to the top.
     finish_approach_coeff: float = 0.0
     # Per-step survival bonus — weighted fraction of limbs currently gripped.
     # Hands are weighted 2× feet (max value = coeff when all 4 limbs gripped).
     # Teaches "stay on the wall" before the height signal kicks in.
+    # WARNING: any positive value creates a floor-hanging attractor. Only use
+    # a tiny coeff (≤0.02) so the per-episode ceiling is small vs the fall
+    # penalty. Default 0; use --finish-approach-coeff as the dense signal
+    # instead.
     survival_bonus_coeff: float = 0.0
     # Penalty per limb that was gripping last step but isn't now. Without
     # this, releasing is free and dangling-off-the-wall becomes an attractor.
     grip_release_penalty: float = 0.0
-    # Per-step reward proportional to positive vertical COM motion:
-    # reward += upward_velocity_coeff × max(0, com_z − prev_com_z).
-    # Downward motion is free (not penalised), so oscillation can't farm —
-    # the only way to accumulate this is to climb. Pairs with the HWM term:
-    # HWM rewards the *peak*, this rewards the journey there. Try 50.0
-    # (so 1 cm upward = 0.5 reward, 1 m climb = 50 reward).
+    # DEPRECATED-as-of-2026-05-27: the original "per-step max(0, dz)"
+    # semantics were exploitable — bouncing the pelvis in place earned
+    # ~5 reward per up-frame with no downward penalty, dominating the
+    # signal. Now GATED on HWM gain (only paid when com_z exceeds the
+    # episode's previous max), so it behaves as a second coefficient on
+    # the HWM term. Leave at 0 unless you intentionally want to amplify
+    # HWM; the default HWM scale (50) is already the dominant signal.
     upward_velocity_coeff: float = 0.0
     enable_slip: bool = True
     # Grip intent deadband.  Any intent in (-grip_intent_deadband,
@@ -240,16 +261,33 @@ class Climbing3DEnv(gym.Env):
 
         self._step_count = 0
         self._finish_streak = 0
-        # Init HWM at floor (0.0), not the seed com_z. Otherwise the agent
-        # starts at the maximum height it will see and has no path to earn
-        # height_reward until it climbs above the seed pose — a structural
-        # zero-gradient region across the first ~hundred steps.
-        self._max_com_z = 0.0
+        # Init HWM at the seed com_z, not at 0. Initing at 0 gives the agent
+        # a one-time "free" +hwm_scale×seed_height every reset (e.g. +60
+        # when seed lands at 1.2 m) — an un-earned constant reward that can
+        # be combined with survival bonus to make floor-hanging profitable
+        # without ever climbing. Initing at the seed height means the agent
+        # must climb ABOVE the seed position to earn any HWM reward.
+        self._max_com_z = float(self.world.com()[2])
+        # Track the highest hold-z any grip has reached this episode. Used
+        # to gate the new_high_grip_bonus so each height level only pays
+        # once per episode regardless of which limb arrives there.
+        # Init at the highest *currently* gripped hold so the seed pose
+        # doesn't get an unearned bonus on step 1.
+        self._max_grip_z = self._current_max_grip_z()
         self._holds_matched_this_episode = set()
         self._prev_grip = {l: self.world.on_hold(l) for l in LIMBS}
         self._prev_finish_dist = self._finish_dist()
         self._prev_com_z = float(self.world.com()[2])
         return self._obs(), self._info()
+
+    def _current_max_grip_z(self) -> float:
+        """Highest z of any currently gripped hold; 0.0 if no grips."""
+        zs = []
+        for limb in LIMBS:
+            hid = self.world.on_hold(limb)
+            if hid is not None:
+                zs.append(float(self.world._hold_meta_by_id[hid]["world_pos"][2]))
+        return max(zs) if zs else 0.0
 
     # ─── Pose seeding helpers (unchanged from prior implementation) ──
     def _default_seed_kwargs(self) -> dict[str, str]:
@@ -332,22 +370,29 @@ class Climbing3DEnv(gym.Env):
         body_intersections = self.world.body_intersection_count()
         com_z = float(self.world.com()[2])
 
-        # High-water-mark progress.
+        # High-water-mark progress (state-based, un-hackable).
         height_reward = 0.0
+        hwm_gain = 0.0
         if com_z > self._max_com_z:
-            height_reward = self.cfg_env.hwm_height_scale * (com_z - self._max_com_z)
+            hwm_gain = com_z - self._max_com_z
+            height_reward = self.cfg_env.hwm_height_scale * hwm_gain
             self._max_com_z = com_z
 
-        # Per-step upward-velocity bonus (rewards motion, not just peaks).
-        # Only positive vertical motion counts — oscillation can't farm.
+        # Upward-velocity term — GATED on HWM gain. With this gate the term
+        # is mathematically equivalent to an extra scalar on hwm_height_scale
+        # (un-farmable). The original "per-step max(0, dz)" semantics was
+        # exploited by pelvis-bouncing in place. Default coeff = 0; leave
+        # at 0 unless intentionally amplifying HWM.
         upward_reward = 0.0
-        if self.cfg_env.upward_velocity_coeff > 0.0:
-            dz = com_z - self._prev_com_z
-            upward_reward = self.cfg_env.upward_velocity_coeff * max(0.0, dz)
+        if self.cfg_env.upward_velocity_coeff > 0.0 and hwm_gain > 0.0:
+            upward_reward = self.cfg_env.upward_velocity_coeff * hwm_gain
         self._prev_com_z = com_z
 
-        # Rising-edge per (limb, hold) hold-match bonus; also count releases.
+        # Rising-edge per (limb, hold) hold-match bonus + new-high-grip
+        # bonus when this grip event raises the episode's max gripped-z.
+        # Also count releases.
         match_bonus = 0.0
+        high_grip_bonus = 0.0
         n_released = 0
         for limb in LIMBS:
             cur = self.world.on_hold(limb)
@@ -357,6 +402,14 @@ class Climbing3DEnv(gym.Env):
                 if key not in self._holds_matched_this_episode:
                     self._holds_matched_this_episode.add(key)
                     match_bonus += self.cfg_env.hold_match_bonus
+                # Check whether this grip advances the episode's max
+                # gripped-hold z. Each height level only pays once per
+                # episode — re-grabbing the same hold with another limb
+                # doesn't trigger it (since it didn't raise the max).
+                hold_z = float(self.world._hold_meta_by_id[cur]["world_pos"][2])
+                if hold_z > self._max_grip_z:
+                    high_grip_bonus += self.cfg_env.new_high_grip_bonus
+                    self._max_grip_z = hold_z
             if prev is not None and cur is None:
                 n_released += 1
             self._prev_grip[limb] = cur
@@ -399,6 +452,7 @@ class Climbing3DEnv(gym.Env):
             + approach_reward
             + survival_reward
             + match_bonus
+            + high_grip_bonus
             - release_penalty
             - self.cfg_env.slip_penalty * slips
             - self.cfg_env.body_intersection_penalty * body_intersections
@@ -440,6 +494,7 @@ class Climbing3DEnv(gym.Env):
         info["approach_reward"] = float(approach_reward)
         info["survival_reward"] = float(survival_reward)
         info["match_bonus"] = float(match_bonus)
+        info["high_grip_bonus"] = float(high_grip_bonus)
         info["release_penalty"] = float(release_penalty)
         info["energy_penalty"] = float(self.cfg_env.energy_penalty_coeff * ctrl_l2_sq)
         return self._obs(), float(reward), terminated, truncated, info

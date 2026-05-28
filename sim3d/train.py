@@ -70,6 +70,7 @@ class TrainConfig:
     move_frames: int = 24               # shorter for snap, longer for reach
     max_episode_steps: int = 30
     enable_slip: bool = True
+    fall_z: float = 0.20
     body_intersection_penalty: float = 20.0
     out_dir: str = "data/runs/sim3d"
     run_id: Optional[str] = None        # auto-generated from timestamp if None
@@ -98,9 +99,13 @@ class TrainConfig:
     survival_bonus_coeff: float = 0.0
     # Per-limb penalty applied on the step a grip releases.
     grip_release_penalty: float = 0.0
-    # Per-step reward for positive vertical COM motion (clipped at 0).
-    # Rewards the *journey* of climbing, complementing the HWM (peak) reward.
+    # GATED on HWM gain — now equivalent to extra hwm_height_scale, kept
+    # for backwards compatibility with old CLIs.
     upward_velocity_coeff: float = 0.0
+    # × max(0, com_z − episode_max_com_z) per step. Major signal.
+    hwm_height_scale: float = 50.0
+    # Lump-sum reward when a grip event raises episode_max_grip_z.
+    new_high_grip_bonus: float = 75.0
     # Warm-start: path to an existing model.zip whose policy weights are
     # copied into the new model at construction. Hyperparameters (lr,
     # clip_range, ent_coef, etc.) and reward coefficients come from the
@@ -250,6 +255,7 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         move_frames=cfg.move_frames,
         max_steps=cfg.max_episode_steps,
         enable_slip=cfg.enable_slip,
+        fall_z=cfg.fall_z,
         body_intersection_penalty=cfg.body_intersection_penalty,
         grip_intent_deadband=cfg.grip_intent_deadband,
         finish_approach_coeff=cfg.finish_approach_coeff,
@@ -257,6 +263,8 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         grip_release_penalty=cfg.grip_release_penalty,
         upward_velocity_coeff=cfg.upward_velocity_coeff,
         energy_penalty_coeff=cfg.energy_penalty_coeff,
+        hwm_height_scale=cfg.hwm_height_scale,
+        new_high_grip_bonus=cfg.new_high_grip_bonus,
     )
 
     def _factory():
@@ -556,6 +564,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--move-frames", type=int, default=24)
     p.add_argument("--episode-steps", type=int, default=30)
     p.add_argument("--no-slip", "--no_slip", dest="no_slip", action="store_true")
+    p.add_argument("--fall-z", type=float, default=0.20,
+                   help="Pelvis height below which the episode terminates as a fall. "
+                        "Default 0.20 m. Raise to 0.40 m to prevent floor-hanging "
+                        "on low footholds — forces the agent to maintain start-hold "
+                        "height or die.")
     p.add_argument("--body-intersection-penalty", type=float, default=20.0,
                    help="Reward penalty per limb-vs-torso/pelvis intersection contact (gating coefficient).")
     p.add_argument("--video-freq", type=int, default=100_000,
@@ -606,9 +619,20 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Per-limb penalty when a grip releases this step. "
                         "Discourages 'let go and dangle'. Try 1.0.")
     p.add_argument("--upward-velocity-coeff", type=float, default=0.0,
-                   help="Per-step reward: coeff * max(0, delta_com_z). "
-                        "Rewards climbing motion (downward = free, not penalised). "
-                        "Try 50.0 (1 cm upward = 0.5 reward).")
+                   help="GATED on HWM gain — effectively an extra coefficient "
+                        "on hwm_height_scale. Kept for backwards compatibility; "
+                        "the original path-dependent semantics was exploitable. "
+                        "Default 0; the default --hwm-height-scale 50 is the "
+                        "primary upward signal.")
+    p.add_argument("--hwm-height-scale", type=float, default=50.0,
+                   help="Reward per metre of new max-COM-z (high-water-mark). "
+                        "State-based — cannot be farmed by oscillation. "
+                        "Default 50 (≈75 reward for a full 1.5 m climb).")
+    p.add_argument("--new-high-grip-bonus", type=float, default=75.0,
+                   help="Lump-sum reward when a grip event raises the episode's "
+                        "max gripped-hold z. Each height level only pays once. "
+                        "Default 75 (a full route on climb-v1 → 2 height levels "
+                        "above start → +150 reward).")
     p.add_argument("--energy-penalty-coeff", type=float, default=0.001,
                    help="Per-step energy penalty: coeff * sum(ctrl^2). "
                         "Default 0.001 (was 0.005 which swamped the height signal).")
@@ -657,6 +681,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         move_frames=args.move_frames,
         max_episode_steps=args.episode_steps,
         enable_slip=not args.no_slip,
+        fall_z=args.fall_z,
         body_intersection_penalty=args.body_intersection_penalty,
         out_dir=args.out_dir,
         run_id=args.run_id,
@@ -676,6 +701,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         survival_bonus_coeff=args.survival_bonus_coeff,
         grip_release_penalty=args.grip_release_penalty,
         upward_velocity_coeff=args.upward_velocity_coeff,
+        hwm_height_scale=args.hwm_height_scale,
+        new_high_grip_bonus=args.new_high_grip_bonus,
         energy_penalty_coeff=args.energy_penalty_coeff,
         curriculum=args.curriculum,
         curriculum_start_difficulty=args.curriculum_start_difficulty,

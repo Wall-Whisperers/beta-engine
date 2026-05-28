@@ -239,18 +239,30 @@ Box(low=-inf, high=inf, shape=(127,), dtype=float32)
 
 | Component | Value | Notes |
 |---|---|---|
-| HWM height gain | `+5.0 × max(0, com_z − episode_max_com_z)` | Not farmable by oscillation |
-| First-touch hold match | `+5.0` rising-edge | Deduped per `(limb, hold_id)` per episode |
+| HWM height gain | `+50.0 × max(0, com_z − episode_max_com_z)` | State-based; un-hackable |
+| First-touch hold match | `+10.0` rising-edge | Deduped per `(limb, hold_id)` per episode |
+| New high-grip bonus | `+75.0` when grip raises `episode_max_grip_z` | Each height level pays once |
+| Finish approach | `+coeff × (prev_dist − cur_dist)` | Potential-based; use coeff=100 (full 2m route → +200) |
+| Survival (hand-gated) | `+coeff × (2·n_hand + n_foot)/6` | Only if survival_coeff≤0.02; default 0 — see warning |
+| Grip release | `−coeff × n_released` | Typical coeff 1.0 |
 | Slip | `−5.0 × n_slips` | Grip force exceeded hold capacity |
 | Body intersection | `−20.0 × n_contacts` | Hard gate, not shaping nudge |
-| Energy | `−0.005 × Σ ctrl²` | Discourages max-torque jitter |
+| Energy | `−0.0005 × Σ ctrl²` | Discourages max-torque jitter |
 | Invalid action | `−0.25` | Discrete-move only |
-| Terminal: finish | `+100` | One hand on finish hold ≥ 6 consecutive steps |
+| Terminal: finish | `+200` | One hand on finish hold ≥ 6 consecutive steps |
 | Terminal: fall | `−50` | pelvis_z < 0.20 m |
 
-**Known issue (NEXT_STEPS §B1):** energy penalty (~0.1/step) currently
-outweighs a 1 cm HWM gain (~0.05). Fix: lower `energy_penalty_coeff` to
-~0.001.
+**Anti-hack design (updated 2026-05-27):**
+- `upward_velocity_coeff` raw per-step form was oscillation-farmable (overnight_1 plateau).
+  Now GATED on HWM gain — equivalent to extra HWM scale, not a separate term.
+- `_max_com_z` MUST init at **seed pose com_z**, not 0. Initing at 0 gives a
+  free HWM bonus equal to `hwm_scale × seed_height` on reset step 1 — that +60
+  combined with survival bonus made floor-hanging profitable (overnight_2 exploit).
+- `survival_bonus_coeff` must be ≤ 0.02 or 0. Any larger value creates a
+  stable attractor at "grip lowest holds forever" (ceiling × coeff beats fall
+  penalty; overnight_2 plateaued at survival ceiling with COM-z = 0.27 m).
+- `finish_approach_coeff` is the primary dense signal. Total reward for a
+  full climb = coeff × route_length. Use coeff ≥ 50; default recommended: 100.
 
 ---
 
