@@ -20,7 +20,7 @@ from sim3d.world import Climb3DWorld
 
 
 @contextmanager
-def native_viewer(world: Climb3DWorld):
+def native_viewer(world: Climb3DWorld, *, hidden_groups: tuple[int, ...] = ()):
     """Yield a passive viewer attached to `world.model` / `world.data`.
 
     Use as:
@@ -29,6 +29,10 @@ def native_viewer(world: Climb3DWorld):
             while viewer.is_running():
                 world.step()
                 viewer.sync()
+
+    ``hidden_groups`` toggles off the named MuJoCo geom groups (0–5) in
+    the viewer's render options — geoms assigned to those groups will
+    not be drawn.
     """
     import mujoco.viewer  # deferred import — needs an OpenGL display
     with mujoco.viewer.launch_passive(world.model, world.data) as viewer:
@@ -38,6 +42,9 @@ def native_viewer(world: Climb3DWorld):
         viewer.cam.distance = max(3.5, world.wall.height_cm / 100.0 * 0.9)
         viewer.cam.azimuth = 90.0       # camera on the +Y side
         viewer.cam.elevation = -10.0
+        for g in hidden_groups:
+            if 0 <= g < len(viewer.opt.geomgroup):
+                viewer.opt.geomgroup[g] = 0
         yield viewer
 
 
@@ -46,6 +53,7 @@ def run_demo(
     *,
     duration_s: float = 30.0,
     on_frame: Optional[Callable[[Climb3DWorld, float], None]] = None,
+    hidden_groups: tuple[int, ...] = (),
 ) -> None:
     """Spin up the native viewer and step `world` in real time for
     `duration_s`. Handy for `python -m sim3d`.
@@ -54,7 +62,7 @@ def run_demo(
     moves over time without having to write a viewer loop yourself.
     """
     from sim3d import config as cfg
-    with native_viewer(world) as viewer:
+    with native_viewer(world, hidden_groups=hidden_groups) as viewer:
         sim_start = time.monotonic()
         next_render = sim_start
         frame_dt = 1.0 / cfg.RENDER_HZ

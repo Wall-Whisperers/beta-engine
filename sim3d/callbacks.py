@@ -9,6 +9,7 @@ prints a one-time warning and becomes a no-op.
 """
 from __future__ import annotations
 
+import collections
 import os
 from typing import Optional
 
@@ -69,6 +70,132 @@ class FirstMidLastCheckpointCallback(BaseCallback):
         self.model.save(path)
         if self.verbose:
             print(f"[FirstMidLastCheckpointCallback] saved {path} at step {self.num_timesteps}")
+
+
+class RollingBestCheckpointCallback(BaseCallback):
+    """Crash-safe checkpoints + best-policy tracking for overnight runs.
+
+    Writes three .zip files in ``out_dir``, each saved atomically (via
+    write-to-temp + os.replace) so a kill mid-write cannot corrupt them:
+
+        model_latest.zip         overwritten every ``save_freq`` env steps
+        model_best_reward.zip    overwritten when rolling avg episode reward
+                                 over the last ``window`` episodes hits a
+                                 new high (with a small improvement floor
+                                 so noise can't trigger constant rewrites)
+        model_best_height.zip    overwritten when a new max final_com_z is
+                                 observed across the run
+
+    The two metrics tracked are intentional: rolling reward catches "the
+    overall policy is getting better", and max com_z catches "the climber
+    actually moved upward" — neither alone is sufficient (a perfect-hang
+    policy maxes reward but plateaus on height; a one-time lucky high
+    com_z spike doesn't mean the policy learned anything).
+    """
+
+    REWARD_IMPROVE_FLOOR = 1.0   # require ≥ +1.0 reward gain to overwrite
+    HEIGHT_IMPROVE_FLOOR = 0.005  # require ≥ 5 mm to overwrite
+
+    def __init__(
+        self,
+        out_dir: str,
+        save_freq: int = 25_000,
+        window: int = 100,
+        min_episodes_for_best: int = 25,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self._out_dir = out_dir
+        self._save_freq = int(save_freq)
+        self._window = int(window)
+        self._min_for_best = int(min_episodes_for_best)
+        self._last_latest_save = 0
+        self._rewards: collections.deque[float] = collections.deque(maxlen=window)
+        self._best_rolling_rew = -float("inf")
+        self._best_com_z = -float("inf")
+        os.makedirs(out_dir, exist_ok=True)
+
+    def _on_step(self) -> bool:
+        # 1. Periodic crash-recovery snapshot.
+        if self.num_timesteps - self._last_latest_save >= self._save_freq:
+            self._save_atomic("model_latest.zip")
+            self._last_latest_save = self.num_timesteps
+
+        # 2. On episode terminations, update rolling stats + best-model files.
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", None)
+        if dones is None:
+            dones = [False] * len(infos)
+        for info, done in zip(infos, dones):
+            if not done:
+                continue
+            # Monitor wraps each env and injects 'episode': {'r': total_r, 'l': len}
+            ep = info.get("episode") if isinstance(info, dict) else None
+            if ep is not None:
+                self._rewards.append(float(ep["r"]))
+                if len(self._rewards) >= self._min_for_best:
+                    avg = sum(self._rewards) / len(self._rewards)
+                    if avg > self._best_rolling_rew + self.REWARD_IMPROVE_FLOOR:
+                        self._best_rolling_rew = avg
+                        self._save_atomic("model_best_reward.zip")
+                        if self.verbose:
+                            print(f"[RollingBest] new best avg_rew={avg:+.2f} "
+                                  f"at step {self.num_timesteps}")
+            # final_com_z lives in info['com'] (set by env._info()).
+            com = info.get("com") if isinstance(info, dict) else None
+            if com is not None:
+                try:
+                    z = float(com[2])
+                except (TypeError, IndexError):
+                    z = None
+                if z is not None and z > self._best_com_z + self.HEIGHT_IMPROVE_FLOOR:
+                    self._best_com_z = z
+                    self._save_atomic("model_best_height.zip")
+                    if self.verbose:
+                        print(f"[RollingBest] new max com_z={z:.3f} m "
+                              f"at step {self.num_timesteps}")
+        return True
+
+    def _on_training_end(self) -> None:
+        # One final latest snapshot on graceful exit.
+        self._save_atomic("model_latest.zip")
+
+    def _save_atomic(self, name: str) -> None:
+        """Atomic save: write to a sibling .tmp_<name> file, then os.replace.
+
+        os.replace is atomic on both Windows and POSIX, so a crash during
+        the underlying zip write leaves the previous (intact) file in
+        place. A torn temp can be ignored on restart.
+
+        SB3's PPO.save uses ``pathlib.Path.with_suffix(".zip")`` which
+        REPLACES any existing suffix (so "foo.tmp" becomes "foo.zip", not
+        "foo.tmp.zip"). To prevent SB3 from mangling our temp path we
+        give it a name that already ends in ``.zip`` — Path.with_suffix
+        leaves a matching suffix untouched.
+        """
+        final_path = os.path.join(self._out_dir, name)
+        base_no_ext = name[:-4] if name.endswith(".zip") else name
+        # The leading underscore-prefix lives ONLY on the temp file so
+        # tools that glob *.zip don't get confused mid-write.
+        tmp_path = os.path.join(self._out_dir, f"_tmp_{base_no_ext}.zip")
+        try:
+            self.model.save(tmp_path)
+            if not os.path.exists(tmp_path):
+                # Defensive: if SB3 ever changes its path handling and
+                # writes elsewhere, fall back to a direct save and skip
+                # atomicity rather than crash.
+                self.model.save(final_path)
+                return
+            os.replace(tmp_path, final_path)
+        except Exception as e:  # noqa: BLE001
+            # Don't kill training over a checkpoint hiccup.
+            if self.verbose:
+                print(f"[RollingBest] save failed for {name}: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 class VideoRolloutCallback(BaseCallback):

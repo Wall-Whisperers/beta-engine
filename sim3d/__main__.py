@@ -173,6 +173,11 @@ def main(argv: list[str] | None = None) -> int:
              "single-frame chunks with viewer.sync + sleep between them.",
     )
     p.add_argument(
+        "--transparent-wall", action="store_true",
+        help="Make the wall plate, kickboard, and floor see-through so the "
+             "climber is visible from the wall side too. Holds stay solid.",
+    )
+    p.add_argument(
         "--move-mode", default="reach", choices=("snap", "reach", "dyno"),
         help="Limb-move mode for scripted betas and policy replay.",
     )
@@ -242,6 +247,25 @@ def main(argv: list[str] | None = None) -> int:
         mass_kg=args.mass,
     )
     world = Climb3DWorld(wall, profile)
+
+    if args.transparent_wall:
+        # Hide the wall plate, kickboard plate, and floor entirely.
+        # Two-pronged: set alpha=0 AND move the geoms to group 3, which we
+        # then hide via viewer.opt.geomgroup[3] = 0 once the viewer opens.
+        # Alpha=0 alone is unreliable across MuJoCo render paths; the group
+        # toggle is the authoritative invisibility switch.
+        import mujoco as _mj
+        _hidden = []
+        for gid in range(world.model.ngeom):
+            name = _mj.mj_id2name(world.model, _mj.mjtObj.mjOBJ_GEOM, gid)
+            if name in ("g_wall", "g_kickboard", "floor"):
+                world.model.geom_rgba[gid, 3] = 0.0
+                world.model.geom_group[gid] = 3
+                _hidden.append(name)
+        # Stash the flag for later viewer-context setup.
+        _hide_group_3 = bool(_hidden)
+    else:
+        _hide_group_3 = False
 
     def _start_hand_targets() -> tuple[str | None, str | None]:
         starts = sorted(wall.starts(), key=lambda h: h.x_cm)
@@ -380,7 +404,18 @@ def main(argv: list[str] | None = None) -> int:
         substeps = env.cfg_env.sim_substeps
         frame_dt = 1.0 / cfg.RENDER_HZ
         sleep_per_frame = (slowmo - 1.0) * frame_dt
-        with native_viewer(env.world) as viewer:
+        # The replay env is a fresh Climbing3DEnv built above, so its world
+        # is a different MjModel than the one we mutated for transparency.
+        # Re-apply the hide to that model too.
+        if _hide_group_3:
+            import mujoco as _mj
+            for gid in range(env.world.model.ngeom):
+                name = _mj.mj_id2name(env.world.model, _mj.mjtObj.mjOBJ_GEOM, gid)
+                if name in ("g_wall", "g_kickboard", "floor"):
+                    env.world.model.geom_rgba[gid, 3] = 0.0
+                    env.world.model.geom_group[gid] = 3
+        _hidden = (3,) if _hide_group_3 else ()
+        with native_viewer(env.world, hidden_groups=_hidden) as viewer:
             done = False
             while viewer.is_running() and not done:
                 action, _ = model.predict(obs, deterministic=True)
@@ -467,7 +502,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Climber: {profile.height_cm:.0f} cm / {profile.wingspan_cm:.0f} cm wingspan / {profile.mass_kg:.0f} kg")
     print("Native MuJoCo viewer running. Close the window or Ctrl+C to quit.")
     try:
-        run_demo(world, duration_s=args.duration, on_frame=on_frame)
+        run_demo(
+            world,
+            duration_s=args.duration,
+            on_frame=on_frame,
+            hidden_groups=(3,) if _hide_group_3 else (),
+        )
     except KeyboardInterrupt:
         pass
     return 0

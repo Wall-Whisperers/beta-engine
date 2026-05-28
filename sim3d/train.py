@@ -98,6 +98,22 @@ class TrainConfig:
     survival_bonus_coeff: float = 0.0
     # Per-limb penalty applied on the step a grip releases.
     grip_release_penalty: float = 0.0
+    # Per-step reward for positive vertical COM motion (clipped at 0).
+    # Rewards the *journey* of climbing, complementing the HWM (peak) reward.
+    upward_velocity_coeff: float = 0.0
+    # Warm-start: path to an existing model.zip whose policy weights are
+    # copied into the new model at construction. Hyperparameters (lr,
+    # clip_range, ent_coef, etc.) and reward coefficients come from the
+    # current run's config — only the network weights transfer.
+    init_from: str = ""
+    # Real resume: path to a model.zip to continue training from. Restores
+    # policy weights AND optimizer state AND timestep counter. CSV is
+    # appended. Use this to recover from a crash; use init_from to start a
+    # new experiment from an old policy with different hyperparameters.
+    resume: str = ""
+    # Env-step interval at which model_latest.zip is overwritten by the
+    # RollingBestCheckpointCallback (crash-safe atomic write).
+    save_freq: int = 25_000
     # Energy penalty. Default env=0.001 (lowered from 0.005 which
     # swamped the HWM height signal).
     energy_penalty_coeff: float = 0.001
@@ -125,26 +141,37 @@ class _EpisodeStatsCallback:
     episode, columns: episode, total_steps, reward, length, outcome.
     """
 
-    def __init__(self, csv_path: Path, BaseCallback) -> None:
+    def __init__(self, csv_path: Path, BaseCallback, *, append: bool = False) -> None:
         self._csv_path = csv_path
         self._fh = None
         self._writer = None
         self._episode = 0
         self._BaseCallback = BaseCallback
         self._impl = None  # The real BaseCallback subclass
+        self._append = bool(append)
 
     def build(self):
         outer = self
 
         class _Cb(self._BaseCallback):
             def _on_training_start(self) -> None:
-                outer._fh = open(outer._csv_path, "w", newline="", encoding="utf-8")
-                outer._writer = csv.writer(outer._fh)
-                outer._writer.writerow([
-                    "episode", "total_steps", "reward", "length",
-                    "outcome", "final_com_z", "n_slips", "body_intersections",
-                    "curriculum_difficulty",
-                ])
+                if outer._append and outer._csv_path.exists():
+                    # Resume: append without re-writing the header. Also pick
+                    # up the prior episode count so 'episode' column stays
+                    # monotonic across the crash.
+                    with open(outer._csv_path, "r", encoding="utf-8") as rf:
+                        prior_lines = sum(1 for _ in rf)
+                    outer._episode = max(0, prior_lines - 1)
+                    outer._fh = open(outer._csv_path, "a", newline="", encoding="utf-8")
+                    outer._writer = csv.writer(outer._fh)
+                else:
+                    outer._fh = open(outer._csv_path, "w", newline="", encoding="utf-8")
+                    outer._writer = csv.writer(outer._fh)
+                    outer._writer.writerow([
+                        "episode", "total_steps", "reward", "length",
+                        "outcome", "final_com_z", "n_slips", "body_intersections",
+                        "curriculum_difficulty",
+                    ])
 
             def _on_step(self) -> bool:
                 # SB3 stuffs episode info into self.locals when an
@@ -228,6 +255,7 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         finish_approach_coeff=cfg.finish_approach_coeff,
         survival_bonus_coeff=cfg.survival_bonus_coeff,
         grip_release_penalty=cfg.grip_release_penalty,
+        upward_velocity_coeff=cfg.upward_velocity_coeff,
         energy_penalty_coeff=cfg.energy_penalty_coeff,
     )
 
@@ -332,29 +360,83 @@ def train(cfg: TrainConfig) -> Path:
     if cfg.log_std_init != 0.0:
         policy_kwargs["log_std_init"] = cfg.log_std_init
 
-    model = sb3.PPO(
-        "MlpPolicy",
-        vec_env,
-        learning_rate=cfg.learning_rate,
-        n_steps=cfg.n_steps,
-        batch_size=cfg.batch_size,
-        n_epochs=cfg.n_epochs,
-        gamma=cfg.gamma,
-        clip_range=cfg.clip_range,
-        ent_coef=cfg.ent_coef,
-        seed=cfg.seed,
-        tensorboard_log=tb_log,
-        device=cfg.device,
-        verbose=1,
-        policy_kwargs=policy_kwargs if policy_kwargs else None,
-    )
+    if cfg.resume and cfg.init_from:
+        raise SystemExit(
+            "--resume and --init-from are mutually exclusive. "
+            "--resume continues a crashed run (restores optimizer + step "
+            "counter); --init-from copies weights into a new experiment."
+        )
 
-    csv_cb = _EpisodeStatsCallback(out_dir / "episode_stats.csv", BaseCallback).build()
+    reset_num_timesteps = True
+    if cfg.resume:
+        from pathlib import Path as _P
+        resume_path = _P(cfg.resume)
+        if not resume_path.exists():
+            raise SystemExit(f"--resume path does not exist: {resume_path}")
+        print(f"Resuming training from {resume_path}")
+        # PPO.load restores policy weights, optimizer moments, and the
+        # num_timesteps counter. We pass custom_objects to override any
+        # hyperparameter that may have changed in the new CLI invocation —
+        # without this, the saved values would be silently used and tuning
+        # via CLI between resumes would be a no-op.
+        custom_objects = {
+            "learning_rate": cfg.learning_rate,
+            "clip_range":    cfg.clip_range,
+            "ent_coef":      cfg.ent_coef,
+            "n_epochs":      cfg.n_epochs,
+            "n_steps":       cfg.n_steps,
+            "batch_size":    cfg.batch_size,
+            "gamma":         cfg.gamma,
+        }
+        model = sb3.PPO.load(
+            str(resume_path),
+            env=vec_env,
+            device=cfg.device,
+            tensorboard_log=tb_log,
+            custom_objects=custom_objects,
+        )
+        reset_num_timesteps = False
+        print(f"  resumed at step {model.num_timesteps}, "
+              f"target = {cfg.total_timesteps}")
+    else:
+        model = sb3.PPO(
+            "MlpPolicy",
+            vec_env,
+            learning_rate=cfg.learning_rate,
+            n_steps=cfg.n_steps,
+            batch_size=cfg.batch_size,
+            n_epochs=cfg.n_epochs,
+            gamma=cfg.gamma,
+            clip_range=cfg.clip_range,
+            ent_coef=cfg.ent_coef,
+            seed=cfg.seed,
+            tensorboard_log=tb_log,
+            device=cfg.device,
+            verbose=1,
+            policy_kwargs=policy_kwargs if policy_kwargs else None,
+        )
+
+        if cfg.init_from:
+            from pathlib import Path as _P
+            init_path = _P(cfg.init_from)
+            if not init_path.exists():
+                raise SystemExit(f"--init-from path does not exist: {init_path}")
+            print(f"Warm-starting policy from {init_path}")
+            loaded = sb3.PPO.load(str(init_path), device=cfg.device)
+            # Copy weights only — keep the new model's hyperparameters and env.
+            model.set_parameters(loaded.get_parameters(), exact_match=False)
+
+    csv_cb = _EpisodeStatsCallback(
+        out_dir / "episode_stats.csv",
+        BaseCallback,
+        append=bool(cfg.resume),
+    ).build()
 
     # Compose the callback list: CSV stats + first/mid/last checkpoints +
-    # (optionally) the periodic mp4 video rollout.
+    # crash-safe rolling-best checkpoints + (optionally) periodic mp4.
     from sim3d.callbacks import (
         FirstMidLastCheckpointCallback,
+        RollingBestCheckpointCallback,
         VideoRolloutCallback,
     )
     callbacks = [
@@ -363,6 +445,12 @@ def train(cfg: TrainConfig) -> Path:
             out_dir=str(out_dir),
             total_timesteps=cfg.total_timesteps,
             first_at=cfg.checkpoint_first_at,
+            verbose=1,
+        ),
+        RollingBestCheckpointCallback(
+            out_dir=str(out_dir),
+            save_freq=cfg.save_freq,
+            window=100,
             verbose=1,
         ),
     ]
@@ -379,8 +467,12 @@ def train(cfg: TrainConfig) -> Path:
             )
         )
 
-    model.learn(total_timesteps=cfg.total_timesteps, callback=callbacks,
-                progress_bar=False)
+    model.learn(
+        total_timesteps=cfg.total_timesteps,
+        callback=callbacks,
+        progress_bar=False,
+        reset_num_timesteps=reset_num_timesteps,
+    )
     model.save(out_dir / "model.zip")
 
     print(f"\nTraining complete. Run dir: {out_dir}")
@@ -473,12 +565,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--out-dir", default="data/runs/sim3d")
     p.add_argument("--run-id", default=None,
                    help="Custom run id; default = run_<timestamp>.")
+    p.add_argument("--init-from", default="",
+                   help="Warm-start: path to an existing model.zip whose "
+                        "policy weights are copied into the new model. "
+                        "Hyperparameters and reward come from the new config; "
+                        "only network weights transfer.")
+    p.add_argument("--resume", default="",
+                   help="Resume training from a saved model.zip. Restores "
+                        "policy weights, optimizer state, and the timestep "
+                        "counter. Appends to episode_stats.csv. Use this to "
+                        "recover from a crash. Mutually exclusive with "
+                        "--init-from.")
+    p.add_argument("--save-freq", type=int, default=25_000,
+                   help="Env-step interval at which model_latest.zip is "
+                        "overwritten by the crash-safe checkpoint callback.")
     p.add_argument("--n-envs", type=int, default=1,
                    help="Parallel environment workers. Use >1 to speed up CPU-bound MuJoCo rollouts.")
     p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
                    help="PyTorch device for PPO policy updates. Env simulation still runs on CPU.")
     p.add_argument("--log-std-init", type=float, default=0.0,
-                   help="Initial log-std for the Gaussian policy. -1.5 → std≈0.22, "
+                   help="Initial log-std for the Gaussian policy. -1.5 -> std~0.22, "
                         "keeps early actions small so grips aren't randomly dropped on step 1.")
     p.add_argument("--grip-deadband", type=float, default=0.0,
                    help="Grip intent deadband. Intents in (-db, +db) hold current grip state. "
@@ -490,17 +596,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--n-epochs", type=int, default=10,
                    help="PPO optimisation epochs per rollout. Default SB3=10.")
     p.add_argument("--finish-approach-coeff", type=float, default=0.0,
-                   help="Dense shaping reward: coeff × (prev_dist_to_finish − cur_dist). "
-                        "Set 1.0–3.0 to give the agent a gradient toward the finish hold.")
+                   help="Dense shaping reward: coeff * (prev_dist_to_finish - cur_dist). "
+                        "Set 1.0-3.0 to give the agent a gradient toward the finish hold.")
     p.add_argument("--survival-bonus-coeff", type=float, default=0.0,
-                   help="Per-step reward: coeff × weighted_grip_fraction "
-                        "(hands 2×, feet 1×; capped at coeff). "
+                   help="Per-step reward: coeff * weighted_grip_fraction "
+                        "(hands 2x, feet 1x; capped at coeff). "
                         "Teaches the agent to stay on the wall. Try 0.5.")
     p.add_argument("--grip-release-penalty", type=float, default=0.0,
                    help="Per-limb penalty when a grip releases this step. "
                         "Discourages 'let go and dangle'. Try 1.0.")
+    p.add_argument("--upward-velocity-coeff", type=float, default=0.0,
+                   help="Per-step reward: coeff * max(0, delta_com_z). "
+                        "Rewards climbing motion (downward = free, not penalised). "
+                        "Try 50.0 (1 cm upward = 0.5 reward).")
     p.add_argument("--energy-penalty-coeff", type=float, default=0.001,
-                   help="Per-step energy penalty: coeff × Σctrl². "
+                   help="Per-step energy penalty: coeff * sum(ctrl^2). "
                         "Default 0.001 (was 0.005 which swamped the height signal).")
     p.add_argument("--curriculum", action="store_true",
                    help="Train on procedurally generated walls with automatic difficulty scheduling.")
@@ -550,6 +660,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         body_intersection_penalty=args.body_intersection_penalty,
         out_dir=args.out_dir,
         run_id=args.run_id,
+        init_from=args.init_from,
+        resume=args.resume,
+        save_freq=args.save_freq,
         n_envs=args.n_envs,
         device=args.device,
         video_freq=args.video_freq,
@@ -562,6 +675,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         finish_approach_coeff=args.finish_approach_coeff,
         survival_bonus_coeff=args.survival_bonus_coeff,
         grip_release_penalty=args.grip_release_penalty,
+        upward_velocity_coeff=args.upward_velocity_coeff,
         energy_penalty_coeff=args.energy_penalty_coeff,
         curriculum=args.curriculum,
         curriculum_start_difficulty=args.curriculum_start_difficulty,

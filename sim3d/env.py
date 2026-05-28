@@ -80,6 +80,13 @@ class EnvConfig:
     # Penalty per limb that was gripping last step but isn't now. Without
     # this, releasing is free and dangling-off-the-wall becomes an attractor.
     grip_release_penalty: float = 0.0
+    # Per-step reward proportional to positive vertical COM motion:
+    # reward += upward_velocity_coeff × max(0, com_z − prev_com_z).
+    # Downward motion is free (not penalised), so oscillation can't farm —
+    # the only way to accumulate this is to climb. Pairs with the HWM term:
+    # HWM rewards the *peak*, this rewards the journey there. Try 50.0
+    # (so 1 cm upward = 0.5 reward, 1 m climb = 50 reward).
+    upward_velocity_coeff: float = 0.0
     enable_slip: bool = True
     # Grip intent deadband.  Any intent in (-grip_intent_deadband,
     # +grip_intent_deadband) leaves the current grip state unchanged.
@@ -241,6 +248,7 @@ class Climbing3DEnv(gym.Env):
         self._holds_matched_this_episode = set()
         self._prev_grip = {l: self.world.on_hold(l) for l in LIMBS}
         self._prev_finish_dist = self._finish_dist()
+        self._prev_com_z = float(self.world.com()[2])
         return self._obs(), self._info()
 
     # ─── Pose seeding helpers (unchanged from prior implementation) ──
@@ -330,6 +338,14 @@ class Climbing3DEnv(gym.Env):
             height_reward = self.cfg_env.hwm_height_scale * (com_z - self._max_com_z)
             self._max_com_z = com_z
 
+        # Per-step upward-velocity bonus (rewards motion, not just peaks).
+        # Only positive vertical motion counts — oscillation can't farm.
+        upward_reward = 0.0
+        if self.cfg_env.upward_velocity_coeff > 0.0:
+            dz = com_z - self._prev_com_z
+            upward_reward = self.cfg_env.upward_velocity_coeff * max(0.0, dz)
+        self._prev_com_z = com_z
+
         # Rising-edge per (limb, hold) hold-match bonus; also count releases.
         match_bonus = 0.0
         n_released = 0
@@ -357,16 +373,20 @@ class Climbing3DEnv(gym.Env):
             )
             self._prev_finish_dist = cur_dist
 
-        # Per-step survival bonus: weighted fraction of limbs gripped.
-        # Hands count 2×, feet count 1×; max weighted sum = 6 → normalize so
-        # all-4-gripped == coeff (i.e. the bonus is capped at coeff/step).
-        # Teaches the agent to hold the wall before it learns to climb it.
+        # Per-step survival bonus: weighted fraction of limbs gripped, GATED
+        # on at least one hand being engaged. Without the hand-gate the agent
+        # learns to sit on the footholds with both hands free — technically
+        # "on the wall" but the opposite of climbing. With the gate, no
+        # bonus accrues until a hand is on a hold.
+        # Hands count 2×, feet count 1×; max weighted sum = 6 → bonus is
+        # capped at coeff/step when all 4 limbs are gripped.
         survival_reward = 0.0
         if self.cfg_env.survival_bonus_coeff > 0.0:
             n_hand = sum(1 for l in HAND_LIMBS if self.world.on_hold(l) is not None)
-            n_foot = sum(1 for l in FOOT_LIMBS if self.world.on_hold(l) is not None)
-            weighted = (2 * n_hand + n_foot) / 6.0
-            survival_reward = self.cfg_env.survival_bonus_coeff * weighted
+            if n_hand >= 1:
+                n_foot = sum(1 for l in FOOT_LIMBS if self.world.on_hold(l) is not None)
+                weighted = (2 * n_hand + n_foot) / 6.0
+                survival_reward = self.cfg_env.survival_bonus_coeff * weighted
 
         # Penalty for each limb that released a grip this step. Combined with
         # the grip_intent_deadband this discourages the "let go and dangle"
@@ -375,6 +395,7 @@ class Climbing3DEnv(gym.Env):
 
         reward = (
             height_reward
+            + upward_reward
             + approach_reward
             + survival_reward
             + match_bonus
@@ -415,7 +436,12 @@ class Climbing3DEnv(gym.Env):
         info["slips"] = slips
         info["body_intersections"] = body_intersections
         info["height_reward"] = float(height_reward)
-        info["hold_match_bonus"] = float(match_bonus)
+        info["upward_reward"] = float(upward_reward)
+        info["approach_reward"] = float(approach_reward)
+        info["survival_reward"] = float(survival_reward)
+        info["match_bonus"] = float(match_bonus)
+        info["release_penalty"] = float(release_penalty)
+        info["energy_penalty"] = float(self.cfg_env.energy_penalty_coeff * ctrl_l2_sq)
         return self._obs(), float(reward), terminated, truncated, info
 
     # ─── Action handling ─────────────────────────────────────────────
