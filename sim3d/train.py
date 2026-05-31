@@ -68,7 +68,10 @@ class TrainConfig:
     move_mode: str = "reach"            # snap is faster but less realistic
     start_mode: str = "seed"            # seed | ground-reach
     move_frames: int = 24               # shorter for snap, longer for reach
-    max_episode_steps: int = 30
+    # Continuous-joint control runs at ~7.8 Hz, so 30 steps = 3.84 s — far
+    # too short to climb (a MoonBoard problem takes 10-60 s). 1000 ≈ 128 s.
+    # (30 was a discrete-move holdover where 1 step = 1 full limb move.)
+    max_episode_steps: int = 1000
     enable_slip: bool = True
     fall_z: float = 0.20
     body_intersection_penalty: float = 20.0
@@ -79,10 +82,11 @@ class TrainConfig:
     # ── PPO algorithm knobs ──────────────────────────────────────────
     # Policy init — lower log_std_init shrinks the initial action std so
     # grips aren't randomly released on the first step.  -1.5 → std≈0.22.
-    log_std_init: float = 0.0
+    # Default 0.0 (std 1.0) releases ~2 grips on step 1 → instant fall.
+    log_std_init: float = -1.5
     # Grip deadband — intents in (-db, +db) hold current grip state.
     # Pair with log_std_init=-1.5 and db=0.2 for stable early training.
-    grip_intent_deadband: float = 0.0
+    grip_intent_deadband: float = 0.2
     # PPO clip range. Default SB3=0.2. Lower (0.1) for more conservative
     # updates — important when clip_fraction is high (>0.4).
     clip_range: float = 0.2
@@ -562,7 +566,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--start-mode", default="seed", choices=("seed", "ground-reach"),
                    help="seed starts welded on route holds; ground-reach starts on the floor and reaches to start hands.")
     p.add_argument("--move-frames", type=int, default=24)
-    p.add_argument("--episode-steps", type=int, default=30)
+    p.add_argument("--episode-steps", type=int, default=1000,
+                   help="Max env steps per episode. Continuous control is ~7.8 Hz, "
+                        "so 1000 ≈ 128 s. Use ~30 only for discrete-move.")
     p.add_argument("--no-slip", "--no_slip", dest="no_slip", action="store_true")
     p.add_argument("--fall-z", type=float, default=0.20,
                    help="Pelvis height below which the episode terminates as a fall. "
@@ -596,10 +602,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Parallel environment workers. Use >1 to speed up CPU-bound MuJoCo rollouts.")
     p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
                    help="PyTorch device for PPO policy updates. Env simulation still runs on CPU.")
-    p.add_argument("--log-std-init", type=float, default=0.0,
+    p.add_argument("--log-std-init", type=float, default=-1.5,
                    help="Initial log-std for the Gaussian policy. -1.5 -> std~0.22, "
                         "keeps early actions small so grips aren't randomly dropped on step 1.")
-    p.add_argument("--grip-deadband", type=float, default=0.0,
+    p.add_argument("--grip-deadband", type=float, default=0.2,
                    help="Grip intent deadband. Intents in (-db, +db) hold current grip state. "
                         "Use 0.2 with --log-std-init -1.5 for stable early training.")
     p.add_argument("--clip-range", type=float, default=0.2,
