@@ -30,6 +30,7 @@ model — exactly what RL needs for fast resets.
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -202,6 +203,12 @@ class Climb3DWorld:
         # Track slips for diagnostics / RL reward shaping.
         self.slip_events: list[SlipEvent] = []
         self._max_slip_log = 200
+
+        # Per-limb settled force / cap from the last seed_pose() call.
+        # Populated by the post-settle guard so callers can detect an
+        # over-braced seed (a limb the settle leaves above its slip cap).
+        self.seed_overload: dict[Limb, dict] = {}
+        self._seed_overload_warned = False
 
         # Continuous-reach state per limb (None = not reaching).
         self._reaching: dict[Limb, Optional[ReachState]] = {l: None for l in LIMBS}
@@ -422,6 +429,52 @@ class Climb3DWorld:
         # the actuator targets now match it; momentum can be reset.
         self.data.qvel[:] = 0.0
         self.slip_events.clear()
+
+        # ── 5) Over-brace guard ───────────────────────────────────
+        # The settle finds a self-consistent pose, but on geometry where
+        # the start holds force a contorted hang (e.g. hands near ankle
+        # height) the welds end up fighting each other and a limb can
+        # settle ABOVE its slip cap. With slip on, that limb releases on
+        # step 1 and the climber falls; with slip off it freezes in a
+        # tensioned pose and only jiggles. Neither is learnable. The
+        # settle cannot fix this — it is fixed by hold geometry — so the
+        # least we can do is surface it instead of failing silently.
+        self._record_seed_overload()
+
+    def _record_seed_overload(self) -> None:
+        """Measure each attached limb's settled force against its slip cap
+        and record/warn for any limb left over cap by the seed pose."""
+        mujoco.mj_forward(self.model, self.data)
+        self.seed_overload = {}
+        for limb in LIMBS:
+            attach = self._on_hold[limb]
+            if attach is None:
+                continue
+            f_mag = self._weld_force_magnitude(self._eq_idx[limb])
+            cap = attach.max_force_n * cfg.SLIP_FORCE_SLACK
+            if f_mag > cap:
+                self.seed_overload[limb] = {
+                    "hold_id": attach.hold_id,
+                    "force_n": float(f_mag),
+                    "cap_n": float(cap),
+                    "ratio": float(f_mag / cap) if cap > 0 else float("inf"),
+                }
+        if self.seed_overload and not self._seed_overload_warned:
+            self._seed_overload_warned = True
+            detail = ", ".join(
+                f"{l} {d['force_n']:.0f}N/{d['cap_n']:.0f}N "
+                f"({d['ratio']:.1f}x) on {d['hold_id']}"
+                for l, d in self.seed_overload.items()
+            )
+            print(
+                f"[seed_pose] WARNING: over-braced seed on wall "
+                f"'{self.wall.name}': {detail}. These limbs settle above "
+                f"their slip cap — with slip enabled the climber will shed "
+                f"them and fall on the first steps. The start-hold geometry "
+                f"is unhangable for this body; pick/generate holds with a "
+                f"larger hand-foot vertical gap.",
+                file=sys.stderr,
+            )
 
     # ─── Attach / release ─────────────────────────────────────────────
     def attach_limb(self, limb: Limb, hold_id: str) -> None:
@@ -678,7 +731,7 @@ class Climb3DWorld:
         is not on a hold."""
         if self._on_hold[limb] is None:
             return 0.0
-        return self._weld_force_magnitude(self._eq_idx[limb], limb)
+        return self._weld_force_magnitude(self._eq_idx[limb])
 
     def reset(self) -> None:
         mujoco.mj_resetData(self.model, self.data)
@@ -694,48 +747,46 @@ class Climb3DWorld:
         for i, qadr in enumerate(self._actuator_jnt_qposadr):
             self.data.ctrl[i] = self.data.qpos[qadr]
 
-    def _weld_force_magnitude(self, eq_idx: int, limb: Limb) -> float:
-        """Approximate the world-frame force on the limb body from this
-        equality. Computed from `data.qfrc_constraint` projected onto
-        the limb body's translational direction via the body Jacobian.
+    def _weld_force_magnitude(self, eq_idx: int) -> float:
+        """Linear force (N) carried by a single weld equality.
 
-        Why not `efc_force`? The raw Lagrange multipliers for a 6D
-        weld mix translation and rotation rows in different units
-        (Newtons and Newton-metres) — summing them gives a number with
-        no clean physical meaning. The Jacobian-projected approach
-        below returns the linear force the body sees, in Newtons.
+        Reads the constraint-force rows belonging to *this* weld from
+        `data.efc_force`, located via ``efc_id == eq_idx`` among the
+        equality-type rows. Each weld emits 6 rows; because holds are
+        welded with ``torquescale=0`` (position-only) the 3 rotational
+        rows are zero, so the norm over this weld's rows equals the
+        translational force magnitude in Newtons — isolated to this
+        limb, unlike `cfrc_int` (which sums every constraint acting on a
+        body, over-counting 6–16× when multiple limbs are loaded, and is
+        only populated by `mj_rnePostConstraint`, which `mj_step` never
+        calls — so it read identically zero and slip never fired).
 
-        This is still an approximation: the qfrc_constraint accumulates
-        forces from ALL active constraints (not just this weld). When
-        only one limb is welded, the result is exact; with four welds
-        active it's an upper bound. Good enough for slip detection.
+        `data.efc_*` is filled by the constraint solver inside `mj_step`,
+        so this is valid immediately after a step.
         """
-        body_id = self._limb_body_idx[limb]
-        # mj_objectVelocity / objectAcceleration / similar exists, but
-        # we want force. Use the body's Jacobian: f = J^T λ ⇒
-        # f_body = J · qfrc_constraint reverses out the world-frame
-        # force at the body origin. Approximated as the mass × the
-        # constraint-induced acceleration.
-        # Easier route — cfrc_int (internal) and cfrc_ext (external)
-        # constraint forces on each body are computed during step.
-        # cfrc_int[body, 0:3] is the *torque* and cfrc_int[body, 3:6]
-        # is the *linear force* applied to the body by joint/equality
-        # constraints (MuJoCo convention).
-        if self.data.cfrc_int is None or body_id >= len(self.data.cfrc_int):
+        d = self.data
+        nefc = int(d.nefc)
+        if nefc == 0:
             return 0.0
-        f = self.data.cfrc_int[body_id, 3:6]
-        return float(np.linalg.norm(f))
+        mask = (
+            (d.efc_type[:nefc] == int(mujoco.mjtConstraint.mjCNSTR_EQUALITY))
+            & (d.efc_id[:nefc] == eq_idx)
+        )
+        if not np.any(mask):
+            return 0.0
+        return float(np.linalg.norm(d.efc_force[:nefc][mask]))
 
     def _check_slip(self) -> int:
         """Detect any hold whose limb is exceeding its rated capacity
         and release it. Logs a SlipEvent for each release.
 
-        Single-substep dedup: cfrc_int sums contributions from ALL active
-        equality constraints onto a body, so when multiple welds are active
-        the per-limb force estimate over-counts. We accept at most one slip
-        per substep to avoid releasing several limbs from a single shared
-        spike. Known limitation; revisit if/when MuJoCo exposes a per-eq
-        constraint-force accessor.
+        Single-substep debounce: we release at most one limb per substep.
+        The per-weld force is now exact (see `_weld_force_magnitude`), so
+        this is no longer masking an over-count — it's a deliberate choice
+        to shed load one limb at a time. When several limbs are over cap,
+        popping the most-loaded one lets the next 2 ms substep redistribute
+        force before deciding whether the rest also slip, which yields a
+        graceful cascade instead of dropping all four from a single spike.
         """
         slip_count = 0
         slipped_this_substep = False
@@ -745,7 +796,7 @@ class Climb3DWorld:
             attach = self._on_hold[limb]
             if attach is None:
                 continue
-            f_mag = self._weld_force_magnitude(self._eq_idx[limb], limb)
+            f_mag = self._weld_force_magnitude(self._eq_idx[limb])
             cap = attach.max_force_n * cfg.SLIP_FORCE_SLACK
             if f_mag > cap:
                 slipped_this_substep = True
