@@ -101,7 +101,7 @@ class CurriculumConfig:
 
     # Generator
     gen_cols:          int   = 12
-    gen_rows:          int   = 18
+    gen_rows:          int   = 20  # see GeneratorConfig.rows: start sits 2 rows up
     gen_cell_size_cm:  float = DEFAULT_CELL_SIZE_CM
     gen_extra_holds:   int   = 8
 

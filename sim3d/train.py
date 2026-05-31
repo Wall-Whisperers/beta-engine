@@ -134,7 +134,7 @@ class TrainConfig:
     curriculum_down_threshold: float = 0.20
     curriculum_difficulty_step: float = 0.05
     curriculum_gen_cols: int = 12
-    curriculum_gen_rows: int = 18
+    curriculum_gen_rows: int = 20  # see GeneratorConfig.rows: start sits 2 rows up
     curriculum_fallback_wall: str = "example-v2-boulder"
 
 
@@ -652,8 +652,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Difficulty increment per up-tick (halved for down-ticks). Default: 0.05")
     p.add_argument("--curriculum-cols", type=int, default=12,
                    help="Grid columns for generated walls. Default: 12")
-    p.add_argument("--curriculum-rows", type=int, default=18,
-                   help="Grid rows for generated walls. Default: 18")
+    p.add_argument("--curriculum-rows", type=int, default=20,
+                   help="Grid rows for generated walls. Default: 20")
     p.add_argument("--curriculum-fallback-wall", default="example-v2-boulder",
                    help="Wall id to use if generation fails. Default: example-v2-boulder")
     args = p.parse_args(argv)

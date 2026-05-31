@@ -92,7 +92,11 @@ class GeneratorConfig:
     """
 
     cols: int = 12
-    rows: int = 18
+    # 20, not 18: the start hands sit ~2 rows up (see _build_holds) so the
+    # body can hang instead of crouch. That offset eats 2 rows of climb span,
+    # and at difficulty 1.0 the route no longer fits/verifies in 18 rows.
+    # 20 restores the original ~14-row climbable span above the start.
+    rows: int = 20
     cell_size_cm: float = DEFAULT_CELL_SIZE_CM
     difficulty: float = 0.5
     extra_holds: int = 8
@@ -200,17 +204,29 @@ def _build_holds(
         return base
 
     # ── Phase 1: Start holds ────────────────────────────────────────────────
-    # Two hands shoulder-width apart, two footholds directly below.
+    # Two hands shoulder-width apart, two footholds well below them.
     # Start holds are always jugs regardless of difficulty.
-    lh_pos = (cx - 1, 2)
-    rh_pos = (cx + 1, 2)
+    #
+    # Start height matters for hangability: seed_pose switches from its
+    # crouched branch to its extended (clean-hang) branch only when the
+    # hand-foot vertical gap clears ~0.50 m. Hands at row 2 (~40 cm with a
+    # 20 cm grid) gave a 40 cm gap, landing every generated wall in the
+    # crouch where the four welds fight and settle 3–4x over their slip cap
+    # — unhangable. The proven-hangable example walls (baby-v1, climb-v1)
+    # put hands ~80 cm up and feet ~20 cm up (a 60 cm gap), so we target the
+    # same heights, derived from cell size so this holds on any grid.
+    start_hand_row = max(2, round(80.0 / cfg.cell_size_cm))
+    start_foot_row = max(0, round(20.0 / cfg.cell_size_cm))
+    start_foot_row = min(start_foot_row, start_hand_row - 3)  # keep ≥0.5 m gap
+    lh_pos = (cx - 1, start_hand_row)
+    rh_pos = (cx + 1, start_hand_row)
     add_hold(*lh_pos, "jug", is_start=True)
     add_hold(*rh_pos, "jug", is_start=True)
-    add_hold(cx - 1, 0, "foothold")
-    add_hold(cx + 1, 0, "foothold")
+    add_hold(cx - 1, start_foot_row, "foothold")
+    add_hold(cx + 1, start_foot_row, "foothold")
 
     finish_row = cfg.rows - 2
-    foot_frontier = 0  # highest foothold row placed so far
+    foot_frontier = start_foot_row  # highest foothold row placed so far
 
     # ── Phase 2: Build hand spine ───────────────────────────────────────────
     alt = cycle(["LH", "RH"])
