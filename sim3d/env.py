@@ -214,6 +214,9 @@ class Climbing3DEnv(gym.Env):
         self._holds_matched_this_episode: set[tuple[str, str]] = set()
         self._prev_grip: dict[Limb, Optional[str]] = {l: None for l in LIMBS}
         self._prev_finish_dist: float = 0.0    # for dense finish-approach shaping
+        # Per-episode seed-pose joint targets; residual base for continuous
+        # actions (set in reset()). Midpoint until the first reset runs.
+        self._seed_ctrl = 0.5 * (self._act_lo + self._act_hi)
 
     # ─── Gym API ──────────────────────────────────────────────────────
     def reset(
@@ -278,6 +281,11 @@ class Climbing3DEnv(gym.Env):
         self._prev_grip = {l: self.world.on_hold(l) for l in LIMBS}
         self._prev_finish_dist = self._finish_dist()
         self._prev_com_z = float(self.world.com()[2])
+        # Snapshot the settled seed-pose joint targets. Continuous-joint
+        # actions are interpreted as residuals around THIS pose (see
+        # _step_continuous), so action≈0 means "hold the hang" rather than
+        # "yank every joint to its ctrlrange midpoint".
+        self._seed_ctrl = self.world.data.ctrl[: self._n_act].copy()
         return self._obs(), self._info()
 
     def _current_max_grip_z(self) -> float:
@@ -505,7 +513,14 @@ class Climbing3DEnv(gym.Env):
         action = np.asarray(action, dtype=np.float64)
         n = self._n_act
         joint_norm = np.clip(action[:n], -1.0, 1.0)
-        ctrl = 0.5 * (joint_norm + 1.0) * (self._act_hi - self._act_lo) + self._act_lo
+        # Residual-around-seed mapping. action=0 holds the settled seed pose;
+        # action=+1 drives a joint to its upper limit, -1 to its lower limit.
+        # This keeps full reach authority while making "do nothing" == "hold
+        # the hang", instead of the old midpoint mapping that yanked every
+        # joint ~42° off the seed and slipped both hands on step 1.
+        seed = self._seed_ctrl
+        reach = np.where(joint_norm >= 0.0, self._act_hi - seed, seed - self._act_lo)
+        ctrl = seed + joint_norm * reach
         self.world.data.ctrl[:n] = ctrl
 
         # Grip intents come *before* stepping physics so the welds can hold

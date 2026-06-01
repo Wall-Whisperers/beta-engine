@@ -189,13 +189,23 @@ ankle.
 ```
 Box(low=-1, high=1, shape=(25,), dtype=float32)
 
-  action[:21]   normalised joint targets in [-1, 1]
-                → rescaled per joint to its MuJoCo ctrlrange
+  action[:21]   per-joint RESIDUALS around the settled seed pose, in [-1, 1]
+                  0   → hold the per-episode seed-pose joint target
+                 +1   → drive that joint to its upper ctrlrange limit
+                 -1   → drive that joint to its lower ctrlrange limit
+                (ctrl = seed + a·(hi−seed) for a≥0; seed + a·(seed−lo) for a<0)
   action[21:25] grip intents for [LH, RH, LF, RF]
                 > 0  →  engage weld if tip is within GRIP_PROXIMITY_M (0.05 m)
                         of an unoccupied eligible hold
                 ≤ 0  →  release weld (if active)
 ```
+
+Residual-around-seed (not raw midpoint) is what makes the calm init policy
+(`log_std_init≈−1.5`) **hold the hang** at action≈0. The old midpoint mapping
+yanked every joint ~42° off the settled seed on step 1, spiking the hands past
+their slip cap and dropping grips before the policy could learn anything. Full
+ctrlrange authority is preserved at ±1; the per-episode seed is captured in
+`Climbing3DEnv.reset()` after the pose settles.
 
 There is **no auto-grip**. The agent must raise grip intent above 0 AND
 be within 5 cm of a valid hold. Proximity alone does not engage.
