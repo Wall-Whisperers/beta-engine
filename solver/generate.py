@@ -207,15 +207,18 @@ def _build_holds(
     # Two hands shoulder-width apart, two footholds well below them.
     # Start holds are always jugs regardless of difficulty.
     #
-    # Start height matters for hangability: seed_pose switches from its
-    # crouched branch to its extended (clean-hang) branch only when the
-    # hand-foot vertical gap clears ~0.50 m. Hands at row 2 (~40 cm with a
-    # 20 cm grid) gave a 40 cm gap, landing every generated wall in the
-    # crouch where the four welds fight and settle 3–4x over their slip cap
-    # — unhangable. The proven-hangable example walls (baby-v1, climb-v1)
-    # put hands ~80 cm up and feet ~20 cm up (a 60 cm gap), so we target the
-    # same heights, derived from cell size so this holds on any grid.
-    start_hand_row = max(2, round(80.0 / cfg.cell_size_cm))
+    # Start height sets whether the seed pose is a clean hang. The real
+    # training climber (wingspan 175 cm → 0.61 m arm reach) has its shoulders
+    # settle at ~1.2 m in the extended seed pose. There is a narrow clean
+    # window for the start hands, measured by sweeping hand height vs the
+    # settled per-limb weld force:
+    #   hand z ≤ 0.9 m  → hands reach DOWN past full extension → 1.3x over cap
+    #   hand z 1.1–1.3 m → shoulders ≈ hand height: true hang, ~0.3 kN/limb
+    #   hand z ≥ 1.5 m  → body hangs, legs over-extend to the low feet → feet
+    #                      blow 2.5x over cap
+    # So target hand z ≈ 1.0 m (mid-window, margin from both cliffs) and keep
+    # feet low (~0.2 m) for a ~0.8 m gap. Derived from cell size for any grid.
+    start_hand_row = max(2, round(100.0 / cfg.cell_size_cm))
     start_foot_row = max(0, round(20.0 / cfg.cell_size_cm))
     start_foot_row = min(start_foot_row, start_hand_row - 3)  # keep ≥0.5 m gap
     lh_pos = (cx - 1, start_hand_row)
