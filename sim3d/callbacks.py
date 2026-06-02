@@ -187,6 +187,14 @@ class RollingBestCheckpointCallback(BaseCallback):
                 self.model.save(final_path)
                 return
             os.replace(tmp_path, final_path)
+            # Also keep VecNormalize stats up-to-date so --resume can reload them.
+            try:
+                from stable_baselines3.common.vec_env import VecNormalize as _VN
+                env = self.training_env
+                if isinstance(env, _VN):
+                    env.save(os.path.join(self._out_dir, "vec_normalize.pkl"))
+            except Exception:
+                pass
         except Exception as e:  # noqa: BLE001
             # Don't kill training over a checkpoint hiccup.
             if self.verbose:

@@ -79,6 +79,11 @@ class TrainConfig:
     run_id: Optional[str] = None        # auto-generated from timestamp if None
     n_envs: int = 1                     # parallel CPU env workers
     device: str = "auto"                # SB3/PyTorch device: auto | cpu | cuda
+    # Normalise observations with a running mean/std (VecNormalize). Standard
+    # practice for MuJoCo PPO — raw obs span wildly different scales (joint
+    # angles in rad, world positions in m, binary grip flags). Disable only
+    # to replay old models trained without normalisation.
+    use_vec_normalize: bool = True
     # ── PPO algorithm knobs ──────────────────────────────────────────
     # Policy init — lower log_std_init shrinks the initial action std so
     # grips aren't randomly released on the first step.  -1.5 → std≈0.22.
@@ -90,14 +95,16 @@ class TrainConfig:
     # PPO clip range. Default SB3=0.2. Lower (0.1) for more conservative
     # updates — important when clip_fraction is high (>0.4).
     clip_range: float = 0.2
-    # Entropy coefficient. Small positive value (0.005) encourages
-    # exploration past "hang still forever."
-    ent_coef: float = 0.0
+    # Entropy coefficient. Small positive value encourages exploration past
+    # "hang still forever." 0.005 is the recommended starting point.
+    ent_coef: float = 0.005
     # Number of PPO optimisation epochs per rollout batch.
     n_epochs: int = 10
     # ── Reward coefficients (matched to EnvConfig) ───────────────────
     # Dense shaping toward finish hold (per-step, potential-based).
-    finish_approach_coeff: float = 0.0
+    # Total reward for a full 2 m climb ≈ coeff × 2. CLAUDE.md recommends
+    # coeff ≥ 50; 100 gives +200 over a full route — the primary dense signal.
+    finish_approach_coeff: float = 100.0
     # Per-step survival bonus (weighted fraction of limbs gripped × coeff;
     # hands 2× feet, max == coeff when all 4 are on).
     survival_bonus_coeff: float = 0.0
@@ -357,6 +364,18 @@ def train(cfg: TrainConfig) -> Path:
     env_fns = [_make_monitored_env(i) for i in range(n_envs)]
     vec_env = DummyVecEnv(env_fns) if n_envs == 1 else SubprocVecEnv(env_fns)
 
+    if cfg.use_vec_normalize:
+        from stable_baselines3.common.vec_env import VecNormalize
+        if cfg.resume:
+            _vn_path = Path(cfg.resume).parent / "vec_normalize.pkl"
+            if _vn_path.exists():
+                vec_env = VecNormalize.load(str(_vn_path), vec_env)
+                print(f"  Loaded VecNormalize stats from {_vn_path}")
+            else:
+                vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
+        else:
+            vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
+
     # TensorBoard is an optional sub-dep. Enable logging only if it's
     # importable; otherwise SB3 errors out at .learn() time.
     tb_log = None
@@ -486,6 +505,9 @@ def train(cfg: TrainConfig) -> Path:
         reset_num_timesteps=reset_num_timesteps,
     )
     model.save(out_dir / "model.zip")
+    from stable_baselines3.common.vec_env import VecNormalize as _VN
+    if isinstance(vec_env, _VN):
+        vec_env.save(str(out_dir / "vec_normalize.pkl"))
 
     print(f"\nTraining complete. Run dir: {out_dir}")
     print(f"  model:         {out_dir / 'model.zip'}")
@@ -610,13 +632,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "Use 0.2 with --log-std-init -1.5 for stable early training.")
     p.add_argument("--clip-range", type=float, default=0.2,
                    help="PPO clip range. Lower (0.1) when clip_fraction is high (>0.4).")
-    p.add_argument("--ent-coef", type=float, default=0.0,
-                   help="PPO entropy coefficient. Small value (0.005) encourages exploration.")
+    p.add_argument("--ent-coef", type=float, default=0.005,
+                   help="PPO entropy coefficient. 0.005 encourages exploration past 'hang forever'.")
     p.add_argument("--n-epochs", type=int, default=10,
                    help="PPO optimisation epochs per rollout. Default SB3=10.")
-    p.add_argument("--finish-approach-coeff", type=float, default=0.0,
-                   help="Dense shaping reward: coeff * (prev_dist_to_finish - cur_dist). "
-                        "Set 1.0-3.0 to give the agent a gradient toward the finish hold.")
+    p.add_argument("--finish-approach-coeff", type=float, default=100.0,
+                   help="Dense shaping: coeff × (prev_dist − cur_dist) per step. "
+                        "Full 2 m route → +200 total at coeff=100. Primary dense signal; "
+                        "use ≥ 50. Default 100 (CLAUDE.md recommended).")
     p.add_argument("--survival-bonus-coeff", type=float, default=0.0,
                    help="Per-step reward: coeff * weighted_grip_fraction "
                         "(hands 2x, feet 1x; capped at coeff). "
@@ -662,6 +685,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Grid rows for generated walls. Default: 20")
     p.add_argument("--curriculum-fallback-wall", default="example-v2-boulder",
                    help="Wall id to use if generation fails. Default: example-v2-boulder")
+    p.add_argument("--no-vec-normalize", action="store_true",
+                   help="Disable VecNormalize observation normalisation. "
+                        "Only use to replay old models trained without it.")
     args = p.parse_args(argv)
 
     cfg = TrainConfig(
@@ -720,6 +746,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         curriculum_gen_cols=args.curriculum_cols,
         curriculum_gen_rows=args.curriculum_rows,
         curriculum_fallback_wall=args.curriculum_fallback_wall,
+        use_vec_normalize=not args.no_vec_normalize,
     )
     train(cfg)
     return 0

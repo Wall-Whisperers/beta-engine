@@ -358,6 +358,20 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         model = sb3.PPO.load(args.play)
+        # Load VecNormalize stats if the model was trained with normalisation.
+        _obs_normalizer = None
+        _vn_path = Path(args.play).parent / "vec_normalize.pkl"
+        if _vn_path.exists():
+            try:
+                from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+                import numpy as _np
+                _vn_dummy = VecNormalize.load(str(_vn_path), DummyVecEnv([lambda: env]))
+                _vn_dummy.training = False
+                _vn_dummy.norm_reward = False
+                _obs_normalizer = _vn_dummy
+                print(f"  VecNormalize stats loaded from {_vn_path}")
+            except Exception as _e:
+                print(f"  (could not load VecNormalize: {_e})")
         model_obs_shape = getattr(model.observation_space, "shape", None)
         env_obs_shape = getattr(env.observation_space, "shape", None)
         if model_obs_shape != env_obs_shape:
@@ -394,6 +408,13 @@ def main(argv: list[str] | None = None) -> int:
         from sim3d.viewer import native_viewer
         from sim3d import config as cfg
         obs, info = env.reset()
+        def _norm(o):
+            """Apply VecNormalize obs stats if available, else pass through."""
+            if _obs_normalizer is None:
+                return o
+            import numpy as _np
+            return _obs_normalizer.normalize_obs(
+                _np.array(o, dtype=_np.float32).reshape(1, -1))[0]
         # One env.step() advances sim_substeps (default 8) render frames
         # of physics. For smooth slow-motion we want the viewer to refresh
         # *during* that physics chunk, not just at the end. So in slow-mo
@@ -418,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
         with native_viewer(env.world, hidden_groups=_hidden) as viewer:
             done = False
             while viewer.is_running() and not done:
-                action, _ = model.predict(obs, deterministic=True)
+                action, _ = model.predict(_norm(obs), deterministic=True)
                 if env.cfg_env.action_mode == "discrete-move":
                     limb, hold_id = env.decode_move(int(action))
                     print(f"  policy: {limb} → {hold_id}")
@@ -435,8 +456,11 @@ def main(argv: list[str] | None = None) -> int:
                     a = np.asarray(action, dtype=np.float64)
                     n = env._n_act
                     joint_norm = np.clip(a[:n], -1.0, 1.0)
-                    ctrl = (0.5 * (joint_norm + 1.0)
-                            * (env._act_hi - env._act_lo) + env._act_lo)
+                    seed = env._seed_ctrl
+                    reach = np.where(joint_norm >= 0.0,
+                                     env._act_hi - seed,
+                                     seed - env._act_lo)
+                    ctrl = seed + joint_norm * reach
                     env.world.data.ctrl[:n] = ctrl
                     db = env.cfg_env.grip_intent_deadband
                     for i, limb in enumerate(LIMBS):
