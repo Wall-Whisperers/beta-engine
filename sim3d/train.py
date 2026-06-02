@@ -90,8 +90,11 @@ class TrainConfig:
     # Default 0.0 (std 1.0) releases ~2 grips on step 1 → instant fall.
     log_std_init: float = -1.5
     # Grip deadband — intents in (-db, +db) hold current grip state.
-    # Pair with log_std_init=-1.5 and db=0.2 for stable early training.
-    grip_intent_deadband: float = 0.2
+    # With log_std_init=-1.5 (std≈0.22), db=0.5 makes release a deliberate
+    # ~2.3σ event (P≈1%) rather than random noise (P≈18% at db=0.2).
+    # Math: all 4 grips survive 100 steps ≈ (1-0.01)^400 ≈ 2% at db=0.5 —
+    # still releases over a long episode, but won't lose grips in 10 steps.
+    grip_intent_deadband: float = 0.5
     # PPO clip range. Default SB3=0.2. Lower (0.1) for more conservative
     # updates — important when clip_fraction is high (>0.4).
     clip_range: float = 0.2
@@ -627,9 +630,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--log-std-init", type=float, default=-1.5,
                    help="Initial log-std for the Gaussian policy. -1.5 -> std~0.22, "
                         "keeps early actions small so grips aren't randomly dropped on step 1.")
-    p.add_argument("--grip-deadband", type=float, default=0.2,
+    p.add_argument("--grip-deadband", type=float, default=0.5,
                    help="Grip intent deadband. Intents in (-db, +db) hold current grip state. "
-                        "Use 0.2 with --log-std-init -1.5 for stable early training.")
+                        "At db=0.5 + log_std_init=-1.5 (std≈0.22), release is a 2.3σ event "
+                        "(P≈1%%) — deliberate, not random noise.")
     p.add_argument("--clip-range", type=float, default=0.2,
                    help="PPO clip range. Lower (0.1) when clip_fraction is high (>0.4).")
     p.add_argument("--ent-coef", type=float, default=0.005,
