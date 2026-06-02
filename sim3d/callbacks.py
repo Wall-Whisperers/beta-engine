@@ -278,10 +278,13 @@ class VideoRolloutCallback(BaseCallback):
 
         cam = mujoco.MjvCamera()
         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        cam.lookat = [0.0, -0.3, 1.5]
-        cam.distance = 6.0
-        cam.azimuth = 235
-        cam.elevation = -20
+        # 3/4 side view: you can see the wall face AND the climber's depth
+        # relative to it. Elevation -25 tilts down enough to see the floor
+        # when the climber falls.
+        cam.lookat = [0.0, 0.3, 1.4]
+        cam.distance = 5.5
+        cam.azimuth = 200
+        cam.elevation = -25
         try:
             renderer = mujoco.Renderer(world.model, height=480, width=640)
         except Exception:
