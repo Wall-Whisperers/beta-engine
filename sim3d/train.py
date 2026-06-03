@@ -98,9 +98,10 @@ class TrainConfig:
     # PPO clip range. Default SB3=0.2. Lower (0.1) for more conservative
     # updates — important when clip_fraction is high (>0.4).
     clip_range: float = 0.2
-    # Entropy coefficient. Small positive value encourages exploration past
-    # "hang still forever." 0.005 is the recommended starting point.
-    ent_coef: float = 0.005
+    # Entropy coefficient. 0.01 encourages exploration of grip releases and
+    # reaching. 0.005 was too conservative — policy converged to "hang still"
+    # local minimum at ~500k steps without ever attempting a reach.
+    ent_coef: float = 0.01
     # Number of PPO optimisation epochs per rollout batch.
     n_epochs: int = 10
     # ── Reward coefficients (matched to EnvConfig) ───────────────────
@@ -109,8 +110,10 @@ class TrainConfig:
     # coeff ≥ 50; 100 gives +200 over a full route — the primary dense signal.
     finish_approach_coeff: float = 100.0
     # Per-step survival bonus (weighted fraction of limbs gripped × coeff;
-    # hands 2× feet, max == coeff when all 4 are on).
-    survival_bonus_coeff: float = 0.0
+    # hands 2× feet, max == coeff when all 4 are on). Must be ≤ 0.02 —
+    # see CLAUDE.md anti-hack warning. 0.01 stabilises the hang without
+    # creating a "grip lowest holds forever" attractor.
+    survival_bonus_coeff: float = 0.01
     # Per-limb penalty applied on the step a grip releases.
     grip_release_penalty: float = 0.0
     # GATED on HWM gain — now equivalent to extra hwm_height_scale, kept
@@ -636,18 +639,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "(P≈1%%) — deliberate, not random noise.")
     p.add_argument("--clip-range", type=float, default=0.2,
                    help="PPO clip range. Lower (0.1) when clip_fraction is high (>0.4).")
-    p.add_argument("--ent-coef", type=float, default=0.005,
-                   help="PPO entropy coefficient. 0.005 encourages exploration past 'hang forever'.")
+    p.add_argument("--ent-coef", type=float, default=0.01,
+                   help="PPO entropy coefficient. 0.01 encourages grip-release exploration; "
+                        "0.005 converges to 'hang still' local minimum.")
     p.add_argument("--n-epochs", type=int, default=10,
                    help="PPO optimisation epochs per rollout. Default SB3=10.")
     p.add_argument("--finish-approach-coeff", type=float, default=100.0,
                    help="Dense shaping: coeff × (prev_dist − cur_dist) per step. "
                         "Full 2 m route → +200 total at coeff=100. Primary dense signal; "
                         "use ≥ 50. Default 100 (CLAUDE.md recommended).")
-    p.add_argument("--survival-bonus-coeff", type=float, default=0.0,
+    p.add_argument("--survival-bonus-coeff", type=float, default=0.01,
                    help="Per-step reward: coeff * weighted_grip_fraction "
-                        "(hands 2x, feet 1x; capped at coeff). "
-                        "Teaches the agent to stay on the wall. Try 0.5.")
+                        "(hands 2x, feet 1x; capped at coeff). Must be ≤ 0.02. "
+                        "0.01 stabilises the hang without rewarding floor-hanging.")
     p.add_argument("--grip-release-penalty", type=float, default=0.0,
                    help="Per-limb penalty when a grip releases this step. "
                         "Discourages 'let go and dangle'. Try 1.0.")
