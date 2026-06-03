@@ -98,10 +98,10 @@ class TrainConfig:
     # PPO clip range. Default SB3=0.2. Lower (0.1) for more conservative
     # updates — important when clip_fraction is high (>0.4).
     clip_range: float = 0.2
-    # Entropy coefficient. 0.01 encourages exploration of grip releases and
-    # reaching. 0.005 was too conservative — policy converged to "hang still"
-    # local minimum at ~500k steps without ever attempting a reach.
-    ent_coef: float = 0.01
+    # Entropy coefficient. 0.005 is enough for joint exploration while keeping
+    # the policy stable enough to hang. 0.01 caused constant grip-noise and
+    # prevented the policy from ever learning to hang (week3 result: 0 hangs).
+    ent_coef: float = 0.005
     # Number of PPO optimisation epochs per rollout batch.
     n_epochs: int = 10
     # ── Reward coefficients (matched to EnvConfig) ───────────────────
@@ -114,15 +114,26 @@ class TrainConfig:
     # see CLAUDE.md anti-hack warning. 0.01 stabilises the hang without
     # creating a "grip lowest holds forever" attractor.
     survival_bonus_coeff: float = 0.01
-    # Per-limb penalty applied on the step a grip releases.
-    grip_release_penalty: float = 0.0
+    # Small reward per released grip (negative = reward, positive = penalty).
+    # +1 per release removes the "never let go" bias without rewarding random
+    # dropping — the big payoff only comes from gripping something new.
+    grip_release_penalty: float = -1.0
     # GATED on HWM gain — now equivalent to extra hwm_height_scale, kept
     # for backwards compatibility with old CLIs.
     upward_velocity_coeff: float = 0.0
     # × max(0, com_z − episode_max_com_z) per step. Major signal.
     hwm_height_scale: float = 50.0
+    # Rising-edge bonus for gripping any new hold (first touch per episode).
+    # 10 was too small vs the fall-penalty — agent never tried reaching.
+    hold_match_bonus: float = 50.0
     # Lump-sum reward when a grip event raises episode_max_grip_z.
-    new_high_grip_bonus: float = 75.0
+    # 75 < EV(fall) at any realistic reach success rate — raised so that even
+    # a 10% reach success rate makes releasing worthwhile:
+    #   EV = 0.1×(1+50+250) − 0.9×(1+30) = 30.1 − 27.9 = +2.2 > 0
+    new_high_grip_bonus: float = 250.0
+    # Terminal fall penalty. Reduced 50→30 to lower the cost of exploration —
+    # a failed reach attempt should sting less than the grip jackpot is worth.
+    fall_penalty: float = 30.0
     # Warm-start: path to an existing model.zip whose policy weights are
     # copied into the new model at construction. Hyperparameters (lr,
     # clip_range, ent_coef, etc.) and reward coefficients come from the
@@ -281,7 +292,9 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         upward_velocity_coeff=cfg.upward_velocity_coeff,
         energy_penalty_coeff=cfg.energy_penalty_coeff,
         hwm_height_scale=cfg.hwm_height_scale,
+        hold_match_bonus=cfg.hold_match_bonus,
         new_high_grip_bonus=cfg.new_high_grip_bonus,
+        fall_penalty=cfg.fall_penalty,
     )
 
     def _factory():
@@ -652,9 +665,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Per-step reward: coeff * weighted_grip_fraction "
                         "(hands 2x, feet 1x; capped at coeff). Must be ≤ 0.02. "
                         "0.01 stabilises the hang without rewarding floor-hanging.")
-    p.add_argument("--grip-release-penalty", type=float, default=0.0,
-                   help="Per-limb penalty when a grip releases this step. "
-                        "Discourages 'let go and dangle'. Try 1.0.")
+    p.add_argument("--grip-release-penalty", type=float, default=-1.0,
+                   help="Per-limb reward/penalty when a grip releases. Negative = reward. "
+                        "-1.0 removes the implicit 'never release' bias without rewarding "
+                        "random dropping — the jackpot only comes from gripping something new.")
     p.add_argument("--upward-velocity-coeff", type=float, default=0.0,
                    help="GATED on HWM gain — effectively an extra coefficient "
                         "on hwm_height_scale. Kept for backwards compatibility; "
@@ -665,11 +679,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Reward per metre of new max-COM-z (high-water-mark). "
                         "State-based — cannot be farmed by oscillation. "
                         "Default 50 (≈75 reward for a full 1.5 m climb).")
-    p.add_argument("--new-high-grip-bonus", type=float, default=75.0,
+    p.add_argument("--hold-match-bonus", type=float, default=50.0,
+                   help="Rising-edge bonus for gripping any new hold (first touch "
+                        "per limb per episode). 50 makes exploration worthwhile vs "
+                        "the fall penalty.")
+    p.add_argument("--new-high-grip-bonus", type=float, default=250.0,
                    help="Lump-sum reward when a grip event raises the episode's "
-                        "max gripped-hold z. Each height level only pays once. "
-                        "Default 75 (a full route on climb-v1 → 2 height levels "
-                        "above start → +150 reward).")
+                        "max gripped-hold z. 250 makes EV(release+reach) positive "
+                        "even at ~10%% reach success rate.")
+    p.add_argument("--fall-penalty", type=float, default=30.0,
+                   help="Terminal penalty on fall (pelvis_z < fall_z). "
+                        "Reduced 50→30 so failed reach attempts sting less "
+                        "than the grip jackpot is worth.")
     p.add_argument("--energy-penalty-coeff", type=float, default=0.001,
                    help="Per-step energy penalty: coeff * sum(ctrl^2). "
                         "Default 0.001 (was 0.005 which swamped the height signal).")
@@ -742,7 +763,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         grip_release_penalty=args.grip_release_penalty,
         upward_velocity_coeff=args.upward_velocity_coeff,
         hwm_height_scale=args.hwm_height_scale,
+        hold_match_bonus=args.hold_match_bonus,
         new_high_grip_bonus=args.new_high_grip_bonus,
+        fall_penalty=args.fall_penalty,
         energy_penalty_coeff=args.energy_penalty_coeff,
         curriculum=args.curriculum,
         curriculum_start_difficulty=args.curriculum_start_difficulty,
