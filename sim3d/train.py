@@ -114,26 +114,29 @@ class TrainConfig:
     # see CLAUDE.md anti-hack warning. 0.01 stabilises the hang without
     # creating a "grip lowest holds forever" attractor.
     survival_bonus_coeff: float = 0.01
-    # Small reward per released grip (negative = reward, positive = penalty).
-    # +1 per release removes the "never let go" bias without rewarding random
-    # dropping — the big payoff only comes from gripping something new.
-    grip_release_penalty: float = -1.0
+    # No release reward — week4 showed that release reward + big lump-sum
+    # jackpot caused the agent to farm: grab jackpot → fall → repeat in
+    # 8-35 step micro-episodes. Release must be neutral (0) so the only
+    # incentive to release is reaching something worthwhile.
+    grip_release_penalty: float = 0.0
     # GATED on HWM gain — now equivalent to extra hwm_height_scale, kept
     # for backwards compatibility with old CLIs.
     upward_velocity_coeff: float = 0.0
     # × max(0, com_z − episode_max_com_z) per step. Major signal.
     hwm_height_scale: float = 50.0
     # Rising-edge bonus for gripping any new hold (first touch per episode).
-    # 10 was too small vs the fall-penalty — agent never tried reaching.
-    hold_match_bonus: float = 50.0
+    # Small enough that it doesn't dominate the fall penalty alone, but
+    # meaningful when combined with survival and approach rewards.
+    hold_match_bonus: float = 15.0
     # Lump-sum reward when a grip event raises episode_max_grip_z.
-    # 75 < EV(fall) at any realistic reach success rate — raised so that even
-    # a 10% reach success rate makes releasing worthwhile:
-    #   EV = 0.1×(1+50+250) − 0.9×(1+30) = 30.1 − 27.9 = +2.2 > 0
-    new_high_grip_bonus: float = 250.0
-    # Terminal fall penalty. Reduced 50→30 to lower the cost of exploration —
-    # a failed reach attempt should sting less than the grip jackpot is worth.
-    fall_penalty: float = 30.0
+    # Kept modest — week4 showed 250 caused jackpot-farming in 8-step
+    # micro-episodes. The primary climbing signal is HWM (per-step, can't
+    # be farmed) + finish_approach. This is a one-time nudge, not the
+    # main signal.
+    new_high_grip_bonus: float = 50.0
+    # Restore fall penalty to 50 — reducing it to 30 made short jackpot
+    # episodes too cheap. Falling must cost more than a single grip bonus.
+    fall_penalty: float = 50.0
     # Warm-start: path to an existing model.zip whose policy weights are
     # copied into the new model at construction. Hyperparameters (lr,
     # clip_range, ent_coef, etc.) and reward coefficients come from the
@@ -665,10 +668,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Per-step reward: coeff * weighted_grip_fraction "
                         "(hands 2x, feet 1x; capped at coeff). Must be ≤ 0.02. "
                         "0.01 stabilises the hang without rewarding floor-hanging.")
-    p.add_argument("--grip-release-penalty", type=float, default=-1.0,
-                   help="Per-limb reward/penalty when a grip releases. Negative = reward. "
-                        "-1.0 removes the implicit 'never release' bias without rewarding "
-                        "random dropping — the jackpot only comes from gripping something new.")
+    p.add_argument("--grip-release-penalty", type=float, default=0.0,
+                   help="Per-limb penalty when a grip releases. 0 = neutral (default). "
+                        "Negative = reward for releasing, which caused jackpot-farming "
+                        "in week4 (8-step micro-episodes). Keep at 0.")
     p.add_argument("--upward-velocity-coeff", type=float, default=0.0,
                    help="GATED on HWM gain — effectively an extra coefficient "
                         "on hwm_height_scale. Kept for backwards compatibility; "
@@ -679,18 +682,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Reward per metre of new max-COM-z (high-water-mark). "
                         "State-based — cannot be farmed by oscillation. "
                         "Default 50 (≈75 reward for a full 1.5 m climb).")
-    p.add_argument("--hold-match-bonus", type=float, default=50.0,
-                   help="Rising-edge bonus for gripping any new hold (first touch "
-                        "per limb per episode). 50 makes exploration worthwhile vs "
-                        "the fall penalty.")
-    p.add_argument("--new-high-grip-bonus", type=float, default=250.0,
-                   help="Lump-sum reward when a grip event raises the episode's "
-                        "max gripped-hold z. 250 makes EV(release+reach) positive "
-                        "even at ~10%% reach success rate.")
-    p.add_argument("--fall-penalty", type=float, default=30.0,
-                   help="Terminal penalty on fall (pelvis_z < fall_z). "
-                        "Reduced 50→30 so failed reach attempts sting less "
-                        "than the grip jackpot is worth.")
+    p.add_argument("--hold-match-bonus", type=float, default=15.0,
+                   help="Rising-edge bonus for gripping any new hold per episode. "
+                        "Keep smaller than fall-penalty so it can't be farmed alone.")
+    p.add_argument("--new-high-grip-bonus", type=float, default=50.0,
+                   help="Lump-sum reward when a grip raises episode max-grip-z. "
+                        "One-time nudge — primary climbing signal is HWM + approach.")
+    p.add_argument("--fall-penalty", type=float, default=50.0,
+                   help="Terminal penalty on fall. Must exceed any single lump-sum "
+                        "grip bonus so micro-episode farming is negative-EV.")
     p.add_argument("--energy-penalty-coeff", type=float, default=0.001,
                    help="Per-step energy penalty: coeff * sum(ctrl^2). "
                         "Default 0.001 (was 0.005 which swamped the height signal).")
