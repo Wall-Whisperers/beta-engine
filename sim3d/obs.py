@@ -18,7 +18,7 @@ Layout (fixed dimension, regardless of wall size):
                                     role_onehot (3, start/mid/finish),
                                     is_gripping (1)
     [..  : .. + 12)     per-limb anchor/goal vector    (12)
-                          zero if gripped, else (finish_world - tip_world)
+                          zero if gripped, else (nearest_hold_world - tip_world)
     [..  : .. + 1)      euclid dist (highest gripped hand → nearest finish)
 
 Per-stream NaN/Inf guard: each stream is checked at the end and replaced
@@ -164,26 +164,58 @@ def build_observation(world: "Climb3DWorld", env_config: "EnvConfig") -> np.ndar
         stream2[base + 6] = is_grip
     stream2 = _guard(stream2, "exteroception")
 
-    # ── Stream 3 — per-limb anchor/goal vectors to the finish hold ──────
+    # ── Stream 3 — per-limb goal vectors to nearest reachable hold ──────
+    # For each ungripped limb: vector from tip to the nearest hold that is
+    # (a) not already gripped by another limb, and (b) above the limb's
+    # current tip height (encouraging upward reach).  If no hold qualifies,
+    # fall back to the nearest hold regardless of height. Zero when gripped.
+    # Using nearest-hold (not finish-hold) gives the agent a dense gradient
+    # for "move your free hand toward something grippable" rather than the
+    # sparse signal of "be near the finish."
+    #
+    # finish_metas is also computed here for reuse in stream 4.
     finish_metas = [
         m_ for m_ in world._hold_meta_by_id.values() if m_["is_finish"]
     ]
     if not finish_metas:
-        # No marked finish: treat the highest hold as the finish.
         finish_metas = [
             max(world._hold_meta_by_id.values(), key=lambda mm: mm["world_pos"][2])
         ]
-    # Use the highest finish hold as the canonical target for the goal vector.
-    finish_meta = max(finish_metas, key=lambda mm: mm["world_pos"][2])
-    finish_world = np.array(finish_meta["world_pos"], dtype=np.float64)
+    currently_gripped_ids = {
+        world.on_hold(l) for l in _LIMBS if world.on_hold(l) is not None
+    }
+    all_hold_metas = list(world._hold_meta_by_id.values())
 
     stream3 = np.zeros(12, dtype=np.float64)
     for li, limb in enumerate(_LIMBS):
         if world.on_hold(limb) is not None:
             # Limb is anchored — zero vector signals "nothing to reach for".
             continue
-        tip_world = world.limb_tip_pos(limb)
-        stream3[li * 3: li * 3 + 3] = finish_world - tip_world
+        tip_world = np.array(world.limb_tip_pos(limb), dtype=np.float64)
+        tip_z = float(tip_world[2])
+
+        # Prefer holds above the tip (upward reach); fall back to any hold.
+        candidates = [
+            m for m in all_hold_metas
+            if m["hold_id"] not in currently_gripped_ids
+            and float(m["world_pos"][2]) > tip_z
+        ]
+        if not candidates:
+            candidates = [
+                m for m in all_hold_metas
+                if m["hold_id"] not in currently_gripped_ids
+            ]
+        if not candidates:
+            continue  # nowhere to reach — leave zero
+
+        hold_pos = np.array(
+            min(candidates,
+                key=lambda m: float(np.linalg.norm(
+                    np.array(m["world_pos"], dtype=np.float64) - tip_world
+                )))["world_pos"],
+            dtype=np.float64,
+        )
+        stream3[li * 3: li * 3 + 3] = hold_pos - tip_world
     stream3 = _guard(stream3, "goal-vectors")
 
     # ── Stream 4 — distance from highest gripped hand to nearest finish ─

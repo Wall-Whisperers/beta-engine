@@ -89,6 +89,12 @@ class EnvConfig:
     # a 2 m route gives +200 approach reward — comparable to the finish bonus.
     # Must be large enough to beat the fall-penalty on every path to the top.
     finish_approach_coeff: float = 0.0
+    # Per-step reward for each FREE limb closing distance to its nearest
+    # eligible hold (potential-based, cannot be farmed). This is the dense
+    # gradient the agent needs to learn to REACH — without it, the only way
+    # to discover a grip is to accidentally land within 5cm of a hold.
+    # coeff × Σ(prev_dist_i − cur_dist_i) over all ungripped limbs.
+    reach_approach_coeff: float = 0.0
     # Per-step survival bonus — weighted fraction of limbs currently gripped.
     # Hands are weighted 2× feet (max value = coeff when all 4 limbs gripped).
     # Teaches "stay on the wall" before the height signal kicks in.
@@ -281,6 +287,7 @@ class Climbing3DEnv(gym.Env):
         self._prev_grip = {l: self.world.on_hold(l) for l in LIMBS}
         self._prev_finish_dist = self._finish_dist()
         self._prev_com_z = float(self.world.com()[2])
+        self._prev_reach_dists = self._reach_dists()
         # Snapshot the settled seed-pose joint targets. Continuous-joint
         # actions are interpreted as residuals around THIS pose (see
         # _step_continuous), so action≈0 means "hold the hang" rather than
@@ -434,6 +441,20 @@ class Climbing3DEnv(gym.Env):
             )
             self._prev_finish_dist = cur_dist
 
+        # Per-limb reach-approach shaping — for each FREE limb, reward
+        # closing distance to its nearest eligible hold. This gives the agent
+        # a dense gradient for "move your free hand toward something grippable"
+        # without needing to accidentally land on a hold first.
+        # Potential-based (prev - cur) so it cannot be farmed.
+        reach_reward = 0.0
+        if self.cfg_env.reach_approach_coeff > 0.0:
+            cur_reach = self._reach_dists()
+            for limb in LIMBS:
+                if self.world.on_hold(limb) is None:
+                    reach_reward += self._prev_reach_dists.get(limb, 0.0) - cur_reach[limb]
+            reach_reward *= self.cfg_env.reach_approach_coeff
+            self._prev_reach_dists = cur_reach
+
         # Per-step survival bonus: weighted fraction of limbs gripped, GATED
         # on at least one hand being engaged. Without the hand-gate the agent
         # learns to sit on the footholds with both hands free — technically
@@ -458,6 +479,7 @@ class Climbing3DEnv(gym.Env):
             height_reward
             + upward_reward
             + approach_reward
+            + reach_reward
             + survival_reward
             + match_bonus
             + high_grip_bonus
@@ -643,6 +665,39 @@ class Climbing3DEnv(gym.Env):
         return float(min(
             np.linalg.norm(fp - ref_pos) for fp in finish_positions
         ))
+
+    def _reach_dists(self) -> dict[str, float]:
+        """For each ungripped limb: distance to its nearest eligible hold.
+        Gripped limbs get distance 0.0 (no approach reward while anchored)."""
+        gripped_ids = {
+            self.world.on_hold(l) for l in LIMBS
+            if self.world.on_hold(l) is not None
+        }
+        result: dict[str, float] = {}
+        for limb in LIMBS:
+            if self.world.on_hold(limb) is not None:
+                result[limb] = 0.0
+                continue
+            tip = np.array(self.world.limb_tip_pos(limb))
+            tip_z = float(tip[2])
+            candidates = [
+                m for m in self.world._hold_meta_by_id.values()
+                if m["hold_id"] not in gripped_ids
+                and float(m["world_pos"][2]) > tip_z
+            ]
+            if not candidates:
+                candidates = [
+                    m for m in self.world._hold_meta_by_id.values()
+                    if m["hold_id"] not in gripped_ids
+                ]
+            if not candidates:
+                result[limb] = 0.0
+                continue
+            result[limb] = float(min(
+                np.linalg.norm(np.array(m["world_pos"]) - tip)
+                for m in candidates
+            ))
+        return result
 
     # ─── Observation / info ──────────────────────────────────────────
     def _obs(self) -> np.ndarray:

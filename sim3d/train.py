@@ -109,6 +109,12 @@ class TrainConfig:
     # Total reward for a full 2 m climb ≈ coeff × 2. CLAUDE.md recommends
     # coeff ≥ 50; 100 gives +200 over a full route — the primary dense signal.
     finish_approach_coeff: float = 100.0
+    # Per-step reward for each free limb closing distance to its nearest hold.
+    # This is the dense gradient for learning to REACH — without it the agent
+    # must accidentally land within 5cm of a hold to discover gripping.
+    # Potential-based (prev-cur dist), cannot be farmed. 50 → each limb
+    # closing 1m over an episode contributes +50 (comparable to hold_match).
+    reach_approach_coeff: float = 50.0
     # Per-step survival bonus (weighted fraction of limbs gripped × coeff;
     # hands 2× feet, max == coeff when all 4 are on). Must be ≤ 0.02 —
     # see CLAUDE.md anti-hack warning. 0.01 stabilises the hang without
@@ -290,6 +296,7 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         body_intersection_penalty=cfg.body_intersection_penalty,
         grip_intent_deadband=cfg.grip_intent_deadband,
         finish_approach_coeff=cfg.finish_approach_coeff,
+        reach_approach_coeff=cfg.reach_approach_coeff,
         survival_bonus_coeff=cfg.survival_bonus_coeff,
         grip_release_penalty=cfg.grip_release_penalty,
         upward_velocity_coeff=cfg.upward_velocity_coeff,
@@ -664,6 +671,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Dense shaping: coeff × (prev_dist − cur_dist) per step. "
                         "Full 2 m route → +200 total at coeff=100. Primary dense signal; "
                         "use ≥ 50. Default 100 (CLAUDE.md recommended).")
+    p.add_argument("--reach-approach-coeff", type=float, default=50.0,
+                   help="Per-step reward for each free limb closing distance to its "
+                        "nearest eligible hold. Dense gradient for learning to reach. "
+                        "Potential-based — cannot be farmed.")
     p.add_argument("--survival-bonus-coeff", type=float, default=0.01,
                    help="Per-step reward: coeff * weighted_grip_fraction "
                         "(hands 2x, feet 1x; capped at coeff). Must be ≤ 0.02. "
@@ -759,6 +770,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         ent_coef=args.ent_coef,
         n_epochs=args.n_epochs,
         finish_approach_coeff=args.finish_approach_coeff,
+        reach_approach_coeff=args.reach_approach_coeff,
         survival_bonus_coeff=args.survival_bonus_coeff,
         grip_release_penalty=args.grip_release_penalty,
         upward_velocity_coeff=args.upward_velocity_coeff,
