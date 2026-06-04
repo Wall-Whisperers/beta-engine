@@ -446,19 +446,25 @@ class Climbing3DEnv(gym.Env):
         # a dense gradient for "move your free hand toward something grippable"
         # without needing to accidentally land on a hold first.
         # ONE-SIDED: only reward closing the gap, never penalise retreating.
-        # Bidirectional (prev-cur) created a dominant negative penalty when
-        # limbs moved randomly away from holds — agent learned "keep all grips
-        # so reach penalty is zero" (week6 failure). One-sided gives a gradient
-        # for approach without punishing exploration.
+        # GATED on at least one hand being gripped — same gate as survival_bonus.
+        # Without the gate the agent learned to release all grips, fall to the
+        # floor, and collect reach reward while free limbs swung toward holds
+        # on the way down (week7: body at floor, +10k reward, zero climbing).
         reach_reward = 0.0
         if self.cfg_env.reach_approach_coeff > 0.0:
-            cur_reach = self._reach_dists()
-            for limb in LIMBS:
-                if self.world.on_hold(limb) is None:
-                    delta = self._prev_reach_dists.get(limb, 0.0) - cur_reach[limb]
-                    reach_reward += max(0.0, delta)   # approach only, no retreat penalty
-            reach_reward *= self.cfg_env.reach_approach_coeff
-            self._prev_reach_dists = cur_reach
+            n_hand = sum(1 for l in HAND_LIMBS if self.world.on_hold(l) is not None)
+            if n_hand >= 1:   # must have at least one hand on the wall
+                cur_reach = self._reach_dists()
+                for limb in LIMBS:
+                    if self.world.on_hold(limb) is None:
+                        delta = self._prev_reach_dists.get(limb, 0.0) - cur_reach[limb]
+                        reach_reward += max(0.0, delta)
+                reach_reward *= self.cfg_env.reach_approach_coeff
+                self._prev_reach_dists = cur_reach
+            else:
+                # Update distances even when ungated so prev is fresh when
+                # a hand re-grips and the gate reopens.
+                self._prev_reach_dists = self._reach_dists()
 
         # Per-step survival bonus: weighted fraction of limbs gripped, GATED
         # on at least one hand being engaged. Without the hand-gate the agent
