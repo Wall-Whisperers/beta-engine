@@ -112,9 +112,9 @@ class TrainConfig:
     # Per-step reward for each free limb closing distance to its nearest hold.
     # This is the dense gradient for learning to REACH — without it the agent
     # must accidentally land within 5cm of a hold to discover gripping.
-    # Potential-based (prev-cur dist), cannot be farmed. 50 → each limb
-    # closing 1m over an episode contributes +50 (comparable to hold_match).
-    reach_approach_coeff: float = 50.0
+    # One-sided: only rewards approach (not retreat). 20 → closing 1m gives
+    # +20, comparable to hold_match_bonus but spread over the whole approach.
+    reach_approach_coeff: float = 20.0
     # Per-step survival bonus (weighted fraction of limbs gripped × coeff;
     # hands 2× feet, max == coeff when all 4 are on). Must be ≤ 0.02 —
     # see CLAUDE.md anti-hack warning. 0.01 stabilises the hang without
@@ -671,10 +671,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Dense shaping: coeff × (prev_dist − cur_dist) per step. "
                         "Full 2 m route → +200 total at coeff=100. Primary dense signal; "
                         "use ≥ 50. Default 100 (CLAUDE.md recommended).")
-    p.add_argument("--reach-approach-coeff", type=float, default=50.0,
-                   help="Per-step reward for each free limb closing distance to its "
-                        "nearest eligible hold. Dense gradient for learning to reach. "
-                        "Potential-based — cannot be farmed.")
+    p.add_argument("--reach-approach-coeff", type=float, default=20.0,
+                   help="Per-step reward for each free limb CLOSING distance to its "
+                        "nearest eligible hold (one-sided: no penalty for retreating). "
+                        "Dense gradient for learning to reach without swamping other signals.")
     p.add_argument("--survival-bonus-coeff", type=float, default=0.01,
                    help="Per-step reward: coeff * weighted_grip_fraction "
                         "(hands 2x, feet 1x; capped at coeff). Must be ≤ 0.02. "

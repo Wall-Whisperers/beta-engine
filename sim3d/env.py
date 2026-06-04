@@ -445,13 +445,18 @@ class Climbing3DEnv(gym.Env):
         # closing distance to its nearest eligible hold. This gives the agent
         # a dense gradient for "move your free hand toward something grippable"
         # without needing to accidentally land on a hold first.
-        # Potential-based (prev - cur) so it cannot be farmed.
+        # ONE-SIDED: only reward closing the gap, never penalise retreating.
+        # Bidirectional (prev-cur) created a dominant negative penalty when
+        # limbs moved randomly away from holds — agent learned "keep all grips
+        # so reach penalty is zero" (week6 failure). One-sided gives a gradient
+        # for approach without punishing exploration.
         reach_reward = 0.0
         if self.cfg_env.reach_approach_coeff > 0.0:
             cur_reach = self._reach_dists()
             for limb in LIMBS:
                 if self.world.on_hold(limb) is None:
-                    reach_reward += self._prev_reach_dists.get(limb, 0.0) - cur_reach[limb]
+                    delta = self._prev_reach_dists.get(limb, 0.0) - cur_reach[limb]
+                    reach_reward += max(0.0, delta)   # approach only, no retreat penalty
             reach_reward *= self.cfg_env.reach_approach_coeff
             self._prev_reach_dists = cur_reach
 
