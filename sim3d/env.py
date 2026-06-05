@@ -115,11 +115,12 @@ class EnvConfig:
     # HWM; the default HWM scale (50) is already the dominant signal.
     upward_velocity_coeff: float = 0.0
     enable_slip: bool = True
-    # Grip intent deadband.  Any intent in (-grip_intent_deadband,
-    # +grip_intent_deadband) leaves the current grip state unchanged.
-    # A zero-centred Gaussian policy (SB3 default) releases grips on
-    # ~50 % of steps when deadband=0, causing an immediate fall.  Set
-    # to ~0.2 so near-zero actions default to "hold what you have".
+    # Grip intent deadband (release side only).
+    # Engage: intent > 0 always tries to grip (50% chance with random policy).
+    # Release: intent < -grip_intent_deadband to release (default -0.5 → ~1%
+    # chance with std≈0.22, protecting existing grips from random drops).
+    # A symmetric deadband of 0.5 blocked both engage AND release, meaning
+    # the agent could never acquire new foot grips (week8 plateau diagnosis).
     grip_intent_deadband: float = 0.0
     seed_pose: bool = True
     seed_kwargs: dict = field(default_factory=dict)
@@ -559,26 +560,27 @@ class Climbing3DEnv(gym.Env):
         # Grip intents come *before* stepping physics so the welds can hold
         # the body through the upcoming substeps.
         #
-        # Deadband semantics (grip_intent_deadband = db):
-        #   intent >  db  →  try to engage (if tip near an eligible hold)
+        # Asymmetric deadband semantics:
+        #   intent >  0   →  try to engage (if tip near an eligible hold)
         #   intent < -db  →  release (if currently gripping)
         #   else          →  hold current grip state unchanged
         #
-        # With SB3's default Gaussian init (mean=0, std=1), without a
-        # deadband every limb releases on ~50% of steps → immediate fall.
-        # A deadband of 0.2 combined with log_std_init=-1.5 (std≈0.22)
-        # means ~85% of steps hold the current grip, giving PPO time to
-        # discover the height reward before the body hits the floor.
+        # Engage uses a zero threshold so ~50% of random policy steps attempt
+        # to grab nearby holds — enabling foot grip acquisition. Release uses
+        # the full deadband (0.5 → ~1% chance with std≈0.22) to protect
+        # existing grips from being dropped by an untrained policy.
+        # A symmetric deadband of 0.5 blocked BOTH sides, which caused the
+        # week8 plateau: agent reached feet to holds but could never grip them.
         db = self.cfg_env.grip_intent_deadband
         intents = action[n: n + 4]
         for i, limb in enumerate(LIMBS):
             intent = float(intents[i]) if i < len(intents) else 0.0
-            if intent > db:
+            if intent > 0.0:
                 self._maybe_engage_grip(limb)
             elif intent < -db:
                 if self.world.on_hold(limb) is not None:
                     self.world.release_limb(limb)
-            # else: inside deadband — leave grip state unchanged
+            # else: in release deadband — hold current grip state
 
         slips = self.world.step(
             self.cfg_env.sim_substeps,

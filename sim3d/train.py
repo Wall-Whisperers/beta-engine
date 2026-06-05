@@ -89,11 +89,12 @@ class TrainConfig:
     # grips aren't randomly released on the first step.  -1.5 → std≈0.22.
     # Default 0.0 (std 1.0) releases ~2 grips on step 1 → instant fall.
     log_std_init: float = -1.5
-    # Grip deadband — intents in (-db, +db) hold current grip state.
-    # With log_std_init=-1.5 (std≈0.22), db=0.5 makes release a deliberate
-    # ~2.3σ event (P≈1%) rather than random noise (P≈18% at db=0.2).
-    # Math: all 4 grips survive 100 steps ≈ (1-0.01)^400 ≈ 2% at db=0.5 —
-    # still releases over a long episode, but won't lose grips in 10 steps.
+    # Grip release deadband (asymmetric). Engage fires on intent > 0 (50%
+    # chance with std≈0.22). Release fires on intent < -db — so db=0.5 keeps
+    # release a deliberate ~2.3σ event (P≈1%), protecting existing grips
+    # while still allowing new grip acquisition. A symmetric 0.5 deadband
+    # (week8) blocked both sides: agent reached feet to holds but could never
+    # grip them because engage also needed to clear 0.5.
     grip_intent_deadband: float = 0.5
     # PPO clip range. Default SB3=0.2. Lower (0.1) for more conservative
     # updates — important when clip_fraction is high (>0.4).
