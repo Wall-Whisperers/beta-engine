@@ -208,6 +208,10 @@ class TrainConfig:
     reach_one_coeff: float = 30.0
     reach_regrip_bonus: float = 50.0
     reach_episode_steps: int = 200
+    # Full-climb reverse curriculum (seed progressively lower toward the start,
+    # always targeting the finish). Reuses staged_wall/gen_seed/difficulty/window.
+    climb_curriculum: bool = False
+    climb_up_threshold: float = 0.40   # top-out rate to drop the start lower
 
 
 class _EpisodeStatsCallback:
@@ -361,6 +365,21 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
     )
 
     def _factory():
+        if cfg.climb_curriculum:
+            from sim3d.staged_curriculum import (
+                ClimbCurriculumEnv, ClimbCurriculumConfig,
+            )
+            ccfg = ClimbCurriculumConfig(
+                wall=cfg.staged_wall,
+                gen_seed=cfg.staged_gen_seed,
+                gen_difficulty=cfg.staged_difficulty,
+                window=cfg.staged_window,
+                up_threshold=cfg.climb_up_threshold,
+                finish_approach_coeff=cfg.finish_approach_coeff,
+                climb_episode_steps=cfg.max_episode_steps,
+            )
+            return ClimbCurriculumEnv(ccfg, profile=profile, env_config=env_cfg)
+
         if cfg.staged_curriculum:
             from sim3d.staged_curriculum import (
                 StagedCurriculumEnv, StagedCurriculumConfig,
@@ -871,6 +890,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Train the hang→reach-one→climb task curriculum: hands the "
                         "agent the reach primitive before the full climb. Breaks "
                         "the 'hangs but won't climb' exploration trap.")
+    p.add_argument("--climb-curriculum", action="store_true",
+                   help="Reverse curriculum on the FULL climb: seed the body "
+                        "progressively lower down the route (start near the finish, "
+                        "walk back), always targeting the finish. For chaining a "
+                        "full top-out. Reuses --staged-wall/--staged-gen-seed/etc.")
+    p.add_argument("--climb-up-threshold", type=float, default=0.40,
+                   help="Top-out rate at which the climb curriculum drops the start "
+                        "one stance lower. Default 0.40 (climbing is hard).")
     p.add_argument("--staged-wall", default=None,
                    help="Static wall id for the staged curriculum. Default: generate "
                         "a wall (--staged-gen-seed) with a clean L/R hand spine.")
@@ -969,6 +996,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         reach_one_coeff=args.reach_one_coeff,
         reach_regrip_bonus=args.reach_regrip_bonus,
         reach_episode_steps=args.reach_episode_steps,
+        climb_curriculum=args.climb_curriculum,
+        climb_up_threshold=args.climb_up_threshold,
         use_vec_normalize=not args.no_vec_normalize,
     )
     train(cfg)

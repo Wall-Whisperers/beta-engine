@@ -844,16 +844,22 @@ class Climbing3DEnv(gym.Env):
         return float(np.linalg.norm(tpos - tip))
 
     def _finish_dist(self) -> float:
-        """Euclidean distance from the highest gripped hand (or highest hand
-        tip if no hand is gripped) to the nearest finish hold."""
+        """Euclidean distance from the highest hand TIP (gripped or not) to the
+        nearest finish hold.
+
+        Using the tip — not the highest *gripped* hand — keeps the reference
+        stable when a hand releases to reach: the old gripped-preference made the
+        reference jump on release, injecting non-telescoping reward (the B2
+        exploit). With the tip reference the finish-approach shaping is a clean
+        signed potential — reaching a hand up toward the finish pays, and falling
+        (tips drop away from the finish) costs, so it cannot be fall-and-swing
+        farmed the way the per-limb reach term was."""
         finish_positions = [
             np.array(self.world._hold_meta_by_id[h]["world_pos"])
             for h in self._finish_hold_ids
         ]
-        hand_tips = [(self.world.limb_tip_pos(l), l) for l in ("LH", "RH")]
-        gripped = [(pos, l) for pos, l in hand_tips
-                   if self.world.on_hold(l) is not None]
-        ref_pos = max(gripped or hand_tips, key=lambda pl: pl[0][2])[0]
+        hand_tips = [np.array(self.world.limb_tip_pos(l)) for l in ("LH", "RH")]
+        ref_pos = max(hand_tips, key=lambda p: float(p[2]))  # highest hand tip
         return float(min(
             np.linalg.norm(fp - ref_pos) for fp in finish_positions
         ))

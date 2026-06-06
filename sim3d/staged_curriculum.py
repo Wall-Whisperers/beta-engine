@@ -416,3 +416,231 @@ class StagedCurriculumEnv(gym.Env):
             "stage_success_rate": round(self.stage_success_rate, 4),
             "curriculum_difficulty": round(self._stage_idx / 2.0, 4),  # 0/.5/1
         }
+
+
+# ─── Climb reverse curriculum ────────────────────────────────────────────────
+# Per-move practice (reach-one) proved the agent can learn a reach but does NOT
+# chain into a full climb: most isolated moves are unlearnable and they don't
+# transfer. The reverse curriculum on the FULL climb instead seeds the body
+# progressively lower down the route — always with the real FINISH as the goal —
+# so the agent learns the climb end-first and each lower start reuses the
+# upper-climb skill it already has. This is the textbook fix for hard sequential
+# exploration (Florensa et al., reverse curriculum generation).
+
+def _pick_feet(footholds, below_row: int, wall: Wall) -> dict[str, str]:
+    """Two footholds below `below_row`, one per side where possible."""
+    below = [f for f in footholds if f.grid_y < below_row]
+    cx = wall.cols / 2.0
+    out: dict[str, str] = {}
+    if len(below) >= 2:
+        left = next((f for f in reversed(below) if f.grid_x <= cx), None)
+        right = next((f for f in reversed(below) if f.grid_x > cx), None)
+        if left is None:
+            left = below[-1]
+        if right is None or right is left:
+            right = next((f for f in reversed(below) if f is not left), below[-1])
+        out["lf"], out["rf"] = left.hold_id, right.hold_id
+    elif below:
+        out["lf"] = out["rf"] = below[-1].hold_id
+    return out
+
+
+def _stance_seed(hold_a, hold_b, footholds, wall: Wall) -> dict[str, str]:
+    """seed_kwargs for a 2-hand stance on hold_a/hold_b (assigned L/R by x) +
+    two feet below the lower hand."""
+    pair = sorted([hold_a, hold_b], key=lambda h: h.grid_x)
+    seed = {"lh": pair[0].hold_id, "rh": pair[1].hold_id}
+    seed.update(_pick_feet(footholds, min(hold_a.grid_y, hold_b.grid_y), wall))
+    return seed
+
+
+def feasible_climb_stances(
+    wall: Wall, profile: ClimberProfile, *, hang_steps: int = 20,
+) -> list[dict]:
+    """Hangable 4-grip stances at each height for the climb reverse curriculum.
+    Stance i = hands on consecutive route holds (hand_seq[i], hand_seq[i+1]) +
+    feet below, excluding the finish (the agent must climb TO it). Ordered
+    bottom→top; each vetted to hang under zero action. Each entry:
+    ``{seed_kwargs, top_hand_row}``."""
+    hand_seq, footholds, _finish = extract_route(wall)
+    n = len(hand_seq)
+    if n < 3:
+        return []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        env = Climbing3DEnv(wall, profile=profile, config=EnvConfig(task_mode="climb"))
+    zero = np.zeros(env.action_space.shape, dtype=np.float32)
+    out: list[dict] = []
+    try:
+        for i in range(n - 1):
+            a, b = hand_seq[i], hand_seq[i + 1]
+            if a.is_finish or b.is_finish:
+                continue  # don't seed on the finish — climb TO it
+            seed = _stance_seed(a, b, footholds, wall)
+            env.cfg_env.seed_kwargs = seed
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    env.reset(seed=0)
+            except Exception:  # noqa: BLE001
+                continue
+            if sum(1 for l in ("LH", "RH", "LF", "RF")
+                   if env.world.on_hold(l) is not None) < 3:
+                continue
+            fell = False
+            for _ in range(hang_steps):
+                _o, _r, term, _tr, info = env.step(zero)
+                if term and info.get("outcome") == "fell":
+                    fell = True
+                    break
+            if not fell:
+                out.append({"seed_kwargs": seed,
+                            "top_hand_row": max(a.grid_y, b.grid_y)})
+    finally:
+        env.close()
+    return out
+
+
+@dataclass
+class ClimbCurriculumConfig:
+    """Knobs for the full-climb reverse curriculum."""
+    wall: Optional[str] = None
+    gen_seed: int = 7
+    gen_difficulty: float = 0.0
+    gen_cols: int = 12
+    gen_rows: int = 20
+    gen_cell_size_cm: float = DEFAULT_CELL_SIZE_CM
+    gen_max_wall_attempts: int = 6
+    min_levels: int = 3
+    window: int = 30
+    up_threshold: float = 0.40        # top-out rate to drop the start lower
+    skip_after_episodes: int = 400    # give up on a stuck level and drop anyway
+    finish_approach_coeff: float = 50.0
+    climb_episode_steps: int = 1000
+
+
+class ClimbCurriculumEnv(gym.Env):
+    """Reverse curriculum on the full climb: seed the body in a vetted stance at
+    a height, run the full climb reward toward the finish, and lower the start
+    one stance at a time as the top-out rate clears ``up_threshold`` (skip-stuck
+    guard). rc_pos starts at the highest stance (nearest the finish) and walks
+    down to the start. One inner env, reused (wall is fixed); the per-episode
+    task is selected by mutating cfg_env before reset.
+
+    info keys: stage='climb-reverse', rc_pos, rc_total, stage_success_rate.
+    """
+
+    metadata = Climbing3DEnv.metadata
+
+    def __init__(self, config=None, profile=None, env_config=None, render_mode=None):
+        super().__init__()
+        self._ccfg = config or ClimbCurriculumConfig()
+        self._profile = profile or ClimberProfile()
+        self._base_cfg = env_config or EnvConfig()
+        self._render_mode = render_mode
+
+        self._wall, self._levels = self._build_wall_and_vet()
+        if len(self._levels) < self._ccfg.min_levels:
+            raise RuntimeError(
+                f"ClimbCurriculumEnv: only {len(self._levels)} hangable stances "
+                f"(need ≥ {self._ccfg.min_levels}); try another gen_seed."
+            )
+        self._rc = len(self._levels) - 1        # highest stance (near finish) first
+        self._history: deque[bool] = deque(maxlen=self._ccfg.window)
+        self._eps_since_advance = 0
+
+        self._env = Climbing3DEnv(
+            self._wall, profile=self._profile,
+            config=self._episode_cfg(), render_mode=self._render_mode,
+        )
+        self.observation_space = self._env.observation_space
+        self.action_space = self._env.action_space
+
+    def _build_wall_and_vet(self):
+        if self._ccfg.wall:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                wall = load_wall(self._ccfg.wall)
+            return wall, feasible_climb_stances(wall, self._profile)
+        for attempt in range(self._ccfg.gen_max_wall_attempts):
+            gen = GeneratorConfig(
+                cols=self._ccfg.gen_cols, rows=self._ccfg.gen_rows,
+                cell_size_cm=self._ccfg.gen_cell_size_cm,
+                difficulty=self._ccfg.gen_difficulty,
+                seed=self._ccfg.gen_seed + attempt,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                wd = generate_wall(gen)
+            if wd is None:
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                wall = load_wall(wd, cell_size_cm=self._ccfg.gen_cell_size_cm)
+            levels = feasible_climb_stances(wall, self._profile)
+            if len(levels) >= self._ccfg.min_levels:
+                return wall, levels
+        return wall, levels
+
+    def _episode_cfg(self) -> EnvConfig:
+        lvl = self._levels[self._rc]
+        return replace(
+            self._base_cfg,
+            task_mode="climb",
+            seed_kwargs=dict(lvl["seed_kwargs"]),
+            finish_approach_coeff=self._ccfg.finish_approach_coeff,
+            reach_target_hold_id=None,
+            reach_mover_limb=None,
+            max_steps=self._ccfg.climb_episode_steps,
+        )
+
+    # ─── Gym API ─────────────────────────────────────────────────────────────
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self._env.cfg_env = self._episode_cfg()
+        obs, info = self._env.reset(seed=seed, options=options)
+        info.update(self._info())
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self._env.step(action)
+        if terminated or truncated:
+            self._history.append(info.get("outcome") == "completed")
+            self._maybe_advance()
+        info.update(self._info())
+        return obs, reward, terminated, truncated, info
+
+    def render(self):
+        return self._env.render()
+
+    def close(self):
+        self._env.close()
+
+    @property
+    def success_rate(self) -> float:
+        return sum(self._history) / len(self._history) if self._history else 0.0
+
+    def _maybe_advance(self) -> None:
+        """Drop the start one stance lower on a cleared top-out rate, or skip a
+        stance that won't train after skip_after_episodes."""
+        self._eps_since_advance += 1
+        if len(self._history) < max(1, self._ccfg.window // 2):
+            return
+        mastered = self.success_rate >= self._ccfg.up_threshold
+        stuck = self._eps_since_advance >= self._ccfg.skip_after_episodes
+        if (mastered or stuck) and self._rc > 0:
+            self._rc -= 1
+            self._history.clear()
+            self._eps_since_advance = 0
+
+    def _info(self) -> dict[str, Any]:
+        return {
+            "stage": "climb-reverse",
+            "rc_pos": int(self._rc),
+            "rc_total": len(self._levels),
+            "stage_success_rate": round(self.success_rate, 4),
+            # rc_pos high (near finish) = early/easy → low difficulty; walking
+            # down to 0 (full climb) = difficulty 1.
+            "curriculum_difficulty": round(
+                1.0 - self._rc / max(1, len(self._levels) - 1), 4),
+        }

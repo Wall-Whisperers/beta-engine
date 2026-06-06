@@ -130,14 +130,41 @@ climbing move. Getting there forced three fixes now baked in: the grip-strength
 physics (one-hand stances were impossible), PPO trust-region guards (`target_kl`
 etc.), and a target-aware observation.
 
-**Remaining (this is the live frontier):**
-- The stable PPO config learns slowly — reach-one needs a **long run (≥1 M
-  steps)** to hit high success, **advance `rc_pos` through the route**, and enter
-  the **climb** stage. No full top-out yet.
-- reach-one runs on ONE fixed generated wall (`--staged-gen-seed`). Generalise
-  to multiple walls once a single wall trains through.
-- Consider warm-starting `climb` from the trained reach-one policy
-  (`--init-from`) rather than relying on auto-advance alone.
+### A1b. THE FRONTIER — chaining scaffolded reaches into a climb (UNSOLVED)
+
+reach-one works **with scaffolding**: a *designated* mover hand (per-limb
+deadband 0, releases freely), a *target-aware* obs (the mover's goal vector
+points at the target), and a dense signed-potential reach reward. A full **climb
+does not** — six distinct attempts (2026-06-06) all hit the same wall:
+
+| Approach | Result |
+|---|---|
+| plain climb (strong grips) | hangs 5–6× longer, never reaches up |
+| + dense `finish_approach` (B2-fixed, tip-based) | never *attempts* the reach |
+| + `reach_approach` | farms (fall-and-swing) |
+| lower deadband (release exploration) | random releases → falls |
+| warm-start climb from the reach policy | release-and-fall (regime mismatch) |
+| per-move reverse curriculum (`StagedCurriculumEnv`) | most moves unlearnable, no transfer |
+| full-climb reverse curriculum (`ClimbCurriculumEnv`) | stalls on the *first* 2-row reach |
+
+**Root cause:** in climb mode the agent must *choose* which hand to move, so
+there is no designated mover and the protective deadband applies to all hands
+equally — it never explores release-and-reach, even from a stance 2 rows below
+the finish. The per-limb scaffolding that makes a single reach discoverable does
+not exist in free-choice climbing, and it does not compose across moves (this is
+the "options don't compose" problem in hierarchical RL). **No reward tweak fixes
+this** — it's exploration/structure, not shaping.
+
+Candidate directions (all substantial, none quick): bring the per-limb
+scaffolding *into* the climb (designate the next mover each move from a
+learned/heuristic selector — i.e. an options/hierarchical policy); behavior-clone
+a move sequence from the discrete-move expert (A4) and PPO-fine-tune; or much
+larger-scale training. A **short top-out** is achievable today by pointing
+reach-one's target at the finish from a stance right below it — but that's the
+reach-one capability relabeled, not chained climbing.
+
+Lesser open items: stable PPO learns slowly (reach-one needs ≥1 M steps for high
+success); both curricula run on ONE fixed generated wall — generalise later.
 
 ### A2. Dense potential-based shaping — DELIVERED (reward clean-restart, 2026-06-05)
 

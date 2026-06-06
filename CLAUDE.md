@@ -50,7 +50,7 @@ beta-engine/
 │   ├── moonboard_env.py # MoonboardClimbing3DEnv — samples problems per reset
 │   ├── moonboard.py     # MoonBoard problem JSON → Wall adapter
 │   ├── curriculum.py    # CurriculumEnv — new synthetic wall every episode (wall-difficulty)
-│   ├── staged_curriculum.py # StagedCurriculumEnv — hang→reach-one→climb task stages (A1)
+│   ├── staged_curriculum.py # StagedCurriculumEnv (hang→reach-one→climb, A1) + ClimbCurriculumEnv (full-climb reverse curriculum)
 │   ├── callbacks.py     # VideoRolloutCallback, FirstMidLastCheckpointCallback
 │   ├── train.py         # SB3 PPO trainer + episode CSV logger
 │   ├── plot_reward_terms.py # per-term reward decomposition viewer (diagnostics)
@@ -307,8 +307,10 @@ terms, two terminals, three physics gates. Nothing else is on by default.
 - **Physics gates ≠ shaping.** Intersection / slip / energy keep the solution
   physical; they are not climbing-shaping and stay on.
 - **Inert legacy levers (default 0):** `hwm_height_scale`, `finish_approach_coeff`
-  (first to re-add, with the B2 reference-jump fixed, if the agent climbs but
-  wanders off-route), `reach_approach_coeff` (fall-and-swing exploit),
+  (B2 reference-jump now fixed — `_finish_dist` measures from the highest hand
+  *tip*, so it's an un-farmable signed potential; tried in the climb experiments
+  but it does not crack the chaining frontier — see NEXT_STEPS A1b),
+  `reach_approach_coeff` (fall-and-swing exploit — confirmed it still farms),
   `survival_bonus_coeff` (floor-hang attractor), `new_high_grip_bonus`
   (grab→fall→repeat magnet), `grip_release_penalty`, `upward_velocity_coeff`.
   Code paths are kept behind `if coeff > 0` so terms can be re-added **one at a
