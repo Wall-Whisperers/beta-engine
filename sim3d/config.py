@@ -264,11 +264,32 @@ SLIP_FORCE_SLACK = 1.25
 # to the joint targets. A grip can only engage when the limb tip is within
 # GRIP_PROXIMITY_M of an unoccupied valid hold. There is no auto-grip — the
 # agent must explicitly raise the intent above 0.0.
-GRIP_PROXIMITY_M = 0.05
+# Raised 0.05 → 0.08 (2026-06-05): the reach-one curriculum showed the agent
+# learning to reach toward a target hold but rarely landing inside a 5 cm radius
+# to complete the grip — near-misses never converted to grabs. 8 cm turns those
+# learned near-reaches into successful regrips. (Long-flagged in the post-mortem.)
+GRIP_PROXIMITY_M = 0.08
 
 # Feet push on overhangs; hands pull. Per-limb capacity multiplier so feet can
 # generate more reaction force than the hands' rated grip strength.
-FOOT_FORCE_MULTIPLIER = 1.5
+# Raised 1.5 → 3.0 (2026-06-05) alongside HAND_FORCE_MULTIPLIER: when a hand
+# releases for a move, its load redistributes onto the anchor hand AND both
+# feet, so the feet need headroom too. With foot 1.5 the feet slipped during the
+# transition and the stance still collapsed; 3.0 holds a one-hand stance solidly
+# (verified: anchors survive 40/40 steps through a hand release, even under
+# joint jitter). Same training-phase rationale as HAND_FORCE_MULTIPLIER.
+FOOT_FORCE_MULTIPLIER = 3.0
+
+# Hand grip-strength multiplier (2026-06-05). Raised from an implicit 1.0 after
+# a decisive finding: with the default grip cap the body CANNOT hold a one-hand
+# stance — releasing either hand collapses the (already ~1.3× over-braced) grips
+# and the climber drops. That is the physical reason every run learned to cling
+# and never climb: with weak hands, "let go and reach" is a losing move. 2.5×
+# lets the body bear the load transfer a hand move requires (verified: anchors
+# survive the release, the reach reward fires). This is a training-phase choice
+# — the roadmap defers realistic grip force to the torque/muscle phase; tighten
+# it back toward 1.0 once the agent reliably climbs.
+HAND_FORCE_MULTIPLIER = 2.5
 
 # ─── Kickboard ─────────────────────────────────────────────────────────────
 # A "kickboard" is a secondary near-vertical plate below the main wall with a

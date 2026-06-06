@@ -583,7 +583,7 @@ class Climb3DWorld:
 
     def _max_force_for(self, limb: Limb, meta: dict) -> float:
         if limb in HAND_LIMBS:
-            base = self.profile.grip_force_n
+            base = self.profile.grip_force_n * cfg.HAND_FORCE_MULTIPLIER
         else:
             base = self.profile.foot_push_force_n * cfg.FOOT_FORCE_MULTIPLIER
         cap = base * meta["positivity"]

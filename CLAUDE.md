@@ -49,9 +49,11 @@ beta-engine/
 │   ├── env.py           # Climbing3DEnv — Gymnasium wrapper
 │   ├── moonboard_env.py # MoonboardClimbing3DEnv — samples problems per reset
 │   ├── moonboard.py     # MoonBoard problem JSON → Wall adapter
-│   ├── curriculum.py    # CurriculumEnv — new synthetic wall every episode
+│   ├── curriculum.py    # CurriculumEnv — new synthetic wall every episode (wall-difficulty)
+│   ├── staged_curriculum.py # StagedCurriculumEnv — hang→reach-one→climb task stages (A1)
 │   ├── callbacks.py     # VideoRolloutCallback, FirstMidLastCheckpointCallback
 │   ├── train.py         # SB3 PPO trainer + episode CSV logger
+│   ├── plot_reward_terms.py # per-term reward decomposition viewer (diagnostics)
 │   ├── viewer.py        # native MuJoCo viewer wrapper
 │   ├── web.py           # Flask blueprint for the Three.js browser viewer
 │   └── __main__.py      # `python -m sim3d` CLI (incl. --play <model.zip>)
@@ -81,7 +83,7 @@ beta-engine/
 
 ---
 
-## Current Status (as of 2026-05-27)
+## Current Status (as of 2026-06-05)
 
 ### ✅ Done
 
@@ -109,23 +111,26 @@ beta-engine/
 
 ### ⚠️ What Doesn't Work Yet
 
-The simulator and body are solid. **The training loop has known blockers
-that prevent any learning**, documented fully in `NEXT_STEPS.md`:
+**As of 2026-06-05 the agent learns its first climbing move.** Via the A1
+staged curriculum (`staged_curriculum.py`), a PPO policy learned **reach-one**
+— release a hand, reach a target hold, regrip — stably (monotonic, no collapse)
+on a generated wall. Getting here required, in order:
 
-1. **Episode length = 30 steps = 3.84 s** — a real MoonBoard problem
-   takes 10–60 s. Fix: `max_episode_steps` → 800–1500.
-2. **MoonBoard seed pose puts feet above hands** — kickboard holds not
-   exposed to `_default_seed_kwargs`. Fix: expose kickboard holds through
-   the Wall object.
-3. **Neutral action releases all grips** — SB3's Gaussian policy init
-   (mean=0, std=1) releases ~2 limbs on step 1 → immediate fall.
-4. **No VecNormalize** — raw world positions at very different scales; known
-   PPO failure mode on MuJoCo environments.
-5. **No dense reward signal** — goal vectors are in the observation but not
-   the reward; no gradient toward the next hold.
+1. **A clean potential-based reward** (height progress + hold-match + terminals;
+   the old patchwork was never shipped — `train.py` re-layered it). DONE.
+2. **The default-wall foot-gun** — 3 of 5 demo walls are unhangable for this
+   body; default is now `baby-v1` + a startup hang-check. DONE.
+3. **The physical blocker** — the body could not hold a one-hand stance with
+   the old grips, so "cling forever" was optimal and nothing ever climbed.
+   Fixed by stronger hands/feet (see §Grip strength). DONE.
+4. **Two training collapses** — a PPO trust-region blowout (→ `target_kl`,
+   `clip_range 0.1`, fewer epochs) and a target-blind observation (→ the
+   mover's goal vector now points at the reach target). DONE.
 
-**A policy has never completed a problem. Success rate = 0%.**
-The blockers above (not the body) are why. Fix Phase 0 before anything else.
+**Still open:** the stable config learns slowly, so reach-one needs a long run
+(≥1 M steps) to reach high success and advance through the curriculum into the
+full **climb** stage; no end-to-end MoonBoard top-out yet. Earlier Phase-0
+items (episode length, VecNormalize, log_std_init) are resolved in `train.py`.
 
 ---
 
@@ -182,6 +187,23 @@ the hold, set `data.eq_active[i] = 1`. To release: `eq_active[i] = 0`.
 so the **tip site** (fingertip / toe) lands on the hold, not the wrist /
 ankle.
 
+### Grip strength (training-phase, 2026-06-05)
+
+A weld slips when its force exceeds `cap × SLIP_FORCE_SLACK`, where
+`cap = base_force × positivity` (clamped by the hold's rating) and
+`base_force = grip_force_n × HAND_FORCE_MULTIPLIER` (hands) or
+`foot_push_force_n × FOOT_FORCE_MULTIPLIER` (feet). The multipliers were
+raised — **`HAND_FORCE_MULTIPLIER 1.0→2.5`, `FOOT_FORCE_MULTIPLIER 1.5→3.0`** —
+after a decisive finding: with the old values **the body could not hold a
+one-hand stance**. Releasing either hand for a move overloaded the remaining
+grips (the seed stances sit ~1.3× over cap) and the climber dropped. That is
+the physical reason every prior run learned to *cling* and never climb — "let
+go and reach" was a losing move. With the stronger grips a hand release leaves
+a stable stance (verified) and the agent can climb. `GRIP_PROXIMITY_M` was also
+loosened `0.05→0.08` so learned near-reaches convert to grips. These are a
+**training-phase choice** — the roadmap defers realistic grip force to the
+torque/muscle phase; tighten back toward 1.0 once the agent reliably climbs.
+
 ---
 
 ## Action Space (Canonical: `continuous-joint`)
@@ -232,7 +254,10 @@ Box(low=-inf, high=inf, shape=(127,), dtype=float32)
                          role_onehot [start, mid, finish] (3)
                          is_gripping (1)
 [114:126)  per-limb anchor/goal vectors  (12)
-               zero when gripped; (finish_world − tip_world) otherwise
+               zero when gripped; (nearest_reachable_hold − tip) otherwise.
+               reach-one task mode: the MOVER limb's slot points at the
+               designated target hold (target_world − tip) even while gripped,
+               so the policy can perceive WHICH hold to reach.
 [126:127)  Euclidean dist: highest gripped hand → nearest finish (1)
 ```
 
@@ -247,32 +272,73 @@ Box(low=-inf, high=inf, shape=(127,), dtype=float32)
 
 ## Reward Function (per step, `continuous-joint`)
 
-| Component | Value | Notes |
-|---|---|---|
-| HWM height gain | `+50.0 × max(0, com_z − episode_max_com_z)` | State-based; un-hackable |
-| First-touch hold match | `+10.0` rising-edge | Deduped per `(limb, hold_id)` per episode |
-| New high-grip bonus | `+75.0` when grip raises `episode_max_grip_z` | Each height level pays once |
-| Finish approach | `+coeff × (prev_dist − cur_dist)` | Potential-based; use coeff=100 (full 2m route → +200) |
-| Survival (hand-gated) | `+coeff × (2·n_hand + n_foot)/6` | Only if survival_coeff≤0.02; default 0 — see warning |
-| Grip release | `−coeff × n_released` | Typical coeff 1.0 |
-| Slip | `−5.0 × n_slips` | Grip force exceeded hold capacity |
-| Body intersection | `−20.0 × n_contacts` | Hard gate, not shaping nudge |
-| Energy | `−0.0005 × Σ ctrl²` | Discourages max-torque jitter |
-| Invalid action | `−0.25` | Discrete-move only |
-| Terminal: finish | `+200` | One hand on finish hold ≥ 6 consecutive steps |
-| Terminal: fall | `−50` | pelvis_z < 0.20 m |
+**Clean restart (2026-06-05).** Every shaping term we ever added either got
+farmed or blocked something else, so the reward was a patchwork of guards
+against the previous week's exploit. It is now rebuilt around one honest idea:
+**reward raising the body, symmetrically, and let the discount factor — not a
+per-step penalty — create the "climb promptly" pressure.** Two climbing-shaping
+terms, two terminals, three physics gates. Nothing else is on by default.
 
-**Anti-hack design (updated 2026-05-27):**
-- `upward_velocity_coeff` raw per-step form was oscillation-farmable (overnight_1 plateau).
-  Now GATED on HWM gain — equivalent to extra HWM scale, not a separate term.
-- `_max_com_z` MUST init at **seed pose com_z**, not 0. Initing at 0 gives a
-  free HWM bonus equal to `hwm_scale × seed_height` on reset step 1 — that +60
-  combined with survival bonus made floor-hanging profitable (overnight_2 exploit).
-- `survival_bonus_coeff` must be ≤ 0.02 or 0. Any larger value creates a
-  stable attractor at "grip lowest holds forever" (ceiling × coeff beats fall
-  penalty; overnight_2 plateaued at survival ceiling with COM-z = 0.27 m).
-- `finish_approach_coeff` is the primary dense signal. Total reward for a
-  full climb = coeff × route_length. Use coeff ≥ 50; default recommended: 100.
+| Component | Value | Category |
+|---|---|---|
+| **Height progress** | `+60.0 × (com_z − prev_com_z)` | primary dense — potential-based, symmetric (up pays, down costs), telescopes ⇒ un-farmable |
+| First-touch hold match | `+10.0` rising-edge, deduped per `(limb, hold_id)`/episode | sparse grip nudge — the only grip incentive |
+| Terminal: finish | `+200` | one hand on finish hold ≥ 6 consecutive steps |
+| Terminal: fall | `−50` | pelvis_z < 0.20 m |
+| Body intersection | `−20.0 × n_contacts` | physics gate (validity, not shaping) |
+| Slip | `−5.0 × n_slips` | physics gate |
+| Energy | `−0.001 × Σ ctrl²` | physics gate (anti-jitter, tiny) |
+
+**Design rationale:**
+- **Why potential-based `com_z`, not HWM.** The old high-water-mark only paid
+  for *new* max height; sliding back down was free, so it could not punish lost
+  progress. `K·(com_z − prev_com_z)` is symmetric and, by the potential-shaping
+  theorem (Ng et al. 1999), policy-invariant and un-farmable by oscillation —
+  which was the whole reason HWM needed the one-way ratchet. `prev_com_z` inits
+  at the settled seed com_z, so step 1 earns `(com_z_after − seed)`, never a
+  free bonus.
+- **No time / stagnation penalty.** A per-step living cost interacts lethally
+  with the `−50` fall terminal: falling *ends* the episode, so any cost above
+  ~0.05/step makes "release and fall on step 1" beat hanging for a full episode.
+  Since the agent can't climb yet, PPO finds that death-spiral first. "Climb
+  promptly" pressure comes from the PPO discount γ and the symmetric height
+  potential (stalling earns 0 while climbing earns positive). Add an explicit
+  efficiency penalty only *after* the agent reliably tops out.
+- **Physics gates ≠ shaping.** Intersection / slip / energy keep the solution
+  physical; they are not climbing-shaping and stay on.
+- **Inert legacy levers (default 0):** `hwm_height_scale`, `finish_approach_coeff`
+  (first to re-add, with the B2 reference-jump fixed, if the agent climbs but
+  wanders off-route), `reach_approach_coeff` (fall-and-swing exploit),
+  `survival_bonus_coeff` (floor-hang attractor), `new_high_grip_bonus`
+  (grab→fall→repeat magnet), `grip_release_penalty`, `upward_velocity_coeff`.
+  Code paths are kept behind `if coeff > 0` so terms can be re-added **one at a
+  time, diagnostics-driven** — never all at once.
+
+**Diagnostics.** `episode_stats.csv` logs a per-term decomposition
+(`r_height, r_match, r_reach, r_finish, r_fall, r_slip, r_intersect, r_energy,
+r_other`) that sums to the episode return, plus `stage` / `rc_pos` for the
+staged curriculum. `r_height` should dominate in climb mode; any other column
+creeping up is the next exploit surfacing. View with
+`python -m sim3d.plot_reward_terms <run>/episode_stats.csv`.
+
+### Task-stage curriculum (A1) — `EnvConfig.task_mode`
+
+To break the "hangs but won't climb" exploration trap, `task_mode` gates the
+reward into an achievable progression (`StagedCurriculumEnv` auto-advances it on
+rolling success; `python -m sim3d.train --staged-curriculum`):
+
+- **`hang`** — reward staying on the wall; success = survive `hang_target_steps`.
+- **`reach-one`** — one designated *mover* hand must release and grip a *target*
+  hold. Reward = **dense signed-potential** pull toward the target
+  (`reach_one_coeff × Δdist`, gated on the other ≥2 limbs anchored so the
+  fall-and-swing farm can't return) + **`+50` regrip** bonus/success. Height
+  reward is **off** in this mode (the high reverse-curriculum seed makes a fall's
+  `−K·Δz` swamp the reach signal). The mover starts seeded on a stance vetted to
+  hang; the obs points its goal vector at the target (see §Observation Space).
+- **`climb`** — the full clean reward above.
+
+Default `task_mode="climb"` — the curriculum is opt-in and leaves normal
+training unchanged.
 
 ---
 

@@ -65,7 +65,18 @@ class EnvConfig:
     fall_z: float = 0.20
     finish_hold_frames: int = 6
     # Reward coefficients.
-    hwm_height_scale: float = 50.0               # × max(0, com_z − max_com_z)
+    # Primary dense signal: potential-based height progress. Reward each step
+    # is K·(com_z − prev_com_z) — symmetric (up pays, down costs, flat is
+    # neutral) and telescoping, so oscillating the pelvis nets ~0. This is the
+    # canonical "reward up" term; it supersedes the one-way high-water-mark
+    # below (which couldn't punish downward motion). "Climb promptly" pressure
+    # comes from the PPO discount γ, NOT a per-step time penalty (a living cost
+    # would make falling-to-end-the-episode beat hanging — the death spiral).
+    height_progress_scale: float = 60.0          # × (com_z − prev_com_z)
+    # Legacy high-water-mark term — additive, INERT by default (0.0). Only the
+    # new max pays, so it gives a free gradient up but no penalty for sliding
+    # back down. Kept as an optional lever, not the main signal.
+    hwm_height_scale: float = 0.0                # × max(0, com_z − max_com_z)
     hold_match_bonus: float = 10.0               # rising-edge first-touch
     # Bonus paid when a grip event raises the episode's max gripped-hold z.
     # Big discrete jackpot for *vertical* progress through grips; each height
@@ -128,6 +139,24 @@ class EnvConfig:
     official_route_only: bool = False
     reset_max_retries: int = 5
     include_kickboard: bool = False
+    # ── Task-stage curriculum (A1) ───────────────────────────────────
+    # task_mode gates the reward so PPO can learn an achievable sub-task before
+    # the full climb. Default "climb" = the standard clean reward (unchanged).
+    #   "hang"      — reward staying on the wall; success = survive
+    #                 hang_target_steps without falling. (Already ~solved by the
+    #                 height reward, so this stage clears fast.)
+    #   "reach-one" — one designated hand must release and grip a target hold.
+    #                 Dense signed-potential reward toward the target, gated on
+    #                 the other 3 limbs staying anchored (so the fall-and-swing
+    #                 farm can't return); big bonus + success on regrip.
+    # The StagedCurriculumEnv wrapper sets these per episode and auto-advances.
+    task_mode: str = "climb"                      # "climb" | "hang" | "reach-one"
+    reach_target_hold_id: Optional[str] = None    # reach-one: hold the mover must grip
+    reach_mover_limb: Optional[str] = None        # reach-one: "LH" | "RH"
+    hang_target_steps: int = 60                   # hang: steps survived = success
+    reach_one_coeff: float = 30.0                 # reach-one: × (prev_d − d) toward target
+    reach_regrip_bonus: float = 50.0              # reach-one: bonus + success on regrip
+    hang_survival_coeff: float = 0.1              # hang: per-step reward while ≥3 grips
 
 
 class Climbing3DEnv(gym.Env):
@@ -156,6 +185,8 @@ class Climbing3DEnv(gym.Env):
             raise ValueError(f"unknown action_mode: {self.cfg_env.action_mode}")
         if self.cfg_env.start_mode not in ("seed", "ground-reach"):
             raise ValueError(f"unknown start_mode: {self.cfg_env.start_mode}")
+        if self.cfg_env.task_mode not in ("climb", "hang", "reach-one"):
+            raise ValueError(f"unknown task_mode: {self.cfg_env.task_mode}")
 
         self.world = Climb3DWorld(
             wall, self.profile, include_kickboard=self.cfg_env.include_kickboard,
@@ -289,6 +320,20 @@ class Climbing3DEnv(gym.Env):
         self._prev_finish_dist = self._finish_dist()
         self._prev_com_z = float(self.world.com()[2])
         self._prev_reach_dists = self._reach_dists()
+        # Reach-one task state: distance from the designated mover hand's tip to
+        # the target hold (for the dense signed-potential reward) and a one-shot
+        # success latch so the regrip bonus pays exactly once.
+        self._reach_one_done = False
+        self._prev_reach_one_dist = self._reach_one_dist()
+        # Per-term reward accumulator for the episode-level decomposition
+        # written to episode_stats.csv (the diagnostic dashboard). The keys
+        # partition the total reward, so sum(self._ep_rew.values()) equals the
+        # episode return — any term that starts getting farmed shows up here.
+        self._ep_rew = {
+            "height": 0.0, "match": 0.0, "finish": 0.0, "fall": 0.0,
+            "slip": 0.0, "intersect": 0.0, "energy": 0.0, "reach": 0.0,
+            "other": 0.0,
+        }
         # Snapshot the settled seed-pose joint targets. Continuous-joint
         # actions are interpreted as residuals around THIS pose (see
         # _step_continuous), so action≈0 means "hold the hang" rather than
@@ -386,23 +431,42 @@ class Climbing3DEnv(gym.Env):
         body_intersections = self.world.body_intersection_count()
         com_z = float(self.world.com()[2])
 
-        # High-water-mark progress (state-based, un-hackable).
-        height_reward = 0.0
+        # Potential-based height progress — the primary dense signal.
+        # Φ(s) = com_z;  reward = K·(Φ(s') − Φ(s)) = K·(com_z − prev_com_z).
+        # Symmetric (up pays, down costs, flat is neutral) and telescoping, so
+        # bouncing the pelvis nets ~0 — un-farmable by construction. _prev_com_z
+        # inits at the settled seed com_z in reset(), so step 1 earns
+        # (com_z_after − seed), never a free bonus. The "climb promptly"
+        # pressure comes from the PPO discount γ, not a per-step living cost.
+        height_reward = self.cfg_env.height_progress_scale * (com_z - self._prev_com_z)
+
+        # Legacy high-water-mark term — additive, inert by default
+        # (hwm_height_scale = 0). Only the new max pays, so it cannot punish
+        # downward motion; retained as an optional lever, not the main signal.
         hwm_gain = 0.0
-        if com_z > self._max_com_z:
+        if self.cfg_env.hwm_height_scale > 0.0 and com_z > self._max_com_z:
             hwm_gain = com_z - self._max_com_z
-            height_reward = self.cfg_env.hwm_height_scale * hwm_gain
+            height_reward += self.cfg_env.hwm_height_scale * hwm_gain
             self._max_com_z = com_z
 
-        # Upward-velocity term — GATED on HWM gain. With this gate the term
-        # is mathematically equivalent to an extra scalar on hwm_height_scale
-        # (un-farmable). The original "per-step max(0, dz)" semantics was
-        # exploited by pelvis-bouncing in place. Default coeff = 0; leave
-        # at 0 unless intentionally amplifying HWM.
+        # Upward-velocity term — GATED on HWM gain (legacy; inert unless both
+        # hwm_height_scale and upward_velocity_coeff are set). The original
+        # "per-step max(0, dz)" semantics was exploited by pelvis-bouncing in
+        # place; kept only for back-compat with old CLIs.
         upward_reward = 0.0
         if self.cfg_env.upward_velocity_coeff > 0.0 and hwm_gain > 0.0:
             upward_reward = self.cfg_env.upward_velocity_coeff * hwm_gain
         self._prev_com_z = com_z
+
+        # reach-one is a LOCAL move from a (possibly high) reverse-curriculum
+        # seed. The global height telescope turns any fall into a huge −K·Δz
+        # (seen at −233 in a smoke) that swamps the +reach/+regrip signal and
+        # destabilises the shared policy. Zero it here; the dense reach reward
+        # and the −50 fall terminal carry reach-one. (_prev_com_z is still
+        # updated above, so re-entering climb mode resumes cleanly.)
+        if self.cfg_env.task_mode == "reach-one":
+            height_reward = 0.0
+            upward_reward = 0.0
 
         # Rising-edge per (limb, hold) hold-match bonus + new-high-grip
         # bonus when this grip event raises the episode's max gripped-z.
@@ -487,6 +551,45 @@ class Climbing3DEnv(gym.Env):
         # local optimum.
         release_penalty = self.cfg_env.grip_release_penalty * n_released
 
+        # ── Task-stage curriculum terms (inert in "climb" mode) ──────────
+        # reach-one: dense signed-potential reward for the designated mover hand
+        # approaching the target hold, GATED on the other 3 limbs staying
+        # anchored (a true stance). The gate is what makes it farm-proof: the old
+        # fall-and-swing exploit needs the body falling (anchors lost), which
+        # closes the gate; and a *signed* potential on a *single* designated limb
+        # means swinging out-and-back nets zero. A one-shot regrip bonus pays
+        # when the mover grips the target.
+        reach_one_reward = 0.0
+        reach_one_success = False
+        if self.cfg_env.task_mode == "reach-one" and self.cfg_env.reach_target_hold_id:
+            mover = self.cfg_env.reach_mover_limb
+            target = self.cfg_env.reach_target_hold_id
+            n_anchored = sum(
+                1 for l in LIMBS if l != mover and self.world.on_hold(l) is not None
+            )
+            cur_d = self._reach_one_dist()
+            if n_anchored >= 2:  # ≥2 grips = not falling; releasing the mover
+                # naturally drops the over-braced stance to ~2 grips, so a ≥3
+                # gate never opened. ≥2 still blocks the fall-and-swing farm
+                # (which needs the body actually falling, i.e. ~0 anchors).
+                reach_one_reward = self.cfg_env.reach_one_coeff * (
+                    self._prev_reach_one_dist - cur_d
+                )
+            self._prev_reach_one_dist = cur_d
+            if not self._reach_one_done and self.world.on_hold(mover) == target:
+                reach_one_reward += self.cfg_env.reach_regrip_bonus
+                self._reach_one_done = True
+                reach_one_success = True
+
+        # hang: small per-step reward while ≥3 limbs are anchored. The GOAL of
+        # the hang stage is just to stay on the wall; success is surviving
+        # hang_target_steps (handled in the termination block).
+        hang_survival_reward = 0.0
+        if self.cfg_env.task_mode == "hang":
+            n_grips = sum(1 for l in LIMBS if self.world.on_hold(l) is not None)
+            if n_grips >= 3:
+                hang_survival_reward = self.cfg_env.hang_survival_coeff
+
         reward = (
             height_reward
             + upward_reward
@@ -495,6 +598,8 @@ class Climbing3DEnv(gym.Env):
             + survival_reward
             + match_bonus
             + high_grip_bonus
+            + reach_one_reward
+            + hang_survival_reward
             - release_penalty
             - self.cfg_env.slip_penalty * slips
             - self.cfg_env.body_intersection_penalty * body_intersections
@@ -503,30 +608,81 @@ class Climbing3DEnv(gym.Env):
         if invalid:
             reward -= self.cfg_env.invalid_action_penalty
 
-        # ── Termination ──────────────────────────────────────────────
+        # Per-term accumulation (diagnostics). These keys partition the per-step
+        # reward; the two terminals (finish/fall) are added in the termination
+        # block below so sum(self._ep_rew.values()) == episode return. "other"
+        # is the catch-all for currently-inert shaping terms, so if any of them
+        # is re-enabled later it surfaces here instead of hiding inside total.
+        er = self._ep_rew
+        er["height"] += float(height_reward + upward_reward)
+        er["match"] += float(match_bonus + high_grip_bonus)
+        er["slip"] += float(-self.cfg_env.slip_penalty * slips)
+        er["intersect"] += float(
+            -self.cfg_env.body_intersection_penalty * body_intersections
+        )
+        er["energy"] += float(-self.cfg_env.energy_penalty_coeff * ctrl_l2_sq)
+        er["reach"] += float(reach_one_reward)
+        er["other"] += float(
+            approach_reward + reach_reward + survival_reward + hang_survival_reward
+            - release_penalty
+            - (self.cfg_env.invalid_action_penalty if invalid else 0.0)
+        )
+
+        # ── Termination (branches by task_mode) ──────────────────────
         terminated = False
         truncated = False
         pelvis_z = float(self.world.pelvis_pos()[2])
-        on_finish = (
-            self.world.on_hold("LH") in self._finish_hold_ids
-            or self.world.on_hold("RH") in self._finish_hold_ids
-        )
-        if on_finish:
-            self._finish_streak += 1
-        else:
-            self._finish_streak = 0
+        fell = pelvis_z < self.cfg_env.fall_z
 
-        if self._finish_streak >= self.cfg_env.finish_hold_frames:
-            reward += self.cfg_env.on_finish_bonus
-            terminated = True
-            info["outcome"] = "completed"
-        elif pelvis_z < self.cfg_env.fall_z:
-            reward -= self.cfg_env.fall_penalty
-            terminated = True
-            info["outcome"] = "fell"
-        elif self._step_count >= self.cfg_env.max_steps:
-            truncated = True
-            info["outcome"] = "timeout"
+        if self.cfg_env.task_mode == "reach-one":
+            # Success = the designated mover hand gripped the target hold.
+            if reach_one_success:
+                terminated = True
+                info["outcome"] = "completed"
+            elif fell:
+                reward -= self.cfg_env.fall_penalty
+                self._ep_rew["fall"] += float(-self.cfg_env.fall_penalty)
+                terminated = True
+                info["outcome"] = "fell"
+            elif self._step_count >= self.cfg_env.max_steps:
+                truncated = True
+                info["outcome"] = "timeout"
+        elif self.cfg_env.task_mode == "hang":
+            # Success = survived hang_target_steps without falling.
+            if fell:
+                reward -= self.cfg_env.fall_penalty
+                self._ep_rew["fall"] += float(-self.cfg_env.fall_penalty)
+                terminated = True
+                info["outcome"] = "fell"
+            elif self._step_count >= self.cfg_env.hang_target_steps:
+                terminated = True
+                info["outcome"] = "completed"
+            elif self._step_count >= self.cfg_env.max_steps:
+                truncated = True
+                info["outcome"] = "timeout"
+        else:  # "climb" — the full route
+            on_finish = (
+                self.world.on_hold("LH") in self._finish_hold_ids
+                or self.world.on_hold("RH") in self._finish_hold_ids
+            )
+            if on_finish:
+                self._finish_streak += 1
+            else:
+                self._finish_streak = 0
+
+            if self._finish_streak >= self.cfg_env.finish_hold_frames:
+                reward += self.cfg_env.on_finish_bonus
+                self._ep_rew["finish"] += float(self.cfg_env.on_finish_bonus)
+                terminated = True
+                info["outcome"] = "completed"
+            elif fell:
+                reward -= self.cfg_env.fall_penalty
+                self._ep_rew["fall"] += float(-self.cfg_env.fall_penalty)
+                terminated = True
+                info["outcome"] = "fell"
+            elif self._step_count >= self.cfg_env.max_steps:
+                truncated = True
+                info["outcome"] = "timeout"
 
         info.update(self._info())
         info["slips"] = slips
@@ -539,6 +695,9 @@ class Climbing3DEnv(gym.Env):
         info["high_grip_bonus"] = float(high_grip_bonus)
         info["release_penalty"] = float(release_penalty)
         info["energy_penalty"] = float(self.cfg_env.energy_penalty_coeff * ctrl_l2_sq)
+        if terminated or truncated:
+            # Episode-level reward decomposition for episode_stats.csv.
+            info["rew_terms"] = dict(self._ep_rew)
         return self._obs(), float(reward), terminated, truncated, info
 
     # ─── Action handling ─────────────────────────────────────────────
@@ -572,12 +731,20 @@ class Climbing3DEnv(gym.Env):
         # A symmetric deadband of 0.5 blocked BOTH sides, which caused the
         # week8 plateau: agent reached feet to holds but could never grip them.
         db = self.cfg_env.grip_intent_deadband
+        # reach-one: the designated mover hand starts gripped but must release to
+        # reach the target. Give it a deadband of 0 (releases on intent < 0,
+        # ~50% under exploration) so "let go" is actually discoverable, while the
+        # anchors keep the protective deadband. Without this the mover almost
+        # never releases (0.5 deadband ≈ 1% event) and reach-one can't be learned.
+        mover = (self.cfg_env.reach_mover_limb
+                 if self.cfg_env.task_mode == "reach-one" else None)
         intents = action[n: n + 4]
         for i, limb in enumerate(LIMBS):
             intent = float(intents[i]) if i < len(intents) else 0.0
+            limb_db = 0.0 if limb == mover else db
             if intent > 0.0:
                 self._maybe_engage_grip(limb)
-            elif intent < -db:
+            elif intent < -limb_db:
                 if self.world.on_hold(limb) is not None:
                     self.world.release_limb(limb)
             # else: in release deadband — hold current grip state
@@ -664,6 +831,18 @@ class Climbing3DEnv(gym.Env):
         return LIMBS[action // self.n_holds], self._hold_ids[action % self.n_holds]
 
     # ─── Helpers ─────────────────────────────────────────────────────
+    def _reach_one_dist(self) -> float:
+        """reach-one: distance from the designated mover hand's tip to the
+        target hold. Returns 0.0 when no reach-one target is configured (i.e.
+        in every other task mode), so the term is a no-op outside reach-one."""
+        tgt = self.cfg_env.reach_target_hold_id
+        mover = self.cfg_env.reach_mover_limb
+        if not tgt or not mover or tgt not in self.world._hold_meta_by_id:
+            return 0.0
+        tip = np.array(self.world.limb_tip_pos(mover))
+        tpos = np.array(self.world._hold_meta_by_id[tgt]["world_pos"])
+        return float(np.linalg.norm(tpos - tip))
+
     def _finish_dist(self) -> float:
         """Euclidean distance from the highest gripped hand (or highest hand
         tip if no hand is gripped) to the nearest finish hold."""

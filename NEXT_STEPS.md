@@ -46,7 +46,9 @@ What we still **don't** have:
 - An episode long enough to climb (see 0.1 — this is the headline bug).
 - A first task the agent can actually solve from random init (curriculum
   "hang" mode does not exist yet).
-- Obs/reward normalization, or any dense signal toward the next hold.
+- A dense signal *toward the next hold* — partly addressed: the height-progress
+  reward (A2, delivered) gives a smooth up-gradient, but there is still no
+  per-limb reach gradient by default (the old one farmed; see A2).
 - A success-rate eval harness on a held-out split.
 
 Honest framing: the simulator is solid; the **training loop is configured
@@ -118,31 +120,41 @@ below 2 contacts. (a) is the cheapest and should be done alongside A3.
 
 ## Phase A — make PPO actually learn (after Phase 0)
 
-### A1. Curriculum: start with "hang", then "reach-one"
+### A1. Curriculum: "hang" → "reach-one" → "climb" — BUILT (2026-06-05)
 
-Add `EnvConfig.task_mode ∈ {hang, reach-one, climb}` and gate the reward:
+Delivered as `EnvConfig.task_mode ∈ {hang, reach-one, climb}` +
+`StagedCurriculumEnv` (auto-advance on rolling success); `--staged-curriculum`.
+See CLAUDE.md → Task-stage curriculum. **reach-one is learnable** — a PPO policy
+went 0%→ (stably, no collapse) on a generated wall, the project's first learned
+climbing move. Getting there forced three fixes now baked in: the grip-strength
+physics (one-hand stances were impossible), PPO trust-region guards (`target_kl`
+etc.), and a target-aware observation.
 
-- **hang** — from the 4-grip seed, reward `+1 per step survived, −50 on
-  fall`, episode caps at N seconds. Teaches which grip intents keep welds
-  engaged and how to balance joint torque against gravity. Solvable from
-  near-random init, unlike the full climb.
-- **reach-one** — hang, then move one hand to a single target hold for a
-  big bonus. Teaches release→reach→regrip.
-- **climb** — the current full reward.
+**Remaining (this is the live frontier):**
+- The stable PPO config learns slowly — reach-one needs a **long run (≥1 M
+  steps)** to hit high success, **advance `rc_pos` through the route**, and enter
+  the **climb** stage. No full top-out yet.
+- reach-one runs on ONE fixed generated wall (`--staged-gen-seed`). Generalise
+  to multiple walls once a single wall trains through.
+- Consider warm-starting `climb` from the trained reach-one policy
+  (`--init-from`) rather than relying on auto-advance alone.
 
-A policy that solves "hang 10 s" is a far better init than random weights.
-This is the single most important new capability — without an achievable
-first task the reward is flat and PPO converges to "do nothing."
+### A2. Dense potential-based shaping — DELIVERED (reward clean-restart, 2026-06-05)
 
-### A2. Dense potential-based shaping toward the next hold (NEW)
+The reward was rebuilt around a potential-based **height-progress** term:
+`+60 × (com_z − prev_com_z)` per step — symmetric, telescoping, un-farmable —
+plus a `+10` first-touch hold-match nudge, the `+200/−50` terminals, and the
+physics gates. All the old shaping terms (reach, survival, new-high-grip,
+finish-approach, HWM) are now **inert by default** but kept behind `if coeff>0`
+so they can be re-added one at a time, diagnostics-driven. Per-term reward
+decomposition is logged to `episode_stats.csv` (`r_*` columns); view with
+`python -m sim3d.plot_reward_terms`. See CLAUDE.md → Reward Function.
 
-The goal vectors are already in the observation but **not in the reward**.
-Add a potential-based shaping term `γ·Φ(s') − Φ(s)` where `Φ` is e.g.
-`−(distance from the nearest free limb to the nearest higher on-route
-hold)`. Potential-based shaping does not change the optimal policy but
-gives a smooth gradient that turns "randomly land within 5 cm of a hold"
-(near-zero probability) into a climbable hill. Pairs with A1; arguably do
-both before reaching for BC.
+If the clean signal still plateaus, that points at **exploration, not reward
+shape** — the next lever is A1 (the "hang → reach-one → climb" curriculum:
+an achievable first task from random init), not another shaping term. The
+first shaping term to consider re-adding is `finish_approach_coeff` (with the
+B2 reference-jump fixed) and only if videos show "climbs but wanders off-route."
 
 ### A3. VecNormalize + continuous-control PPO hyperparameters (NEW)
 

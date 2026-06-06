@@ -93,13 +93,13 @@ def build_observation(world: "Climb3DWorld", env_config: "EnvConfig") -> np.ndar
 
     Args:
         world: live Climb3DWorld (post mj_forward / step).
-        env_config: env config — currently unused but kept for symmetry so
-            future curricula can vary K, encoding, etc.
+        env_config: env config. In reach-one task mode it supplies the mover
+            limb + target hold so the mover's goal vector points at the target
+            (see stream 3). Otherwise unused.
 
     Returns:
         float32 1-D ndarray of length `observation_dim(world)`.
     """
-    del env_config  # reserved for future use
 
     d = world.data
     m = world.model
@@ -216,6 +216,24 @@ def build_observation(world: "Climb3DWorld", env_config: "EnvConfig") -> np.ndar
             dtype=np.float64,
         )
         stream3[li * 3: li * 3 + 3] = hold_pos - tip_world
+
+    # reach-one override: point the MOVER limb's goal vector at the designated
+    # target hold (not the generic nearest hold), applied whether or not the
+    # mover is currently gripped. This is what lets the policy perceive WHICH
+    # hold to reach and adapt when the curriculum advances the target — without
+    # it the mover's goal points at whatever hold is nearest, the policy
+    # memorises one target's location, and it collapses the moment the target
+    # moves (observed: reach-one peaked at 40% then crashed when rc advanced).
+    if getattr(env_config, "task_mode", "climb") == "reach-one":
+        mover = getattr(env_config, "reach_mover_limb", None)
+        target = getattr(env_config, "reach_target_hold_id", None)
+        if mover in _LIMBS and target and target in world._hold_meta_by_id:
+            mi = _LIMBS.index(mover)
+            tip_world = np.array(world.limb_tip_pos(mover), dtype=np.float64)
+            tpos = np.array(
+                world._hold_meta_by_id[target]["world_pos"], dtype=np.float64
+            )
+            stream3[mi * 3: mi * 3 + 3] = tpos - tip_world
     stream3 = _guard(stream3, "goal-vectors")
 
     # ── Stream 4 — distance from highest gripped hand to nearest finish ─

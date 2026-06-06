@@ -48,7 +48,11 @@ def _require_sb3():
 
 @dataclass
 class TrainConfig:
-    wall: str = "example-v2-boulder"
+    # Default to the smallest HANGABLE demo route. example-v2-boulder (the old
+    # default) seeds the body at COM 0.28 m over-braced and falls in 3 steps —
+    # training on it produces ~100% falls regardless of the reward. baby-v1
+    # hangs cleanly at COM 1.24 m (~1 m climb, 5 holds). See _warn_if_unhangable.
+    wall: str = "baby-v1"
     moonboard_file: Optional[str] = None
     moonboard_problem_id: Optional[int] = None
     moonboard_split: str = "train"            # train | validation | test when sampling a corpus
@@ -96,31 +100,46 @@ class TrainConfig:
     # (week8) blocked both sides: agent reached feet to holds but could never
     # grip them because engage also needed to clear 0.5.
     grip_intent_deadband: float = 0.5
-    # PPO clip range. Default SB3=0.2. Lower (0.1) for more conservative
-    # updates — important when clip_fraction is high (>0.4).
-    clip_range: float = 0.2
+    # PPO clip range. Lowered 0.2 → 0.1 (2026-06-05): the staged run blew the
+    # trust region (clip_fraction 0.70, approx_kl 0.20) and a post-peak update
+    # destroyed a learned 48%-success reach skill. 0.1 tightens each update.
+    clip_range: float = 0.1
     # Entropy coefficient. 0.005 is enough for joint exploration while keeping
     # the policy stable enough to hang. 0.01 caused constant grip-noise and
     # prevented the policy from ever learning to hang (week3 result: 0 hangs).
     ent_coef: float = 0.005
-    # Number of PPO optimisation epochs per rollout batch.
-    n_epochs: int = 10
+    # Number of PPO optimisation epochs per rollout batch. Lowered 10 → 5: with
+    # 10 epochs the policy over-fit each batch and drifted far past the trust
+    # region (see clip_range note).
+    n_epochs: int = 5
+    # Early-stop the epoch loop once the policy has moved approx_kl past this —
+    # the direct guard against the trust-region blowout that collapsed the
+    # staged run (observed approx_kl ~0.20; healthy PPO is ~0.01–0.02).
+    target_kl: float = 0.03
+    # Linearly decay the learning rate to 0 over training. Constant 3e-4 let a
+    # late update overshoot and forget a learned skill; decaying shrinks step
+    # size as the policy nears competence.
+    lr_decay: bool = True
     # ── Reward coefficients (matched to EnvConfig) ───────────────────
-    # Dense shaping toward finish hold (per-step, potential-based).
-    # Total reward for a full 2 m climb ≈ coeff × 2. CLAUDE.md recommends
-    # coeff ≥ 50; 100 gives +200 over a full route — the primary dense signal.
-    finish_approach_coeff: float = 100.0
-    # Per-step reward for each free limb closing distance to its nearest hold.
-    # This is the dense gradient for learning to REACH — without it the agent
-    # must accidentally land within 5cm of a hold to discover gripping.
-    # One-sided: only rewards approach (not retreat). 20 → closing 1m gives
-    # +20, comparable to hold_match_bonus but spread over the whole approach.
-    reach_approach_coeff: float = 20.0
-    # Per-step survival bonus (weighted fraction of limbs gripped × coeff;
-    # hands 2× feet, max == coeff when all 4 are on). Must be ≤ 0.02 —
-    # see CLAUDE.md anti-hack warning. 0.01 stabilises the hang without
-    # creating a "grip lowest holds forever" attractor.
-    survival_bonus_coeff: float = 0.01
+    # CLEAN-RESTART DEFAULTS (2026-06-05). The reward is height_progress
+    # (primary) + hold_match (sparse grip nudge) + terminals + physics gates.
+    # Every shaping term below is OFF by default — each was added in a past
+    # week and either got farmed or blocked something else. Re-enable one at a
+    # time, diagnostics-driven (see episode_stats.csv r_* columns), never all
+    # at once.
+    #
+    # Dense finish-hold shaping (potential-based). Off: the primary up-signal
+    # is now height_progress; this duplicated it and had a reference-point
+    # jump (B2) that could leak non-telescoping reward. First candidate to
+    # re-add (with B2 fixed) if the agent climbs but wanders off-route.
+    finish_approach_coeff: float = 0.0
+    # Per-limb reach shaping. Off: caused the fall-and-swing exploit (release
+    # all grips, collect reach reward while limbs swing toward holds on the
+    # way down).
+    reach_approach_coeff: float = 0.0
+    # Per-step survival bonus. Off: any positive value is a floor-hanging
+    # attractor (grip lowest holds forever beats climbing).
+    survival_bonus_coeff: float = 0.0
     # No release reward — week4 showed that release reward + big lump-sum
     # jackpot caused the agent to farm: grab jackpot → fall → repeat in
     # 8-35 step micro-episodes. Release must be neutral (0) so the only
@@ -129,18 +148,20 @@ class TrainConfig:
     # GATED on HWM gain — now equivalent to extra hwm_height_scale, kept
     # for backwards compatibility with old CLIs.
     upward_velocity_coeff: float = 0.0
-    # × max(0, com_z − episode_max_com_z) per step. Major signal.
-    hwm_height_scale: float = 50.0
+    # Primary dense signal: potential-based height progress, K·(com_z −
+    # prev_com_z) per step. Symmetric (up pays, down costs), telescopes ⇒
+    # un-farmable by oscillation. This is the canonical "reward up" term.
+    height_progress_scale: float = 60.0
+    # Legacy high-water-mark — inert by default, superseded by height_progress
+    # (the one-way ratchet couldn't punish sliding back down).
+    hwm_height_scale: float = 0.0
     # Rising-edge bonus for gripping any new hold (first touch per episode).
-    # Small enough that it doesn't dominate the fall penalty alone, but
-    # meaningful when combined with survival and approach rewards.
-    hold_match_bonus: float = 15.0
-    # Lump-sum reward when a grip event raises episode_max_grip_z.
-    # Kept modest — week4 showed 250 caused jackpot-farming in 8-step
-    # micro-episodes. The primary climbing signal is HWM (per-step, can't
-    # be farmed) + finish_approach. This is a one-time nudge, not the
-    # main signal.
-    new_high_grip_bonus: float = 50.0
+    # The ONLY grip incentive. Kept low so grab-then-fall stays negative-EV
+    # (a handful of fresh matches < the 50 fall penalty).
+    hold_match_bonus: float = 10.0
+    # Lump-sum reward when a grip raises episode_max_grip_z. Off: this +50
+    # jackpot was the main magnet for grab→fall→repeat micro-episode farming.
+    new_high_grip_bonus: float = 0.0
     # Restore fall penalty to 50 — reducing it to 30 made short jackpot
     # episodes too cheap. Falling must cost more than a single grip bonus.
     fall_penalty: float = 50.0
@@ -173,7 +194,20 @@ class TrainConfig:
     curriculum_difficulty_step: float = 0.05
     curriculum_gen_cols: int = 12
     curriculum_gen_rows: int = 20  # see GeneratorConfig.rows: start sits 2 rows up
-    curriculum_fallback_wall: str = "example-v2-boulder"
+    curriculum_fallback_wall: str = "baby-v1"
+    # ── Task-stage curriculum (A1: hang → reach-one → climb) ─────────
+    # Breaks the "hangs but won't climb" exploration trap by handing the agent
+    # the reach primitive on a fixed generated wall before the full climb.
+    staged_curriculum: bool = False
+    staged_wall: Optional[str] = None     # None → generate a wall (staged_gen_seed)
+    staged_gen_seed: int = 7
+    staged_difficulty: float = 0.0
+    staged_window: int = 30               # rolling success window per sub-task
+    staged_up_threshold: float = 0.60     # advance when success_rate ≥ this
+    hang_target_steps: int = 60
+    reach_one_coeff: float = 30.0
+    reach_regrip_bonus: float = 50.0
+    reach_episode_steps: int = 200
 
 
 class _EpisodeStatsCallback:
@@ -213,7 +247,12 @@ class _EpisodeStatsCallback:
                     outer._writer.writerow([
                         "episode", "total_steps", "reward", "length",
                         "outcome", "final_com_z", "n_slips", "body_intersections",
-                        "curriculum_difficulty",
+                        "curriculum_difficulty", "stage", "rc_pos",
+                        # Per-term reward decomposition (sums to 'reward').
+                        # Watch r_height dominate; any other column creeping up
+                        # is the next exploit surfacing.
+                        "r_height", "r_match", "r_reach", "r_finish", "r_fall",
+                        "r_slip", "r_intersect", "r_energy", "r_other",
                     ])
 
             def _on_step(self) -> bool:
@@ -235,6 +274,7 @@ class _EpisodeStatsCallback:
                     ep = info.get("episode", {}) or {}
                     outcome = info.get("outcome", "?")
                     com = info.get("com", (0, 0, 0))
+                    rt = info.get("rew_terms", {}) or {}
                     outer._writer.writerow([
                         outer._episode,
                         self.num_timesteps,
@@ -245,6 +285,17 @@ class _EpisodeStatsCallback:
                         int(info.get("slips", 0)),
                         int(info.get("body_intersections", 0)),
                         round(float(info.get("curriculum_difficulty", 0.0)), 4),
+                        info.get("stage", ""),
+                        info.get("rc_pos", ""),
+                        round(float(rt.get("height", 0.0)), 3),
+                        round(float(rt.get("match", 0.0)), 3),
+                        round(float(rt.get("reach", 0.0)), 3),
+                        round(float(rt.get("finish", 0.0)), 3),
+                        round(float(rt.get("fall", 0.0)), 3),
+                        round(float(rt.get("slip", 0.0)), 3),
+                        round(float(rt.get("intersect", 0.0)), 3),
+                        round(float(rt.get("energy", 0.0)), 3),
+                        round(float(rt.get("other", 0.0)), 3),
                     ])
                 outer._fh.flush()
                 return True
@@ -302,6 +353,7 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         grip_release_penalty=cfg.grip_release_penalty,
         upward_velocity_coeff=cfg.upward_velocity_coeff,
         energy_penalty_coeff=cfg.energy_penalty_coeff,
+        height_progress_scale=cfg.height_progress_scale,
         hwm_height_scale=cfg.hwm_height_scale,
         hold_match_bonus=cfg.hold_match_bonus,
         new_high_grip_bonus=cfg.new_high_grip_bonus,
@@ -309,6 +361,24 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
     )
 
     def _factory():
+        if cfg.staged_curriculum:
+            from sim3d.staged_curriculum import (
+                StagedCurriculumEnv, StagedCurriculumConfig,
+            )
+            scfg = StagedCurriculumConfig(
+                wall=cfg.staged_wall,
+                gen_seed=cfg.staged_gen_seed,
+                gen_difficulty=cfg.staged_difficulty,
+                window=cfg.staged_window,
+                up_threshold=cfg.staged_up_threshold,
+                hang_target_steps=cfg.hang_target_steps,
+                reach_one_coeff=cfg.reach_one_coeff,
+                reach_regrip_bonus=cfg.reach_regrip_bonus,
+                reach_episode_steps=cfg.reach_episode_steps,
+                climb_episode_steps=cfg.max_episode_steps,
+            )
+            return StagedCurriculumEnv(scfg, profile=profile, env_config=env_cfg)
+
         if cfg.moonboard_file:
             from sim3d.moonboard import (
                 load_moonboard_problems, moonboard_problem_to_wall, find_problem,
@@ -361,6 +431,52 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
     return _factory
 
 
+def _warn_if_unhangable(factory, seed: int, steps: int = 20) -> None:
+    """One-time startup sanity check: if the seed pose can't even hang (the body
+    falls under a zero action), print a loud warning.
+
+    An unhangable seed makes training produce ~100% falls no matter how good the
+    reward is — the single most common silent foot-gun here (most hand-designed
+    demo walls place the start holds too close to the feet for this body, so the
+    hands settle above their slip cap and shed on the first steps). Non-fatal: we
+    warn and continue, because the user may be deliberately debugging.
+    """
+    try:
+        env = factory()
+    except Exception:  # noqa: BLE001 — never let a sanity check kill training
+        return
+    try:
+        _obs, info = env.reset(seed=seed)
+        seed_z = float(info.get("com", (0.0, 0.0, 0.0))[2])
+        zero = np.zeros(env.action_space.shape, dtype=np.float32)
+        fell_at = None
+        for i in range(steps):
+            _obs, _r, term, _trunc, info = env.step(zero)
+            if term and info.get("outcome") == "fell":
+                fell_at = i + 1
+                break
+        if fell_at is not None:
+            bar = "=" * 72
+            print(
+                f"\n{bar}\n"
+                f"  ⚠  UNHANGABLE SEED POSE: the body falls in {fell_at} steps under a\n"
+                f"     zero action (seed COM {seed_z:.2f} m). Training on this wall will\n"
+                f"     produce ~100% falls regardless of the reward. Use a hangable wall\n"
+                f"     (curriculum walls are hang-tuned; baby-v1 / climb-v1 hang) or widen\n"
+                f"     the hand–foot vertical gap on the start holds.\n{bar}\n"
+            )
+        else:
+            print(f"[hang-check] seed pose holds (COM {seed_z:.2f} m, no fall in "
+                  f"{steps} zero-action steps).")
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            env.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def train(cfg: TrainConfig) -> Path:
     sb3, BaseCallback, DummyVecEnv, SubprocVecEnv = _require_sb3()
     from stable_baselines3.common.monitor import Monitor
@@ -382,6 +498,10 @@ def train(cfg: TrainConfig) -> Path:
             json.dump(moonboard_split_manifest(moonboard_splits), f, indent=2)
 
     factory = _make_env_factory(cfg, moonboard_splits)
+
+    # Loud, non-fatal warning if the chosen wall's seed pose can't even hang —
+    # catches the "trained 1 M steps on an unhangable wall" foot-gun up front.
+    _warn_if_unhangable(factory, cfg.seed)
 
     def _make_monitored_env(rank: int):
         def _init():
@@ -460,16 +580,20 @@ def train(cfg: TrainConfig) -> Path:
         print(f"  resumed at step {model.num_timesteps}, "
               f"target = {cfg.total_timesteps}")
     else:
+        # Linear LR decay (SB3 calls the schedule with progress_remaining 1→0).
+        base_lr = cfg.learning_rate
+        lr = (lambda pr: pr * base_lr) if cfg.lr_decay else base_lr
         model = sb3.PPO(
             "MlpPolicy",
             vec_env,
-            learning_rate=cfg.learning_rate,
+            learning_rate=lr,
             n_steps=cfg.n_steps,
             batch_size=cfg.batch_size,
             n_epochs=cfg.n_epochs,
             gamma=cfg.gamma,
             clip_range=cfg.clip_range,
             ent_coef=cfg.ent_coef,
+            target_kl=cfg.target_kl,
             seed=cfg.seed,
             tensorboard_log=tb_log,
             device=cfg.device,
@@ -591,7 +715,10 @@ def play(model_path: str | Path, env: Climbing3DEnv, *, deterministic: bool = Tr
 # ─── CLI ──────────────────────────────────────────────────────────────────
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="python -m sim3d.train")
-    p.add_argument("--wall", default="example-v2-boulder")
+    p.add_argument("--wall", default="baby-v1",
+                   help="Wall id for single-wall training. Default baby-v1 (smallest "
+                        "hangable demo route). NB: example-v2-boulder/infinity-labyrinth/"
+                        "moonlit-snake have unhangable start geometry for this body.")
     p.add_argument("--moonboard", dest="moonboard_file")
     p.add_argument("--problem", dest="moonboard_problem_id", type=int,
                    help="Train on one MoonBoard problem id. Omit to sample a deterministic split.")
@@ -661,25 +788,32 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Grip intent deadband. Intents in (-db, +db) hold current grip state. "
                         "At db=0.5 + log_std_init=-1.5 (std≈0.22), release is a 2.3σ event "
                         "(P≈1%%) — deliberate, not random noise.")
-    p.add_argument("--clip-range", type=float, default=0.2,
-                   help="PPO clip range. Lower (0.1) when clip_fraction is high (>0.4).")
-    p.add_argument("--ent-coef", type=float, default=0.01,
-                   help="PPO entropy coefficient. 0.01 encourages grip-release exploration; "
-                        "0.005 converges to 'hang still' local minimum.")
-    p.add_argument("--n-epochs", type=int, default=10,
-                   help="PPO optimisation epochs per rollout. Default SB3=10.")
-    p.add_argument("--finish-approach-coeff", type=float, default=100.0,
-                   help="Dense shaping: coeff × (prev_dist − cur_dist) per step. "
-                        "Full 2 m route → +200 total at coeff=100. Primary dense signal; "
-                        "use ≥ 50. Default 100 (CLAUDE.md recommended).")
-    p.add_argument("--reach-approach-coeff", type=float, default=20.0,
-                   help="Per-step reward for each free limb CLOSING distance to its "
-                        "nearest eligible hold (one-sided: no penalty for retreating). "
-                        "Dense gradient for learning to reach without swamping other signals.")
-    p.add_argument("--survival-bonus-coeff", type=float, default=0.01,
-                   help="Per-step reward: coeff * weighted_grip_fraction "
-                        "(hands 2x, feet 1x; capped at coeff). Must be ≤ 0.02. "
-                        "0.01 stabilises the hang without rewarding floor-hanging.")
+    p.add_argument("--clip-range", type=float, default=0.1,
+                   help="PPO clip range. 0.1 (default) keeps updates inside the trust "
+                        "region; 0.2 blew it (clip_fraction 0.70) and collapsed a learned skill.")
+    p.add_argument("--ent-coef", type=float, default=0.005,
+                   help="PPO entropy coefficient. 0.005 gives joint exploration while "
+                        "staying stable enough to hang; 0.01 caused constant grip-noise "
+                        "and 0 hangs (week3). Matches the TrainConfig default.")
+    p.add_argument("--n-epochs", type=int, default=5,
+                   help="PPO optimisation epochs per rollout. 5 (default) avoids the "
+                        "per-batch over-fitting that drove approx_kl to 0.20 at 10 epochs.")
+    p.add_argument("--target-kl", type=float, default=0.03,
+                   help="Early-stop the epoch loop once approx_kl exceeds this. Direct "
+                        "guard against the trust-region blowout (healthy ~0.01–0.02).")
+    p.add_argument("--no-lr-decay", action="store_true",
+                   help="Disable the linear learning-rate decay to 0 (on by default).")
+    p.add_argument("--finish-approach-coeff", type=float, default=0.0,
+                   help="OFF by default (clean restart). Dense finish-hold shaping: "
+                        "coeff × (prev_dist − cur_dist) per step. Duplicated the "
+                        "height-progress signal and had a reference-jump seam (B2); "
+                        "first candidate to re-add if the agent wanders off-route.")
+    p.add_argument("--reach-approach-coeff", type=float, default=0.0,
+                   help="OFF by default (clean restart). Per-step per-limb reach "
+                        "shaping — caused the fall-and-swing exploit.")
+    p.add_argument("--survival-bonus-coeff", type=float, default=0.0,
+                   help="OFF by default (clean restart). Per-step grip-fraction bonus "
+                        "— any positive value is a floor-hanging attractor.")
     p.add_argument("--grip-release-penalty", type=float, default=0.0,
                    help="Per-limb penalty when a grip releases. 0 = neutral (default). "
                         "Negative = reward for releasing, which caused jackpot-farming "
@@ -690,16 +824,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "the original path-dependent semantics was exploitable. "
                         "Default 0; the default --hwm-height-scale 50 is the "
                         "primary upward signal.")
-    p.add_argument("--hwm-height-scale", type=float, default=50.0,
-                   help="Reward per metre of new max-COM-z (high-water-mark). "
-                        "State-based — cannot be farmed by oscillation. "
-                        "Default 50 (≈75 reward for a full 1.5 m climb).")
-    p.add_argument("--hold-match-bonus", type=float, default=15.0,
+    p.add_argument("--height-progress-scale", type=float, default=60.0,
+                   help="PRIMARY dense signal: reward per metre of COM-z progress, "
+                        "K·(com_z − prev_com_z) per step. Symmetric (up pays, down "
+                        "costs) and telescoping — un-farmable by oscillation. "
+                        "Default 60 (≈+90–120 over a full 1.5–2 m climb).")
+    p.add_argument("--hwm-height-scale", type=float, default=0.0,
+                   help="OFF by default — superseded by --height-progress-scale. "
+                        "Legacy high-water-mark (one-way ratchet; can't punish "
+                        "sliding back down). Additive lever only.")
+    p.add_argument("--hold-match-bonus", type=float, default=10.0,
                    help="Rising-edge bonus for gripping any new hold per episode. "
-                        "Keep smaller than fall-penalty so it can't be farmed alone.")
-    p.add_argument("--new-high-grip-bonus", type=float, default=50.0,
-                   help="Lump-sum reward when a grip raises episode max-grip-z. "
-                        "One-time nudge — primary climbing signal is HWM + approach.")
+                        "The only grip incentive. Keep well under fall-penalty so "
+                        "grab-then-fall stays negative-EV.")
+    p.add_argument("--new-high-grip-bonus", type=float, default=0.0,
+                   help="OFF by default (clean restart). Lump-sum on raising "
+                        "max-grip-z — was the main grab→fall→repeat farming magnet.")
     p.add_argument("--fall-penalty", type=float, default=50.0,
                    help="Terminal penalty on fall. Must exceed any single lump-sum "
                         "grip bonus so micro-episode farming is negative-EV.")
@@ -724,8 +864,34 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Grid columns for generated walls. Default: 12")
     p.add_argument("--curriculum-rows", type=int, default=20,
                    help="Grid rows for generated walls. Default: 20")
-    p.add_argument("--curriculum-fallback-wall", default="example-v2-boulder",
-                   help="Wall id to use if generation fails. Default: example-v2-boulder")
+    p.add_argument("--curriculum-fallback-wall", default="baby-v1",
+                   help="Wall id to use if generation fails. Default: baby-v1 (hangable)")
+    # ── Task-stage curriculum (A1: hang → reach-one → climb) ─────────
+    p.add_argument("--staged-curriculum", action="store_true",
+                   help="Train the hang→reach-one→climb task curriculum: hands the "
+                        "agent the reach primitive before the full climb. Breaks "
+                        "the 'hangs but won't climb' exploration trap.")
+    p.add_argument("--staged-wall", default=None,
+                   help="Static wall id for the staged curriculum. Default: generate "
+                        "a wall (--staged-gen-seed) with a clean L/R hand spine.")
+    p.add_argument("--staged-gen-seed", type=int, default=7,
+                   help="Generator seed for the staged-curriculum wall. Default: 7.")
+    p.add_argument("--staged-difficulty", type=float, default=0.0,
+                   help="Generated wall difficulty for the staged curriculum (0=jugs).")
+    p.add_argument("--staged-window", type=int, default=30,
+                   help="Rolling success window per sub-task before advancing. Default 30.")
+    p.add_argument("--staged-up-threshold", type=float, default=0.60,
+                   help="Success rate at which a sub-task advances. Default 0.60.")
+    p.add_argument("--hang-target-steps", type=int, default=60,
+                   help="Hang stage: steps survived without falling = success. Default 60.")
+    p.add_argument("--reach-one-coeff", type=float, default=30.0,
+                   help="reach-one: dense signed-potential reward × (prev_d − d) toward "
+                        "the target hold, gated on the other 3 limbs anchored. Default 30.")
+    p.add_argument("--reach-regrip-bonus", type=float, default=50.0,
+                   help="reach-one: one-shot bonus + success when the mover grips the "
+                        "target hold. Default 50.")
+    p.add_argument("--reach-episode-steps", type=int, default=200,
+                   help="reach-one episode truncation cap (steps). Default 200.")
     p.add_argument("--no-vec-normalize", action="store_true",
                    help="Disable VecNormalize observation normalisation. "
                         "Only use to replay old models trained without it.")
@@ -770,11 +936,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         clip_range=args.clip_range,
         ent_coef=args.ent_coef,
         n_epochs=args.n_epochs,
+        target_kl=args.target_kl,
+        lr_decay=not args.no_lr_decay,
         finish_approach_coeff=args.finish_approach_coeff,
         reach_approach_coeff=args.reach_approach_coeff,
         survival_bonus_coeff=args.survival_bonus_coeff,
         grip_release_penalty=args.grip_release_penalty,
         upward_velocity_coeff=args.upward_velocity_coeff,
+        height_progress_scale=args.height_progress_scale,
         hwm_height_scale=args.hwm_height_scale,
         hold_match_bonus=args.hold_match_bonus,
         new_high_grip_bonus=args.new_high_grip_bonus,
@@ -790,6 +959,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         curriculum_gen_cols=args.curriculum_cols,
         curriculum_gen_rows=args.curriculum_rows,
         curriculum_fallback_wall=args.curriculum_fallback_wall,
+        staged_curriculum=args.staged_curriculum,
+        staged_wall=args.staged_wall,
+        staged_gen_seed=args.staged_gen_seed,
+        staged_difficulty=args.staged_difficulty,
+        staged_window=args.staged_window,
+        staged_up_threshold=args.staged_up_threshold,
+        hang_target_steps=args.hang_target_steps,
+        reach_one_coeff=args.reach_one_coeff,
+        reach_regrip_bonus=args.reach_regrip_bonus,
+        reach_episode_steps=args.reach_episode_steps,
         use_vec_normalize=not args.no_vec_normalize,
     )
     train(cfg)
