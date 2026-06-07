@@ -227,17 +227,23 @@ HOLD_CONSTRAINT_SOLIMP = (0.95, 0.99, 0.001, 0.5, 2)
 # When a limb is mid-flight (released from one hold, reaching toward
 # another), we apply a Cartesian PD on the limb tip to drive it through
 # space. This is what makes the climber actually MOVE between holds
-# rather than teleport. Tuned by hand: enough force to overcome gravity
-# on the limb segment plus the actuator stiffness; not so much that the
-# tip overshoots.
-REACH_KP_HAND = 600.0      # N / m  — proportional gain pulling hand to target
-REACH_KD_HAND = 60.0       # N·s / m — velocity damping
-REACH_KP_FOOT = 800.0
-REACH_KD_FOOT = 80.0
+# rather than teleport.
+# Gains RAISED 2.5× (2026-06-06): the per-group actuator gains + raised grip
+# strength stiffened the body, so the old 600 N/m reach could only creep the
+# hand to ~0.13 m short of a hold and never landed a move (the discrete-move
+# expert silently stopped climbing). 1500 N/m lands moves at 0.19–0.63 m
+# reliably and stays stable; the relax fix in world._relax_reaching_actuators
+# (zero gain AND bias on the reaching chain) is what lets this gain actually
+# extend the arm instead of fighting a spring-to-zero. KD scaled by √2.5.
+REACH_KP_HAND = 1500.0     # N / m  — proportional gain pulling hand to target
+REACH_KD_HAND = 95.0       # N·s / m — velocity damping (≈ √2.5 × 60)
+REACH_KP_FOOT = 2000.0
+REACH_KD_FOOT = 127.0
 
-# Distance (m) at which the reach controller engages the weld. ~5 cm
-# matches the visual hold radius — when the hand is "on" the hold.
-REACH_ATTACH_RADIUS = 0.05
+# Distance (m) at which the reach controller engages the weld. Loosened
+# 0.05 → 0.10 (2026-06-06) so a near-reach converts to a grip — matches the
+# loosened GRIP_PROXIMITY_M and lets the controller land moves it gets close on.
+REACH_ATTACH_RADIUS = 0.10
 # Hard timeout (s) on a reach. Past this we give up and weld at the
 # closest approach. Without a timeout, an unreachable target makes the
 # limb dangle forever.

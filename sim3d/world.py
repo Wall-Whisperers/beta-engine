@@ -607,31 +607,44 @@ class Climb3DWorld:
             7. Optionally check for grip slip.
         """
         slip_count = 0
-        # Snapshot original actuator gains; we temporarily zero gains on
-        # the reaching limbs' joints during each substep.
+        # Snapshot original actuator gains AND bias; we temporarily zero BOTH
+        # on the reaching limbs' joints during each substep. (Zeroing only the
+        # gain leaves the position servo's -kp·qpos bias as a spring-to-zero
+        # that fights the reach controller — the bug that stalled every move
+        # ~0.1 m short of its hold.)
         kp_orig = self.model.actuator_gainprm[:, 0].copy()
+        bias_orig = self.model.actuator_biasprm.copy()
         for _ in range(frames * cfg.SUBSTEPS_PER_FRAME):
-            self._relax_reaching_actuators(kp_orig)
+            self._relax_reaching_actuators(kp_orig, bias_orig)
             self._apply_reach_forces()
             mujoco.mj_step(self.model, self.data)
             self._update_reach_state(cfg.PHYS_DT)
             if check_slip:
                 slip_count += self._check_slip()
-        # Restore gains and clear applied forces.
+        # Restore gains/bias and clear applied forces.
         self.model.actuator_gainprm[:, 0] = kp_orig
+        self.model.actuator_biasprm[:] = bias_orig
         self.data.qfrc_applied[:] = 0.0
         return slip_count
 
-    def _relax_reaching_actuators(self, kp_orig: np.ndarray) -> None:
-        """Zero actuator KP on any limb chain currently reaching, restore
-        the rest. Called before each physics substep so the change is
-        always one-substep scoped."""
+    def _relax_reaching_actuators(self, kp_orig: np.ndarray,
+                                  bias_orig: np.ndarray) -> None:
+        """Fully relax (zero gain AND the -kp/-kv bias) the actuators on any
+        limb chain currently reaching, restore the rest. A position servo's
+        force is gain·ctrl − kp·qpos − kv·qvel; zeroing only the gain leaves
+        −kp·qpos − kv·qvel, i.e. a spring pulling the joint back to angle 0,
+        which fought the Cartesian reach controller and pinned the limb short
+        of its target. Zeroing the bias columns too makes the chain truly
+        free so the reach can extend it. One-substep scoped."""
         self.model.actuator_gainprm[:, 0] = kp_orig
+        self.model.actuator_biasprm[:] = bias_orig
         for limb in LIMBS:
             if self._reaching[limb] is None:
                 continue
             for aid in self._limb_actuator_ids[limb]:
                 self.model.actuator_gainprm[aid, 0] = 0.0
+                self.model.actuator_biasprm[aid, 1] = 0.0   # −kp (spring)
+                self.model.actuator_biasprm[aid, 2] = 0.0   # −kv (damping)
 
     # ─── Continuous-reach controller ──────────────────────────────────
     def _apply_reach_forces(self) -> None:
