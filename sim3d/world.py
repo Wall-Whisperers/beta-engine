@@ -212,6 +212,10 @@ class Climb3DWorld:
 
         # Continuous-reach state per limb (None = not reaching).
         self._reaching: dict[Limb, Optional[ReachState]] = {l: None for l in LIMBS}
+        # Pelvis position to hold during a reach (balance assist). Set when a
+        # reach starts; the balance PD pins the pelvis here so the reach
+        # controller's reaction can't tip the body off its support.
+        self._balance_target: Optional[np.ndarray] = None
 
         # Tip-anchor bodies are fixed children at the contact sites, so hold
         # constraints can pin the actual hand/toe contact point rather than
@@ -563,6 +567,9 @@ class Climb3DWorld:
             return
         if mode in ("reach", "dyno"):
             self.release_limb(limb)
+            # Snapshot the pelvis position to hold during this move (balance
+            # assist) — pin it so the reach reaction can't barn-door the body.
+            self._balance_target = self.pelvis_pos().copy()
             target = np.array(self._hold_meta_by_id[target_hold_id]["world_pos"])
             kp = cfg.REACH_KP_HAND if limb in HAND_LIMBS else cfg.REACH_KP_FOOT
             kd = cfg.REACH_KD_HAND if limb in HAND_LIMBS else cfg.REACH_KD_FOOT
@@ -697,6 +704,21 @@ class Climb3DWorld:
             # Dyno leg push: drive knee + hip-flex toward extension.
             if rs.dyno and rs.t_remaining > (cfg.REACH_TIMEOUT_S - cfg.DYNO_DURATION_S):
                 self._dyno_leg_push(cfg.DYNO_LEG_PUSH_NM)
+
+        # ── Balance assist ──────────────────────────────────────────────
+        # While any limb is reaching, hold the pelvis at its pre-move position
+        # with a Cartesian PD on the free-joint root, so the reach reaction
+        # can't tip the body off its support (the transitional-stance instability
+        # that breaks chaining). qfrc_applied[0:3] are world-frame forces on the
+        # free root translation; qvel[0:3] is its world-frame linear velocity.
+        if (cfg.BALANCE_KP > 0.0 and self._balance_target is not None
+                and any(self._reaching[l] is not None for l in LIMBS)):
+            pelvis = self.data.qpos[0:3]
+            pvel = self.data.qvel[0:3]
+            self.data.qfrc_applied[0:3] += (
+                cfg.BALANCE_KP * (self._balance_target - pelvis)
+                - cfg.BALANCE_KD * pvel
+            )
 
     def _dyno_leg_push(self, torque_nm: float) -> None:
         """Add torque to both knees and hip-flex joints to push the

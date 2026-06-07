@@ -249,6 +249,19 @@ REACH_ATTACH_RADIUS = 0.10
 # limb dangle forever.
 REACH_TIMEOUT_S = 1.5
 
+# ─── Balance assist during a reach (lever, OFF by default) ───────────────────
+# Attempt at the transitional-stance instability that breaks chaining. While a
+# limb reaches, hold the pelvis at its pre-move position with a Cartesian PD
+# (force on the free-joint root). DISABLED (KP=0) after testing: pinning the
+# pelvis over-constrains — it blocks the body from RISING to reach higher holds,
+# and it doesn't address the other two failure factors a move-by-move diagnosis
+# revealed (the stronger reach force overloads/sheds the anchor grips, and the
+# body barn-doors out from the wall). A working balance assist needs a smarter
+# target (keep COM over the *support*, allow vertical rise) AND coordinated
+# grip-force / reach-strength — see NEXT_STEPS A1c. Kept as a tunable lever.
+BALANCE_KP = 0.0      # N / m on the pelvis toward its pre-move position (0 = off)
+BALANCE_KD = 400.0    # N·s / m damping
+
 # Dyno: explosive whole-body extension when the moving limb is too far
 # for a static reach. We boost legs / hips toward extension and fly the
 # limb forward.

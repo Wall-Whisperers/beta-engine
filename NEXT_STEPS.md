@@ -166,6 +166,40 @@ reach-one capability relabeled, not chained climbing.
 Lesser open items: stable PPO learns slowly (reach-one needs ≥1 M steps for high
 success); both curricula run on ONE fixed generated wall — generalise later.
 
+### A1c. THE DEEPER ROOT — transitional-stance instability (2026-06-06)
+
+Tried to bootstrap via the discrete-move A* expert (BC source). Found the expert
+had *also* stopped climbing — root-caused and **fixed two real bugs** (commit
+6bd0c32): the reach controller's relax zeroed only the actuator gain, not the
+−kp/−kv bias (a spring-to-zero that fought the reach), and `REACH_KP` was tuned
+for the old softer body. Isolated reaches now land 6/6 (were 0).
+
+**But even the fixed hand-coded expert can't reliably chain a full climb** — it
+lands 1–4 moves then the body destabilises and falls, even with actuator-target
+sync + a settle after each move. So the chaining wall is **not just an RL
+exploration problem** — it blocks a perfect planner + hand-coded controller too.
+
+The precise root: **the body holds *tuned* stances (the hangable seed) but not
+arbitrary *mid-climb transitional* stances.** Each move lands; the *next*
+transition tips it off. This is the single highest-leverage thing to fix — it
+unblocks the expert (→ BC) AND RL at once.
+
+**First balance attempt (2026-06-06) — instructive failure.** A pelvis-hold PD
+(pin the pelvis at its pre-move position during a reach; `BALANCE_KP`, now 0/off)
+made chaining *worse*. A move-by-move diagnosis showed the failure is
+**three-factor**, not one:
+1. **Grips decay** 3→2→1→0 across the sequence — the raised reach force (KP
+   1500) overloads/sheds the *anchor* grips during a reach.
+2. **Barn-door** — the pelvis drifts *out* from the wall (y grows each move).
+3. **Frame-sensitive reaches** — 60 frames/move often don't land; 120 destabilise.
+Pinning the pelvis fixes none of these and blocks the body from rising to a hold.
+
+So the balance assist needs a smarter design: keep the COM over the **support**
+(not a fixed point), *allow* vertical rise, AND coordinate reach-strength vs
+grip-force so anchors don't shed mid-reach. This is a real whole-body-control
+effort (or: learn it via RL with a stability reward) — the current frontier.
+NOT "unrealistic motion"; specifically transitional balance + grip retention.
+
 ### A2. Dense potential-based shaping — DELIVERED (reward clean-restart, 2026-06-05)
 
 The reward was rebuilt around a potential-based **height-progress** term:
