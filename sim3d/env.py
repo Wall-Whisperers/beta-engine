@@ -185,7 +185,7 @@ class Climbing3DEnv(gym.Env):
             raise ValueError(f"unknown action_mode: {self.cfg_env.action_mode}")
         if self.cfg_env.start_mode not in ("seed", "ground-reach"):
             raise ValueError(f"unknown start_mode: {self.cfg_env.start_mode}")
-        if self.cfg_env.task_mode not in ("climb", "hang", "reach-one"):
+        if self.cfg_env.task_mode not in ("climb", "hang", "reach-one", "imitate"):
             raise ValueError(f"unknown task_mode: {self.cfg_env.task_mode}")
 
         self.world = Climb3DWorld(
@@ -300,6 +300,34 @@ class Climbing3DEnv(gym.Env):
                 "Continuing — episode may be unstable."
             )
 
+        return self._begin_episode()
+
+    def reset_to_reference(
+        self,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+        grips: dict[Limb, Optional[str]],
+        *,
+        settle_frames: int = 4,
+    ) -> tuple[np.ndarray, dict]:
+        """Reference State Initialization entry point for the imitation loop.
+
+        Slam the world to a recorded reference frame (exact pose/velocity +
+        re-weld the gripped limbs) via ``Climb3DWorld.rsi``, then run the normal
+        per-episode bookkeeping. Because ``rsi`` syncs the actuator targets to
+        the reference pose, ``_seed_ctrl`` captured below makes a zero action
+        hold the reference frame — the residual action space is automatically
+        re-anchored to wherever RSI placed the body. Bypasses ``seed_pose``
+        entirely (no gravity ramp / pelvis guess)."""
+        super().reset()
+        self.world.rsi(qpos, qvel, grips, settle_frames=settle_frames)
+        return self._begin_episode()
+
+    def _begin_episode(self) -> tuple[np.ndarray, dict]:
+        """Initialise per-episode reward/termination bookkeeping from the
+        already-posed world (whether posed by ``seed_pose`` or ``rsi``) and
+        return the first ``(obs, info)``. Shared by ``reset`` and
+        ``reset_to_reference`` so the two entry points can't drift."""
         self._step_count = 0
         self._finish_streak = 0
         # Init HWM at the seed com_z, not at 0. Initing at 0 gives the agent
@@ -657,6 +685,17 @@ class Climbing3DEnv(gym.Env):
             elif self._step_count >= self.cfg_env.hang_target_steps:
                 terminated = True
                 info["outcome"] = "completed"
+            elif self._step_count >= self.cfg_env.max_steps:
+                truncated = True
+                info["outcome"] = "timeout"
+        elif self.cfg_env.task_mode == "imitate":
+            # The ImitationEnv wrapper owns the reward, the termination
+            # curriculum (R_min), and end-of-reference success. The inner env
+            # only flags a physical fall + the max_steps backstop; its reward
+            # value is ignored by the wrapper.
+            if fell:
+                terminated = True
+                info["outcome"] = "fell"
             elif self._step_count >= self.cfg_env.max_steps:
                 truncated = True
                 info["outcome"] = "timeout"

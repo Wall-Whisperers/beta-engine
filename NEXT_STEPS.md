@@ -130,7 +130,7 @@ climbing move. Getting there forced three fixes now baked in: the grip-strength
 physics (one-hand stances were impossible), PPO trust-region guards (`target_kl`
 etc.), and a target-aware observation.
 
-### A1b. THE FRONTIER — chaining scaffolded reaches into a climb (UNSOLVED)
+### A1b. Chaining reaches into a climb — single move SOLVED via imitation + RSI
 
 reach-one works **with scaffolding**: a *designated* mover hand (per-limb
 deadband 0, releases freely), a *target-aware* obs (the mover's goal vector
@@ -155,13 +155,30 @@ not exist in free-choice climbing, and it does not compose across moves (this is
 the "options don't compose" problem in hierarchical RL). **No reward tweak fixes
 this** — it's exploration/structure, not shaping.
 
-Candidate directions (all substantial, none quick): bring the per-limb
-scaffolding *into* the climb (designate the next mover each move from a
-learned/heuristic selector — i.e. an options/hierarchical policy); behavior-clone
-a move sequence from the discrete-move expert (A4) and PPO-fine-tune; or much
-larger-scale training. A **short top-out** is achievable today by pointing
-reach-one's target at the finish from a stance right below it — but that's the
-reach-one capability relabeled, not chained climbing.
+**Resolved (2026-06-07) — imitation + RSI, not RL-discovery.** Following the
+Babadi/Naderi/Hämäläinen method (PPO fails to *discover* long-horizon skills; the
+field splits non-RL discovery from a tracking controller), the loop is now:
+author a reference *without RL* → train PPO to track it with a **bounded
+DeepMimic reward** (0.65 pose / 0.10 vel / 0.15 endeff / 0.10 com, ∈[0,1],
+un-farmable) + **Reference State Initialization** + a **termination curriculum**
+(R_min 0.75→0.50). A de-risk probe (`sim3d/probe_transitions.py`) first
+established the prerequisite the chaining failures hid: the transitional stances
+ARE holdable; the catastrophe was the open-loop KP-1500 reach controller
+overloading anchors (release-survives-but-reach-sheds on 12/17 moves), and RSI is
+faithful 16/17. New modules: `sim3d/reference.py` (Reference + bounded reward +
+weight-shift authoring) and `sim3d/imitation.py` (ImitationEnv); `env.py` gains
+`task_mode="imitate"` + `reset_to_reference()`; `world.py` gains `rsi()`. A single
+landing move trains **0→88%** (monotonic, no collapse, no reward-hacking) — the
+project's first learned move that releases, reaches, and regrips a target hold.
+
+**Now the frontier (multi-move):** stitch authored per-move references into one
+full-climb trajectory with uniform RSI for a top-out; and graduate grips from
+reference-driven (v1) to policy-controlled (rewarded against the contact
+schedule). **Reference quality is the binding constraint** — and note the vetting
+bug: `feasible_reach_moves`/`feasible_climb_stances` accept a stance if it merely
+*doesn't fall* in N steps, so they greenlight seeds sitting 1.3–8× over grip cap
+(they shed grips, just slowly) → jittery references; tighten to also reject
+grip-shedding stances.
 
 Lesser open items: stable PPO learns slowly (reach-one needs ≥1 M steps for high
 success); both curricula run on ONE fixed generated wall — generalise later.

@@ -775,6 +775,51 @@ class Climb3DWorld:
         self.slip_events.clear()
         self.data.ctrl[:] = 0.0
 
+    def rsi(
+        self,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+        grips: dict[Limb, Optional[str]],
+        *,
+        settle_frames: int = 4,
+    ) -> None:
+        """Reference State Initialization: slam the world to an arbitrary
+        reference frame and re-establish exactly the grips it held.
+
+        This is the RSI primitive the imitation loop needs (DeepMimic-style):
+        unlike ``seed_pose`` (which ramps gravity from a guessed pelvis), it sets
+        the *exact* pose/velocity of a recorded reference frame and re-welds the
+        gripped limbs. The brief slip-off ``settle_frames`` then ``qvel`` damp is
+        essential, not cosmetic: instant welding spikes near-cap grips (seed
+        stances sit ~1.3× cap, SLIP_FORCE_SLACK 1.25), so without it even a vetted
+        stance "slips" on contact — a reconstruction artifact. With it, instant
+        reconstruction reproduces the hang on 16/17 vetted stances (verified by
+        ``sim3d.probe_transitions``).
+
+        After this, ``data.ctrl`` holds the reference pose, so an env action of 0
+        (residual-around-seed) keeps the body at the reference frame.
+        """
+        self.reset()
+        self.data.qpos[:] = qpos
+        self.data.qvel[:] = qvel
+        mujoco.mj_forward(self.model, self.data)
+        for limb, hid in grips.items():
+            if hid is not None:
+                self.attach_limb(limb, hid)
+        mujoco.mj_forward(self.model, self.data)
+        self._sync_actuator_targets_to_pose()
+        if settle_frames > 0:
+            self.step(settle_frames, check_slip=False)
+            self.data.qvel[:] = 0.0
+            self.slip_events.clear()
+
+    def _sync_actuator_targets_to_pose(self) -> None:
+        """Snapshot the current joint angles and write them as actuator
+        targets. After this, the actuators try to *hold* the current
+        pose rather than servo toward zero."""
+        for i, qadr in enumerate(self._actuator_jnt_qposadr):
+            self.data.ctrl[i] = self.data.qpos[qadr]
+
     def _sync_actuator_targets_to_pose(self) -> None:
         """Snapshot the current joint angles and write them as actuator
         targets. After this, the actuators try to *hold* the current
