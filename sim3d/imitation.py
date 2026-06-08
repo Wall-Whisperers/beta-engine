@@ -293,7 +293,8 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
 
 def record_video(model_path: str, ref_path: str, out_path: str, *,
                  vecnorm: Optional[str] = None, n_episodes: int = 4,
-                 fps: int = 10, size: int = 480, wall_json: Optional[str] = None) -> None:
+                 fps: int = 10, size: int = 480, wall_json: Optional[str] = None,
+                 rsi_phase_max: Optional[int] = 0) -> None:
     """Roll out the trained policy in its ImitationEnv and render to mp4.
 
     Critically applies the saved VecNormalize obs stats — without them the
@@ -308,7 +309,7 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
 
     ref = Reference.load(ref_path)
     wall, profile = _load_wall_for_ref(ref, wall_json)
-    icfg = ImitationConfig(rsi_phase_max=0)
+    icfg = ImitationConfig(rsi_phase_max=rsi_phase_max)
     env = ImitationEnv(ref, wall, profile, imitation_config=icfg)
     model = PPO.load(model_path)
     vn = None
