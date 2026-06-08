@@ -63,6 +63,12 @@ class ImitationConfig:
     # (the right choice for a full multi-move reference, where every phase is
     # active).
     rsi_phase_max: Optional[int] = None
+    # Anneal the RSI cap from len(ref) (uniform — every move gets gradient) down
+    # to rsi_phase_max (forced near-bottom — the full chain) over this many
+    # per-env steps. Hardens the full climb: phase-averaged success hides that the
+    # hardest start (the bottom, crossing every boundary) is undertrained under
+    # pure uniform RSI; annealing focuses late training there. 0 = fixed cap.
+    rsi_anneal_steps: int = 0
 
 
 class ImitationEnv(gym.Env):
@@ -90,12 +96,22 @@ class ImitationEnv(gym.Env):
         frac = min(1.0, self._total_steps / max(1, self.icfg.r_min_decay_steps))
         return self.icfg.r_min_start + frac * (self.icfg.r_min_end - self.icfg.r_min_start)
 
+    def rsi_cap(self) -> Optional[int]:
+        """Current RSI start-phase cap. None = uniform. With annealing it walks
+        from len(ref) (uniform) down to rsi_phase_max (forced near-bottom)."""
+        tgt = self.icfg.rsi_phase_max
+        if tgt is None or self.icfg.rsi_anneal_steps <= 0:
+            return tgt
+        frac = min(1.0, self._total_steps / self.icfg.rsi_anneal_steps)
+        return int(round(len(self.ref) + frac * (tgt - len(self.ref))))
+
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         T = len(self.ref)
         hi = max(1, T - self.icfg.min_episode_frames)
-        if self.icfg.rsi_phase_max is not None:
-            hi = min(hi, self.icfg.rsi_phase_max + 1)
+        cap = self.rsi_cap()
+        if cap is not None:
+            hi = min(hi, cap + 1)
         self._phase = int(self.np_random.integers(0, hi))   # RSI start phase
         t = self._phase
         obs, info = self.env.reset_to_reference(
@@ -235,7 +251,7 @@ def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None,
 
 
 def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: ImitationConfig,
-          wall_json: Optional[str] = None) -> None:
+          wall_json: Optional[str] = None, load_run: Optional[str] = None) -> None:
     import stable_baselines3 as sb3
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
@@ -245,7 +261,14 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
 
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
     vec = vec_cls([make_env(ref_path, icfg, i, wall_json) for i in range(n_envs)])
-    vec = VecNormalize(vec, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    # Warm-start: reuse the prior run's VecNormalize stats + policy weights so we
+    # continue (and harden) a trained policy instead of relearning from scratch.
+    vn_path = Path(load_run) / "vecnormalize.pkl" if load_run else None
+    if vn_path is not None and vn_path.exists():
+        vec = VecNormalize.load(str(vn_path), vec)
+        vec.training, vec.norm_reward = True, False
+    else:
+        vec = VecNormalize(vec, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
     class ProgressCallback(BaseCallback):
         """Log success rate + mean tracking quality (r_imit) + R_min per rollout.
@@ -270,20 +293,28 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
             rimit = self.rimit_sum / max(1, self.rimit_n)
             try:
                 rmin = float(np.mean(self.training_env.env_method("r_min")))
+                cap = self.training_env.env_method("rsi_cap")[0]
             except Exception:  # noqa: BLE001
-                rmin = float("nan")
+                rmin, cap = float("nan"), None
+            cap_s = "uniform" if cap is None else f"cap{cap}"
             print(f"  [{self.num_timesteps:>7}] success {sr*100:5.1f}%  "
-                  f"({self.ep_succ}/{self.ep_done} eps)  r_imit {rimit:.3f}  R_min {rmin:.3f}")
+                  f"({self.ep_succ}/{self.ep_done} eps)  r_imit {rimit:.3f}  "
+                  f"R_min {rmin:.3f}  RSI {cap_s}")
             self.ep_succ, self.ep_done = 0, 0
             self.rimit_sum, self.rimit_n = 0.0, 0
 
-    model = sb3.PPO(
-        "MlpPolicy", vec, verbose=0,
-        learning_rate=3e-4, n_steps=1024, batch_size=64, n_epochs=5,
-        gamma=0.99, gae_lambda=0.95, clip_range=0.1, ent_coef=0.005,
-        target_kl=0.03, policy_kwargs={"log_std_init": -1.5},
-        tensorboard_log=str(out / "tb"),
-    )
+    model_path = Path(load_run) / "model.zip" if load_run else None
+    if model_path is not None and model_path.exists():
+        model = sb3.PPO.load(str(model_path), env=vec, tensorboard_log=str(out / "tb"))
+        print(f"Warm-started from {model_path}")
+    else:
+        model = sb3.PPO(
+            "MlpPolicy", vec, verbose=0,
+            learning_rate=3e-4, n_steps=1024, batch_size=64, n_epochs=5,
+            gamma=0.99, gae_lambda=0.95, clip_range=0.1, ent_coef=0.005,
+            target_kl=0.03, policy_kwargs={"log_std_init": -1.5},
+            tensorboard_log=str(out / "tb"),
+        )
     print(f"Training imitation: {steps} steps, {n_envs} envs → {out}")
     model.learn(total_timesteps=steps, callback=ProgressCallback(), progress_bar=False)
     model.save(str(out / "model.zip"))
@@ -365,14 +396,20 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=60000)
     ap.add_argument("--n-envs", type=int, default=4)
     ap.add_argument("--run-id", type=str, default="imitation/smoke")
+    ap.add_argument("--load", type=str, default=None,
+                    help="warm-start from a prior run dir (loads model.zip + vecnormalize.pkl)")
     ap.add_argument("--r-min-decay", type=int, default=150_000,
                     help="steps to anneal R_min 0.75→0.50")
     ap.add_argument("--rsi-phase-max", type=int, default=None,
-                    help="cap RSI start phase (single-move: keep episodes on the move)")
+                    help="final RSI start-phase cap (low = forced near-bottom)")
+    ap.add_argument("--rsi-anneal", type=int, default=0,
+                    help="anneal the RSI cap len(ref)→rsi-phase-max over this many "
+                         "per-env steps (hardens the full climb). 0 = fixed cap")
     args = ap.parse_args()
 
     icfg = ImitationConfig(r_min_decay_steps=args.r_min_decay,
-                           rsi_phase_max=args.rsi_phase_max)
+                           rsi_phase_max=args.rsi_phase_max,
+                           rsi_anneal_steps=args.rsi_anneal)
 
     if args.author:
         from sim3d.probe_transitions import build_wall_and_moves
@@ -397,7 +434,7 @@ def main() -> None:
         smoke(args.ref, icfg, wall_json)
     if args.train:
         train(args.ref, steps=args.steps, n_envs=args.n_envs, run_id=args.run_id,
-              icfg=icfg, wall_json=wall_json)
+              icfg=icfg, wall_json=wall_json, load_run=args.load)
 
 
 if __name__ == "__main__":
