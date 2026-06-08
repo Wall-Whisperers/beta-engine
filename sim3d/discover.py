@@ -120,11 +120,14 @@ def discover_move(
             ctrl[i] = float(np.clip(ctrl[i] + residual[k], lo[i], hi[i]))
         w.data.ctrl[:] = ctrl
         pelvis_y0 = float(w.pelvis_pos()[1])
+        com_z0 = float(start_frame["com"][2])
+        com_z_min = com_z0          # track worst trough during the reach
         frames: list[dict] = []
         for _ in range(horizon):
             if record:
                 frames.append(_snapshot(w))
             w.step(ENV_SUBSTEPS, check_slip=True)
+            com_z_min = min(com_z_min, float(w.com()[2]))
             if w.on_hold(mover) is None:
                 gap = float(np.linalg.norm(target_pos - w.limb_tip_pos(mover)))
                 if gap < cfg.GRIP_PROXIMITY_M:
@@ -135,16 +138,27 @@ def discover_move(
         gap = float(np.linalg.norm(target_pos - w.limb_tip_pos(mover)))
         n_anchor = sum(1 for l in LIMBS if l != mover and w.on_hold(l) is not None)
         fell = float(w.pelvis_pos()[2]) < FALL_Z
-        barn = abs(float(w.pelvis_pos()[1]) - pelvis_y0)
+        # Directional lean: only penalize moving *away* from the wall (positive Y).
+        lean_back = max(0.0, float(w.pelvis_pos()[1]) - pelvis_y0)
+        # CoM trough: penalize the worst mid-reach dip below the start height.
+        # com_drop (end-minus-start) missed poses that dip and recover — the policy
+        # can't track a sharp trough even if the final height is fine.
+        com_trough = max(0.0, com_z0 - com_z_min)
+        # End-height: also penalize ending lower (catches moves that don't recover).
+        com_drop = max(0.0, com_z0 - float(w.com()[2]))
         landed = w.on_hold(mover) == target
-        # Land (gap→0, which an actual grip pins to ~0) dominates; hard penalties
-        # for dropping an anchor or falling; gentle barn-door + effort regularisers.
+        # Land (gap→0) dominates; hard penalties for dropped anchors or falling;
+        # posture terms keep the body upright with a smooth CoM arc, no sharp troughs.
         cost = (10.0 * gap + 8.0 * max(0, n_anchor0 - n_anchor)
-                + (25.0 if fell else 0.0) + 3.0 * barn + 0.08 * float(np.linalg.norm(residual)))
+                + (25.0 if fell else 0.0)
+                + 3.0 * lean_back + 4.0 * com_trough + 3.0 * com_drop
+                + 0.08 * float(np.linalg.norm(residual)))
         if record:
             return cost, frames, {"gap": round(gap, 3), "landed": bool(landed),
                                   "n_anchor": n_anchor, "fell": bool(fell),
-                                  "barn": round(barn, 3)}
+                                  "lean_back": round(lean_back, 3),
+                                  "com_trough": round(com_trough, 3),
+                                  "com_drop": round(com_drop, 3)}
         return cost
 
     with warnings.catch_warnings():
