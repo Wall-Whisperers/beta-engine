@@ -340,7 +340,10 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
 
     ref = Reference.load(ref_path)
     wall, profile = _load_wall_for_ref(ref, wall_json)
-    icfg = ImitationConfig(rsi_phase_max=rsi_phase_max)
+    # Record at the trained R_min floor (0.50), not the 0.75 default — otherwise
+    # the termination curriculum cuts a policy that tracks the (harder) full climb
+    # at r_imit ~0.74 right at the start, which looks like total failure.
+    icfg = ImitationConfig(rsi_phase_max=rsi_phase_max, r_min_start=0.5, r_min_end=0.5)
     env = ImitationEnv(ref, wall, profile, imitation_config=icfg)
     model = PPO.load(model_path)
     vn = None
