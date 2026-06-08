@@ -178,21 +178,38 @@ def _build_wall(seed: int):
     return wall, profile
 
 
-def make_env(ref_path: str, icfg: ImitationConfig, rank: int = 0):
+def _load_wall_for_ref(ref: Reference, wall_json: Optional[str] = None):
+    """The exact wall the reference was authored/discovered on. A CMA-ES
+    reference comes from a non-default ``reach_frac`` wall that can't be rebuilt
+    from seed alone, so it's persisted as JSON next to the .npz; load that when
+    given, else rebuild from the gen seed."""
+    if wall_json:
+        import contextlib
+        import io
+        from solver.wall import load_wall
+        with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()):
+            warnings.simplefilter("ignore")
+            return load_wall(wall_json), ClimberProfile()
+    return _build_wall(ref.wall_gen_seed)
+
+
+def make_env(ref_path: str, icfg: ImitationConfig, rank: int = 0,
+             wall_json: Optional[str] = None):
     def _init():
         ref = Reference.load(ref_path)
-        wall, profile = _build_wall(ref.wall_gen_seed)
+        wall, profile = _load_wall_for_ref(ref, wall_json)
         env = ImitationEnv(ref, wall, profile=profile, imitation_config=icfg)
         from stable_baselines3.common.monitor import Monitor
         return Monitor(env)
     return _init
 
 
-def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None) -> None:
+def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None,
+          wall_json: Optional[str] = None) -> None:
     """Single-env sanity: RSI works, reward stays in [0,1], episodes end via the
     termination curriculum / phase-end, and zero-action vs random differ."""
     ref = Reference.load(ref_path)
-    wall, profile = _build_wall(ref.wall_gen_seed)
+    wall, profile = _load_wall_for_ref(ref, wall_json)
     env = ImitationEnv(ref, wall, profile=profile, imitation_config=icfg)
     print(f"reference: {len(ref)} frames | obs {env.observation_space.shape} "
           f"action {env.action_space.shape}")
@@ -217,7 +234,8 @@ def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None) -> None:
     env.close()
 
 
-def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: ImitationConfig) -> None:
+def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: ImitationConfig,
+          wall_json: Optional[str] = None) -> None:
     import stable_baselines3 as sb3
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
@@ -226,7 +244,7 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
     out.mkdir(parents=True, exist_ok=True)
 
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
-    vec = vec_cls([make_env(ref_path, icfg, i) for i in range(n_envs)])
+    vec = vec_cls([make_env(ref_path, icfg, i, wall_json) for i in range(n_envs)])
     vec = VecNormalize(vec, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
     class ProgressCallback(BaseCallback):
@@ -275,7 +293,7 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
 
 def record_video(model_path: str, ref_path: str, out_path: str, *,
                  vecnorm: Optional[str] = None, n_episodes: int = 4,
-                 fps: int = 10, size: int = 480) -> None:
+                 fps: int = 10, size: int = 480, wall_json: Optional[str] = None) -> None:
     """Roll out the trained policy in its ImitationEnv and render to mp4.
 
     Critically applies the saved VecNormalize obs stats — without them the
@@ -289,7 +307,7 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
     ref = Reference.load(ref_path)
-    wall, profile = _build_wall(ref.wall_gen_seed)
+    wall, profile = _load_wall_for_ref(ref, wall_json)
     icfg = ImitationConfig(rsi_phase_max=0)
     env = ImitationEnv(ref, wall, profile, imitation_config=icfg)
     model = PPO.load(model_path)
@@ -340,6 +358,9 @@ def main() -> None:
                     help="render a trained model to this mp4 (needs --model + --ref)")
     ap.add_argument("--model", type=str, default=None, help="model.zip for --record")
     ap.add_argument("--vecnorm", type=str, default=None, help="vecnormalize.pkl for --record")
+    ap.add_argument("--wall-json", type=str, default=None,
+                    help="exact wall JSON (for CMA-ES refs on a non-default wall); "
+                         "auto-detected as <ref>.wall.json if present")
     ap.add_argument("--steps", type=int, default=60000)
     ap.add_argument("--n-envs", type=int, default=4)
     ap.add_argument("--run-id", type=str, default="imitation/smoke")
@@ -361,13 +382,21 @@ def main() -> None:
         ref.save(args.ref)
         print(f"Authored move {move['move_k']} → {args.ref}  {diag}")
 
+    # Auto-detect the sibling wall JSON a CMA-ES reference saves next to itself.
+    wall_json = args.wall_json
+    if wall_json is None:
+        sib = Path(args.ref).with_suffix(".wall.json")
+        if sib.exists():
+            wall_json = str(sib)
+
     if args.record:
-        record_video(args.model, args.ref, args.record, vecnorm=args.vecnorm)
+        record_video(args.model, args.ref, args.record, vecnorm=args.vecnorm,
+                     wall_json=wall_json)
     if args.smoke:
-        smoke(args.ref, icfg)
+        smoke(args.ref, icfg, wall_json)
     if args.train:
         train(args.ref, steps=args.steps, n_envs=args.n_envs, run_id=args.run_id,
-              icfg=icfg)
+              icfg=icfg, wall_json=wall_json)
 
 
 if __name__ == "__main__":
