@@ -171,17 +171,36 @@ weight-shift authoring) and `sim3d/imitation.py` (ImitationEnv); `env.py` gains
 landing move trains **0→88%** (monotonic, no collapse, no reward-hacking) — the
 project's first learned move that releases, reaches, and regrips a target hold.
 
-**Now the frontier (multi-move):** stitch authored per-move references into one
-full-climb trajectory with uniform RSI for a top-out; and graduate grips from
-reference-driven (v1) to policy-controlled (rewarded against the contact
-schedule). **Reference quality is the binding constraint** — and note the vetting
-bug: `feasible_reach_moves`/`feasible_climb_stances` accept a stance if it merely
-*doesn't fall* in N steps, so they greenlight seeds sitting 1.3–8× over grip cap
-(they shed grips, just slowly) → jittery references; tighten to also reject
-grip-shedding stances.
+### A1d. THE FRONTIER — a feasible multi-move reference (CMA-ES discovery)
 
-Lesser open items: stable PPO learns slowly (reach-one needs ≥1 M steps for high
-success); both curricula run on ONE fixed generated wall — generalise later.
+Multi-move authoring **infrastructure** is built and correct: `stitch_references`
+(concatenate per-move refs) and `author_climb_reference` (RSI-chain per-move
+authoring — start each move from the prior move's clean RSI'd end frame, so
+boundaries stay smooth *and* no instability accumulates; snap to the closest
+approach so marginal reaches land). The boundary-teleport and A1c-collapse failure
+modes are both solved at the mechanism level (verified: boundary jump 0.09 rad,
+was 0.86).
+
+**But authoring a feasible multi-move reference by reach-rollout is blocked**, and
+five approaches confirmed it's not a code bug — it's that the hand-coded reach
+controller is too marginal (2026-06-07): independent+stitch → boundary teleport;
+continuous → A1c collapse (grips 3→1→0); RSI-chain → moves don't land+hold; snap →
+grip slips (over cap); grip-boost → reach falls short; tighter walls
+(`reach_frac` 0.4) → still aborts. Every facet of the same root: on generated
+walls the static reach won't close to the grip radius and the stances sit over
+grip cap.
+
+**This is exactly why the paper uses a trajectory optimizer for discovery.** Next:
+build the **CMA-ES discovery stage** (Naderi 2017) — search joint-space keyframes
+per move to satisfy reach + balance + grip-capacity, so references are *optimized
+to be feasible* instead of hoping a marginal controller lands them. Reuses the
+`Reference` container, `rsi()`, `imitation_reward`, and `holdable_fraction`.
+
+Lesser open items: graduate grips from reference-driven (v1) to policy-controlled
+(rewarded against the contact schedule); the **vetting bug** —
+`feasible_reach_moves`/`feasible_climb_stances` accept a stance that merely
+*doesn't fall* in N steps, so they greenlight seeds 1.3–8× over grip cap (CMA-ES
+should vet true holdability); generalise beyond ONE fixed wall.
 
 ### A1c. THE DEEPER ROOT — transitional-stance instability (2026-06-06)
 

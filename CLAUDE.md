@@ -338,9 +338,41 @@ rolling success; `python -m sim3d.train --staged-curriculum`):
   `−K·Δz` swamp the reach signal). The mover starts seeded on a stance vetted to
   hang; the obs points its goal vector at the target (see §Observation Space).
 - **`climb`** — the full clean reward above.
+- **`imitate`** — the env defers reward + termination to the `ImitationEnv`
+  wrapper (`sim3d/imitation.py`); the inner env only applies the action and flags
+  a physical fall. See below.
 
 Default `task_mode="climb"` — the curriculum is opt-in and leaves normal
 training unchanged.
+
+### Imitation + RSI training (the discovery/learning split)
+
+The decisive lesson (2026-06-07, after RL-discovery exp 4–7 all failed to chain a
+climb): **PPO does not *discover* long-horizon physical skills — the field splits
+the problem.** First *discover* a reference motion **without RL**; then train PPO
+to *track* it. This is the Babadi/Naderi/Hämäläinen method, and it works here:
+
+- **Reference** (`sim3d/reference.py`) — a per-env-step trajectory (`qpos`,
+  `qvel`, end-effectors, CoM, grip hold-ids). Authored without RL by a
+  balance-assisted reach rollout; `author_climb_reference` RSI-chains per-move
+  authoring into a multi-move climb.
+- **Bounded DeepMimic reward** — `imitation_reward` ∈ [0,1] (0.65 pose / 0.10 vel
+  / 0.15 endeff / 0.10 com). Capped at 1/step and maximised only by *matching* the
+  reference ⇒ un-farmable by oscillation (the failure mode of every prior dense
+  shaping term).
+- **Reference State Initialization** — `Climb3DWorld.rsi()` + `Climbing3DEnv.
+  reset_to_reference()`: each episode starts RSI'd into a (random) reference frame,
+  so every move gets on-policy gradient. The probe (`sim3d/probe_transitions.py`)
+  verified RSI is faithful 16/17 and that transitional stances are holdable.
+- **Termination curriculum** — terminate when the instantaneous imitation reward
+  drops below `R_min`, annealed 0.75→0.50. Hugs the reference, not wall geometry.
+
+A single landing move trains **0→88%** (monotonic, no collapse). Grips are
+reference-driven in v1 (policy-controlled is a follow-up). **Multi-move is blocked
+not by the loop but by reference *quality*** — the hand-coded reach controller is
+too marginal to author feasible multi-move references on generated walls (reaches
+don't close to the grip radius; over-cap stances shed). The fix is the paper's
+actual discovery stage: a **CMA-ES trajectory optimizer** (NEXT_STEPS).
 
 ---
 

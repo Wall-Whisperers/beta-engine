@@ -215,6 +215,158 @@ def author_weight_shift_move(
     return ref, diag
 
 
+def author_climb_reference(
+    wall: Wall, profile: ClimberProfile, moves: list[dict], *,
+    settle_pre: int = 2, reach_frames: int = 20, settle_post: int = 4,
+    shift_frac: float = 0.6, toward_wall_m: float = 0.04, balance_kp: float = 250.0,
+    snap_dist: float = 0.22, wall_gen_seed: int = 7,
+) -> tuple["Reference", list[dict]]:
+    """Author a multi-move climb by **RSI-chaining** — the fix for both failure
+    modes that broke the earlier versions.
+
+    Independent authoring + concatenation gave smooth *within* moves but teleports
+    at the boundaries (the seed pose ≠ the prior move's end). A single continuous
+    rollout fixed the boundaries but reproduced A1c — momentum/instability
+    accumulated across moves and the body collapsed (grips 3→1→0).
+
+    RSI-chaining takes the best of both: author move 1 from its vetted seed, then
+    start each next move by RSI-ing the world into the *previous move's clean end
+    frame* (zeroed velocity + re-welded grips) before authoring its reach. Move
+    k+1 begins exactly at move k's end pose (smooth boundary) from a fresh,
+    non-collapsing state (no accumulated instability). The static reach often
+    stalls ~0.13 m short, so it snaps to its **closest-approach** pose (drift
+    frames discarded) — a genuine miss ends the climb there. Returns
+    ``(Reference, per_move_diagnostics)``."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        w = Climb3DWorld(wall, profile)
+        w.seed_pose(**moves[0]["seed_kwargs"])
+
+    frames: list[dict] = []
+
+    def rec() -> None:
+        frames.append({
+            "qpos": w.data.qpos.copy(), "qvel": w.data.qvel.copy(),
+            "eef": np.array([w.limb_tip_pos(l) for l in LIMBS]),
+            "com": w.com().copy(),
+            "grips": tuple((w.on_hold(l) or "") for l in LIMBS),
+        })
+
+    for _ in range(settle_pre):
+        rec()
+        w.step(ENV_SUBSTEPS, check_slip=True)
+
+    diag: list[dict] = []
+    move_starts: list[int] = []
+    for mi, m in enumerate(moves):
+        # RSI-chain: every move after the first starts from the PREVIOUS move's
+        # clean end frame (zeroed velocity + re-welded grips), so no momentum or
+        # instability carries over (the A1c collapse) while the boundary stays
+        # smooth (move k+1 begins at move k's end pose). The spec movers alternate
+        # (LH,RH,…) and chain; only the anchor must hold (the mover releases).
+        if mi > 0:
+            last = frames[-1]
+            grips = {LIMBS[i]: (g or None) for i, g in enumerate(last["grips"])}
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                w.rsi(last["qpos"], np.zeros(w.model.nv), grips)
+
+        mover, target = m["mover"], m["target"]
+        anchor = next(l for l in HAND_LIMBS if l != mover)
+        if w.on_hold(anchor) is None or target not in w._hold_meta_by_id:
+            diag.append({"move_k": m["move_k"], "status": "aborted: anchor hand lost"})
+            break
+
+        move_starts.append(len(frames))
+        tgt = np.array(w._hold_meta_by_id[target]["world_pos"])
+        w.move_limb(mover, target, mode="reach")
+        pelvis_tgt = w.pelvis_pos().copy()
+        pelvis_tgt[0] += shift_frac * (float(w.limb_tip_pos(anchor)[0]) - pelvis_tgt[0])
+        pelvis_tgt[1] -= toward_wall_m
+        kp0 = _cfg.BALANCE_KP
+        _cfg.BALANCE_KP = balance_kp
+        w._balance_target = pelvis_tgt
+        # Track the closest approach so a marginal reach snaps to its CLOSEST
+        # pose, not the drifted-away final one.
+        best = (1e9, len(frames), None, None)   # (gap, frame_idx, qpos, grips)
+        try:
+            for _ in range(reach_frames):
+                rec()
+                gap = float(np.linalg.norm(tgt - w.limb_tip_pos(mover)))
+                if gap < best[0]:
+                    best = (gap, len(frames) - 1, w.data.qpos.copy(),
+                            tuple(w.on_hold(l) for l in LIMBS))
+                w.step(ENV_SUBSTEPS, check_slip=True)
+                if w.on_hold(mover) == target:
+                    break
+        finally:
+            _cfg.BALANCE_KP = kp0
+            w._balance_target = None
+
+        # Land it: if the reach didn't auto-grip, rewind to the closest-approach
+        # pose (discard the drift frames) and snap onto the hold — but only if it
+        # got close enough; a genuine miss ends the climb here.
+        if w.on_hold(mover) != target:
+            if best[0] <= snap_dist and best[2] is not None:
+                del frames[best[1] + 1:]
+                grips_best = {l: h for l, h in zip(LIMBS, best[3]) if h}
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    w.rsi(best[2], np.zeros(w.model.nv), grips_best, settle_frames=0)
+                w.move_limb(mover, target, mode="snap")
+            else:
+                diag.append({"move_k": m["move_k"],
+                             "status": f"aborted: reach fell {best[0]:.2f} m short"})
+                break
+
+        for _ in range(settle_post):
+            rec()
+            w.step(ENV_SUBSTEPS, check_slip=True)
+
+        n_grip = sum(1 for l in LIMBS if w.on_hold(l) is not None)
+        diag.append({"move_k": m["move_k"], "mover": mover, "target": target,
+                     "landed": bool(w.on_hold(mover) == target),
+                     "min_gap": round(best[0], 3), "n_grip_after": n_grip})
+        if float(w.pelvis_pos()[2]) < FALL_Z:
+            diag.append({"status": "aborted: body fell"})
+            break
+
+    ref = Reference(
+        qpos=np.array([f["qpos"] for f in frames]),
+        qvel=np.array([f["qvel"] for f in frames]),
+        eef=np.array([f["eef"] for f in frames]),
+        com=np.array([f["com"] for f in frames]),
+        grips=np.array([f["grips"] for f in frames], dtype="<U24"),
+        wall_gen_seed=wall_gen_seed,
+        meta={"moves": [d.get("move_k") for d in diag if "mover" in d],
+              "move_starts": move_starts, "continuous": True},
+    )
+    return ref, diag
+
+
+def stitch_references(refs: list["Reference"]) -> "Reference":
+    """Concatenate per-move references into one full-climb trajectory.
+
+    Consecutive feasible reach moves chain by construction — move k ends with
+    the hands on holds (k, k+1), which is exactly move k+1's start stance — so
+    independently-authored moves (each from its own vetted stance, hence
+    RSI-faithful) concatenate into a continuous climb. Small pose jumps at the
+    boundaries are fine: RSI re-seeds each frame and the policy tracks locally,
+    so a boundary is just another transition to learn."""
+    if not refs:
+        raise ValueError("stitch_references: need ≥1 reference")
+    return Reference(
+        qpos=np.concatenate([r.qpos for r in refs]),
+        qvel=np.concatenate([r.qvel for r in refs]),
+        eef=np.concatenate([r.eef for r in refs]),
+        com=np.concatenate([r.com for r in refs]),
+        grips=np.concatenate([r.grips for r in refs]),
+        wall_gen_seed=refs[0].wall_gen_seed,
+        meta={"stitched": [r.meta for r in refs], "boundaries":
+              list(np.cumsum([len(r) for r in refs])[:-1])},
+    )
+
+
 def holdable_fraction(ref: Reference, wall: Wall, profile: ClimberProfile, *,
                       k_steps: int = 12) -> float:
     """Fraction of reference frames that, RSI'd and held passively, don't fall.
