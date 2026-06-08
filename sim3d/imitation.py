@@ -352,13 +352,21 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
         vn.training = False
 
     m, d = env.env.world.model, env.env.world.data
+    # Tame the default over-exposure so the wall isn't blown to white and the
+    # coloured holds + climber read clearly.
+    m.vis.headlight.diffuse[:] = 0.35
+    m.vis.headlight.ambient[:] = 0.45
+    m.vis.headlight.specular[:] = 0.0
+    for _i in range(m.nlight):
+        m.light_diffuse[_i] *= 0.35
+        m.light_specular[_i] *= 0.0
     renderer = mujoco.Renderer(m, height=size, width=size)
     cam = mujoco.MjvCamera()
     mujoco.mjv_defaultFreeCamera(m, cam)
-    # Near-edge-on side view: this move sits at the wall top, where front views
-    # crop the legs and the plate occludes the downward reach. From the side the
-    # climber shows in full profile past the wall edge, so the reach is legible.
-    cam.azimuth, cam.elevation, cam.distance = 8.0, 4.0, 4.6
+    # Front view (az 270): the climber's back against the wall FACE, so the
+    # coloured holds are visible and upward progress along them is legible. A
+    # side view hides the holds (they lie flat on the face) and reads as "leaning".
+    cam.azimuth, cam.elevation, cam.distance = 270.0, -10.0, 3.6
 
     frames, n_done, n_succ = [], 0, 0
     for ep in range(n_episodes):
@@ -368,7 +376,7 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
             action, _ = model.predict(o, deterministic=True)
             obs, _r, term, trunc, info = env.step(action)
             com = env.env.world.com()
-            cam.lookat[:] = [float(com[0]), 0.0, float(com[2]) - 0.3]
+            cam.lookat[:] = [float(com[0]), 0.2, float(com[2])]
             renderer.update_scene(d, camera=cam)
             frames.append(renderer.render())
             if term or trunc:
