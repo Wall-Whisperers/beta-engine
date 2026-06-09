@@ -194,18 +194,37 @@ def _build_wall(seed: int):
     return wall, profile
 
 
-def _load_wall_for_ref(ref: Reference, wall_json: Optional[str] = None):
+def _load_wall_for_ref(ref: Reference, wall_json: Optional[str] = None,
+                       ref_path: Optional[str] = None):
     """The exact wall the reference was authored/discovered on. A CMA-ES
     reference comes from a non-default ``reach_frac`` wall that can't be rebuilt
-    from seed alone, so it's persisted as JSON next to the .npz; load that when
-    given, else rebuild from the gen seed."""
+    from seed alone, so it's persisted as JSON next to the .npz.
+
+    Resolution order:
+      1. Explicit ``wall_json`` argument.
+      2. Auto-detected sibling ``<ref_stem>.wall.json`` (when ``ref_path`` given).
+      3. Rebuild from ``ref.wall_gen_seed`` (fallback — only correct for walls
+         whose hold layout matches the generator defaults; WRONG for CMA-ES refs
+         that used a different wall parametrisation).
+    """
+    import contextlib
+    import io
+    from solver.wall import load_wall
+
+    candidates = []
     if wall_json:
-        import contextlib
-        import io
-        from solver.wall import load_wall
-        with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()):
-            warnings.simplefilter("ignore")
-            return load_wall(wall_json), ClimberProfile()
+        candidates.append(wall_json)
+    if ref_path:
+        sibling = Path(ref_path).with_suffix(".wall.json")
+        if sibling.exists():
+            candidates.append(str(sibling))
+
+    for cand in candidates:
+        if Path(cand).exists():
+            with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()):
+                warnings.simplefilter("ignore")
+                return load_wall(cand), ClimberProfile()
+
     return _build_wall(ref.wall_gen_seed)
 
 
@@ -213,7 +232,7 @@ def make_env(ref_path: str, icfg: ImitationConfig, rank: int = 0,
              wall_json: Optional[str] = None):
     def _init():
         ref = Reference.load(ref_path)
-        wall, profile = _load_wall_for_ref(ref, wall_json)
+        wall, profile = _load_wall_for_ref(ref, wall_json, ref_path=ref_path)
         env = ImitationEnv(ref, wall, profile=profile, imitation_config=icfg)
         from stable_baselines3.common.monitor import Monitor
         return Monitor(env)
@@ -225,7 +244,7 @@ def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None,
     """Single-env sanity: RSI works, reward stays in [0,1], episodes end via the
     termination curriculum / phase-end, and zero-action vs random differ."""
     ref = Reference.load(ref_path)
-    wall, profile = _load_wall_for_ref(ref, wall_json)
+    wall, profile = _load_wall_for_ref(ref, wall_json, ref_path=ref_path)
     env = ImitationEnv(ref, wall, profile=profile, imitation_config=icfg)
     print(f"reference: {len(ref)} frames | obs {env.observation_space.shape} "
           f"action {env.action_space.shape}")
@@ -253,7 +272,7 @@ def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None,
 def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: ImitationConfig,
           wall_json: Optional[str] = None, load_run: Optional[str] = None) -> None:
     import stable_baselines3 as sb3
-    from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
     out = Path("data/runs/sim3d") / run_id
@@ -305,7 +324,7 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
 
     model_path = Path(load_run) / "model.zip" if load_run else None
     if model_path is not None and model_path.exists():
-        model = sb3.PPO.load(str(model_path), env=vec, tensorboard_log=str(out / "tb"))
+        model = sb3.PPO.load(str(model_path), env=vec)
         print(f"Warm-started from {model_path}")
     else:
         model = sb3.PPO(
@@ -313,10 +332,19 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
             learning_rate=3e-4, n_steps=1024, batch_size=64, n_epochs=5,
             gamma=0.99, gae_lambda=0.95, clip_range=0.1, ent_coef=0.005,
             target_kl=0.03, policy_kwargs={"log_std_init": -1.5},
-            tensorboard_log=str(out / "tb"),
         )
+    # Checkpoint every 200k global steps (vec-normalize stats saved alongside).
+    ckpt_cb = CheckpointCallback(
+        save_freq=max(1, 200_000 // n_envs),
+        save_path=str(out / "checkpoints"),
+        name_prefix="model",
+        save_vecnormalize=True,
+        verbose=0,
+    )
+    callbacks = CallbackList([ProgressCallback(), ckpt_cb])
+
     print(f"Training imitation: {steps} steps, {n_envs} envs → {out}")
-    model.learn(total_timesteps=steps, callback=ProgressCallback(), progress_bar=False)
+    model.learn(total_timesteps=steps, callback=callbacks, progress_bar=False)
     model.save(str(out / "model.zip"))
     vec.save(str(out / "vecnormalize.pkl"))
     print(f"Saved {out/'model.zip'}")
@@ -339,7 +367,7 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
     ref = Reference.load(ref_path)
-    wall, profile = _load_wall_for_ref(ref, wall_json)
+    wall, profile = _load_wall_for_ref(ref, wall_json, ref_path=ref_path)
     # Record at the trained R_min floor (0.50), not the 0.75 default — otherwise
     # the termination curriculum cuts a policy that tracks the (harder) full climb
     # at r_imit ~0.74 right at the start, which looks like total failure.
@@ -409,8 +437,12 @@ def main() -> None:
     ap.add_argument("--run-id", type=str, default="imitation/smoke")
     ap.add_argument("--load", type=str, default=None,
                     help="warm-start from a prior run dir (loads model.zip + vecnormalize.pkl)")
+    ap.add_argument("--r-min-start", type=float, default=0.75,
+                    help="initial R_min termination threshold (default 0.75)")
+    ap.add_argument("--r-min-end", type=float, default=0.50,
+                    help="final R_min after decay (default 0.50)")
     ap.add_argument("--r-min-decay", type=int, default=150_000,
-                    help="steps to anneal R_min 0.75→0.50")
+                    help="per-env steps to anneal R_min start→end (default 150k)")
     ap.add_argument("--rsi-phase-max", type=int, default=None,
                     help="final RSI start-phase cap (low = forced near-bottom)")
     ap.add_argument("--rsi-anneal", type=int, default=0,
@@ -418,7 +450,9 @@ def main() -> None:
                          "per-env steps (hardens the full climb). 0 = fixed cap")
     args = ap.parse_args()
 
-    icfg = ImitationConfig(r_min_decay_steps=args.r_min_decay,
+    icfg = ImitationConfig(r_min_start=args.r_min_start,
+                           r_min_end=args.r_min_end,
+                           r_min_decay_steps=args.r_min_decay,
                            rsi_phase_max=args.rsi_phase_max,
                            rsi_anneal_steps=args.rsi_anneal)
 

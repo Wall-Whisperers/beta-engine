@@ -470,6 +470,119 @@ the next step — not a prerequisite.
 
 ---
 
+## Future Direction: Generalization Strategy
+
+### The reference bottleneck (current constraint)
+
+The imitation + RSI approach (PPO tracks a CMA-ES-authored reference) is
+the correct solve for getting a climbing policy at all — pure RL definitively
+failed to discover multi-move sequences across many attempts. But the current
+pipeline produces a **single-wall controller**: the policy learns to reproduce
+one specific reference on one specific wall and does not transfer elsewhere.
+
+The reference authoring step is the bottleneck:
+- CMA-ES is fragile (most multi-move runs stall; the 6-move reference required
+  manual stitching of two separate runs).
+- Only hand moves work (foot-move authoring is blocked by the hip_flex axis).
+- Each new wall needs a new reference, taking hours of babysitting.
+
+### Path A — Automatic reference authoring at scale
+
+Fix the CMA-ES trajectory optimizer so it reliably generates multi-move
+references (including foot moves) on arbitrary walls without hand-holding.
+Build a library of (wall, reference) pairs and train one policy on all of
+them simultaneously. The policy learns a general climbing style rather than
+one specific route.
+
+**Ceiling:** the policy can only be as good as the authored references.
+Advanced technique that the optimizer can't produce won't appear in training.
+
+### Path B — Motion primitives + RL chaining
+
+Train a small library of canonical single-move primitives via imitation
+(reach-left-up, reach-right-up, step-up-left, step-up-right, etc.). Then
+use RL to chain those primitives on a new wall — the policy reuses learned
+movement templates and RL figures out the sequencing.
+
+**Ceiling:** the primitive library is the ceiling of the policy. Moves that
+don't fit a template (dynos, drop-knees, flags, deadpoints, cross-throughs)
+cannot be expressed — the policy will fail or substitute a weaker technique.
+Each advanced move type needs its own primitive, and authoring complex
+primitives has the same CMA-ES quality problem, just harder.
+
+For V3–V5 MoonBoard grades, basic reach patterns cover most moves. This
+approach likely plateaus around V5–V6 without richer primitives.
+
+### Path C — AMP (Adversarial Motion Priors) — the complete answer
+
+Instead of specific primitives or references, collect a diverse library of
+motion clips (from simulation or MoCap of real climbers) and train a
+**motion prior**: a learned distribution over "what climbing looks like."
+RL then samples from the prior when solving new problems. This sidesteps
+both the reference quality ceiling (Path A) and the primitive expressiveness
+ceiling (Path B), because the prior is a continuous distribution — any
+motion that appeared in training data is representable.
+
+The catch: still needs reference data. MoCap of real climbers is the
+cleanest source. Without it, you're authoring diverse references — just
+many of them.
+
+### Recommended sequencing
+
+1. **Now** — single-wall imitation controller (current work). Proves the
+   physics, reward, and body are correct. ✓ in progress.
+2. **Next** — Path B primitives for the basic move set. Get a policy that
+   solves V3–V5 MoonBoard problems reliably without wall-specific references.
+3. **Later** — video-based motion prior (Path C / AMP) for grade-agnostic
+   generalisation. See §Video pipeline below.
+
+Paths B and C are not mutually exclusive. The primitive library *is* a
+small motion prior — the AMP architecture can grow from it.
+
+### The video pipeline (Path C implementation)
+
+Rather than MoCap (requires a studio, a skilled climber, expensive
+retargeting), the practical data source is **existing climbing video** —
+MoonBoard send videos, IFSC competition footage, gym videos. Modern
+markerless pose estimators (4D-Humans, WHAM) extract SMPL 3D body pose
+from monocular video without any markers. The MoonBoard is the natural
+starting point because hold positions are globally standardised (20cm grid,
+11×18, exact 3D coordinates known) — no camera calibration needed to
+label which holds are gripped.
+
+**Why video beats MoCap for this project:**
+- You don't need to be a skilled climber — use footage of professionals
+- IFSC competition footage covers V3–V15 technique at elite level, free
+- MoonBoard send videos cover every grade and style, thousands available
+- The discriminator is improved incrementally: add gym footage → extends
+  to vertical/slab; add outdoor footage → extends further. Each expansion
+  fine-tunes the discriminator without retraining the RL policy from scratch.
+
+**Technique coverage by data source:**
+
+| Source | Overhang | Drop knee | Heel/toe hook | Slab | Dyno |
+|---|---|---|---|---|---|
+| MoonBoard footage | ✓✓ | ✓ | rare | ✗ | ✓ |
+| IFSC bouldering | ✓✓ | ✓✓ | ✓✓ | ✓ | ✓✓ |
+| Gym footage | ✓ | ✓ | ✓ | ✓✓ | ✓ |
+| Outdoor footage | ✓ | ✓ | ✓ | ✓✓ | ✓ |
+
+The AMP discriminator learns from the union of all sources. Expand the
+library incrementally — the policy adapts each time without starting over.
+
+**Concrete implementation steps (see NEXT_STEPS.md §V for sprint plan):**
+
+1. Pose extraction — 4D-Humans/WHAM on MoonBoard videos → SMPL per frame
+2. Clip segmentation — detect move transitions, cut into 2–5 s clips
+3. Contact labelling — project known hold positions, threshold match to hands/feet
+4. SMPL → 27-DOF retargeting — physics-based IK in MuJoCo (the hard step)
+5. Quality filtering — reject clips with joint limit violations, wall penetration
+6. AMP discriminator — add to existing PPO loop; input is (state, next\_state) pairs
+7. Multi-wall RL — train policy with prior across diverse generated walls
+8. MoonBoard eval — test on held-out problems, measure success and technique quality
+
+---
+
 ## Future Direction: Toward Muscle-Level Control
 
 The current PD-servo architecture is a stepping stone. The full roadmap:
