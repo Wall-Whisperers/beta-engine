@@ -5,13 +5,14 @@
 > roadmap. Prune aggressively; don't let this drift into an audit doc that
 > rots while the code moves.
 >
-> Last reviewed: 2026-06-09.
+> Last reviewed: 2026-06-10.
 
 ---
 
-## Where we are (2026-06-09)
+## Where we are (2026-06-10)
 
-**The imitation + CMA-ES loop is working end-to-end.**
+**The imitation + CMA-ES loop is working end-to-end. A 6-move climb is
+learned from frame 0.**
 
 Path taken:
 - Phase 0 blockers (episode length, seed pose, grip semantics, log_std_init) — DONE.
@@ -23,54 +24,19 @@ Path taken:
   Foot moves blocked by hip_flex axis; all discovery is hand-only.
 - **6-move reference authored**: `ref_cma9_6moves_stitched.npz`, 148 frames,
   holds h_033→h_034→h_037→h_038→h_039→h_040, pelvis 3.29→3.49m.
-- **R_min bug found and fixed**: v1 training had R_min_start=0.75 but the
-  reference's worst transition gives r_imit=0.750 — barely above the threshold.
-  As RSI hardened (more moves per episode), success collapsed from 13.7% peak
-  → 0%. Root cause: any imperfection during a reach transition pushed r_imit
-  below R_min and terminated. Fix: `--r-min-start 0.3` exposes `r_min_start`
-  and `r_min_end` as CLI args; now set to 0.30 (flat).
-- **Wrong-wall bug found and fixed**: `_load_wall_for_ref` was rebuilding the
-  wall from the generator seed (54 holds, wrong positions) instead of the saved
-  `.wall.json` (58 holds). Only 1/10 reference holds matched — catastrophic RSI
-  instability. Fix: `_load_wall_for_ref` now auto-detects sibling `.wall.json`.
-- **Periodic checkpointing added**: `CheckpointCallback` saves every 200k global
-  steps into `checkpoints/` — runs can be warm-started if interrupted.
-- **v2 training running (2026-06-09)**:
-  `data/runs/sim3d/imitation/ref6moves_v2_rmin03/`
-  - 2M steps, 8 envs, `--rsi-anneal 400000 --r-min-start 0.3 --r-min-end 0.3`.
-  - At 811k steps: success 39–42% (tripled from 12% start), r_imit 0.665.
-    Clean monotonic rise — no collapse. r_imit stabilised after early dip
-    (null policy accidentally tracked well; exploration dip is normal).
-
----
-
-## Immediate: evaluate v2 at 2M steps
-
-### I1. Record a rollout video
-
-When `ref6moves_v2_rmin03/model.zip` appears:
-```bash
-python -m sim3d.imitation --record ref6moves_v2_rollout.mp4 \
-  --ref data/runs/sim3d/imitation/ref_cma9_6moves_stitched.npz \
-  --model data/runs/sim3d/imitation/ref6moves_v2_rmin03/model.zip \
-  --vecnorm data/runs/sim3d/imitation/ref6moves_v2_rmin03/vecnormalize.pkl
-```
-Does the policy visually execute the 6-move sequence? Are late-reference RSI
-starts (easy) vs early-reference starts (hard) both succeeding?
-
-### I2. Harden to full-chain if success ≥ 60% at 2M steps
-
-If success plateaus below 60%, the uniform RSI is masking that early-start
-episodes are undertrained. Add RSI hardening in a third run:
-```bash
-python -m sim3d.imitation --train \
-  --ref data/runs/sim3d/imitation/ref_cma9_6moves_stitched.npz \
-  --steps 2_000_000 --n-envs 8 \
-  --run-id imitation/ref6moves_v3_hardened \
-  --load data/runs/sim3d/imitation/ref6moves_v2_rmin03 \
-  --rsi-phase-max 0 --rsi-anneal 250_000 \
-  --r-min-start 0.3 --r-min-end 0.3
-```
+- **R_min bug found and fixed**: v1 collapsed to 0% because R_min=0.75 sat
+  right at the reference's worst-case transition (r_imit=0.750). Any imperfection
+  during a reach terminated the episode. Fix: `--r-min-start 0.3` flat.
+- **Wrong-wall bug found and fixed**: `_load_wall_for_ref` was rebuilding from
+  generator seed (54 holds) not the saved `.wall.json` (58 holds). Fix: sibling
+  auto-detection.
+- **Periodic checkpointing added**: `CheckpointCallback` saves every 200k steps
+  into `checkpoints/` — runs resumable if interrupted.
+- **v2 trained** (`ref6moves_v2_rmin03`, 2M steps, uniform RSI): 70.2% success
+  — but inflated by easy late-reference starts. 0/4 eval from frame 0.
+- **v3 trained** (`ref6moves_v3_hardened`, 2M steps, RSI hardened cap→0):
+  **52.6% success from frame 0** (40/76 eps), r_imit=0.676. This is the real
+  number. Monotonic learning, no collapse. Video: `ref6moves_v3_rollout.mp4`.
 
 ---
 
