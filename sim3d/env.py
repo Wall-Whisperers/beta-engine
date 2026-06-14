@@ -128,6 +128,24 @@ class EnvConfig:
     official_route_only: bool = False
     reset_max_retries: int = 5
     include_kickboard: bool = False
+    # Continuous-control task curriculum.  This never calls the discrete-move
+    # controller; every task still uses the same joint-target + grip-intent
+    # action space.
+    task_mode: str = "climb"                    # "hang" | "reach-one" | "climb"
+    hang_survival_reward: float = 1.0            # per-step weighted contact reward in hang/reach-one
+    hang_release_penalty: float = 2.0            # per non-target released limb in task modes
+    reach_target_limb: Optional[Limb] = None     # dynamic: selected at reset in reach-one
+    reach_target_hold: Optional[str] = None      # dynamic: selected at reset in reach-one
+    reach_target_bonus: float = 100.0
+    reach_stabilize_bonus: float = 100.0
+    reach_stabilize_frames: int = 12
+    reach_release_bonus: float = 5.0
+    reach_distance_coeff: float = 25.0
+    reach_stability_reward: float = 0.05        # tiny: keep other contacts stable without rewarding hang-still
+    reach_time_penalty: float = 0.02            # per-step pressure to finish reach-one
+    reach_timeout_penalty: float = 25.0         # makes no-catch timeout negative-EV
+    reach_max_target_dist: float = 1.25         # reject reach-one targets too far for the first skill
+    reach_require_higher_target: bool = True    # keep reach-one aligned with upward route progress
 
 
 class Climbing3DEnv(gym.Env):
@@ -154,6 +172,8 @@ class Climbing3DEnv(gym.Env):
 
         if self.cfg_env.action_mode not in ("discrete-move", "continuous-joint"):
             raise ValueError(f"unknown action_mode: {self.cfg_env.action_mode}")
+        if self.cfg_env.task_mode not in ("hang", "reach-one", "climb"):
+            raise ValueError(f"unknown task_mode: {self.cfg_env.task_mode}")
         if self.cfg_env.start_mode not in ("seed", "ground-reach"):
             raise ValueError(f"unknown start_mode: {self.cfg_env.start_mode}")
 
@@ -218,9 +238,19 @@ class Climbing3DEnv(gym.Env):
         self._step_count = 0
         self._finish_streak = 0
         self._max_com_z = 0.0
+        self._seed_max_grip_z = 0.0
         self._holds_matched_this_episode: set[tuple[str, str]] = set()
         self._prev_grip: dict[Limb, Optional[str]] = {l: None for l in LIMBS}
         self._prev_finish_dist: float = 0.0    # for dense finish-approach shaping
+        self._prev_reach_target_dist: float = 0.0
+        self._reach_caught = False
+        self._reach_streak = 0
+        self._reach_released_once = False
+        self._episode_max_com_z = 0.0
+        self._episode_max_pelvis_z = 0.0
+        self._episode_max_grip_z_metric = 0.0
+        self._unique_holds_gripped: set[str] = set()
+        self._unique_higher_holds_gripped: set[str] = set()
         # Per-episode seed-pose joint targets; residual base for continuous
         # actions (set in reset()). Midpoint until the first reset runs.
         self._seed_ctrl = 0.5 * (self._act_lo + self._act_hi)
@@ -284,17 +314,96 @@ class Climbing3DEnv(gym.Env):
         # Init at the highest *currently* gripped hold so the seed pose
         # doesn't get an unearned bonus on step 1.
         self._max_grip_z = self._current_max_grip_z()
+        self._seed_max_grip_z = self._max_grip_z
         self._holds_matched_this_episode = set()
         self._prev_grip = {l: self.world.on_hold(l) for l in LIMBS}
         self._prev_finish_dist = self._finish_dist()
         self._prev_com_z = float(self.world.com()[2])
+        self._configure_task_after_reset()
         self._prev_reach_dists = self._reach_dists()
+        self._prev_reach_target_dist = self._reach_target_dist()
+        self._reach_caught = False
+        self._reach_streak = 0
+        self._reach_released_once = False
+        self._episode_max_com_z = float(self.world.com()[2])
+        self._episode_max_pelvis_z = float(self.world.pelvis_pos()[2])
+        self._episode_max_grip_z_metric = self._current_max_grip_z()
+        self._unique_holds_gripped = {
+            hid for hid in (self.world.on_hold(l) for l in LIMBS) if hid is not None
+        }
+        self._unique_higher_holds_gripped = set()
         # Snapshot the settled seed-pose joint targets. Continuous-joint
         # actions are interpreted as residuals around THIS pose (see
         # _step_continuous), so action≈0 means "hold the hang" rather than
         # "yank every joint to its ctrlrange midpoint".
         self._seed_ctrl = self.world.data.ctrl[: self._n_act].copy()
         return self._obs(), self._info()
+
+    def _configure_task_after_reset(self) -> None:
+        """Choose continuous-only task targets for the current episode."""
+        self.cfg_env.reach_target_limb = None
+        self.cfg_env.reach_target_hold = None
+        if self.cfg_env.task_mode != "reach-one":
+            return
+
+        # Prefer a hand that is currently attached and has a nearby higher
+        # hand-eligible target.  This keeps the subtask achievable while still
+        # requiring the policy to emit the release/reach/regrip sequence itself.
+        occupied_at_start = {
+            self.world.on_hold(l) for l in LIMBS if self.world.on_hold(l) is not None
+        }
+        candidates: list[tuple[float, Limb, str]] = []
+        max_dist = float(self.cfg_env.reach_max_target_dist)
+        require_higher = bool(self.cfg_env.reach_require_higher_target)
+        for limb in HAND_LIMBS:
+            cur = self.world.on_hold(limb)
+            if cur is None:
+                continue
+            tip = np.array(self.world.limb_tip_pos(limb), dtype=np.float64)
+            cur_z = float(self.world._hold_meta_by_id[cur]["world_pos"][2])
+            for i, hid in enumerate(self._hold_ids):
+                if hid in occupied_at_start or not self._hand_eligible[i]:
+                    continue
+                meta = self.world._hold_meta_by_id[hid]
+                z = float(meta["world_pos"][2])
+                d = float(np.linalg.norm(np.array(meta["world_pos"], dtype=np.float64) - tip))
+                # Harsh curriculum invariant: the first reach skill must mean
+                # "move one hand to a *new higher* hold within a plausible local
+                # reach radius".  If a wall cannot provide that, the episode is
+                # marked invalid instead of training lateral/downward catches that
+                # would pass reach-one while teaching no climbing progress.
+                if require_higher and z <= cur_z + 0.03:
+                    continue
+                if d > max_dist:
+                    continue
+                candidates.append((d, limb, hid))
+        if not candidates:
+            return
+        candidates.sort(key=lambda x: x[0])
+        # Randomize among the nearest few so both hands see data without making
+        # the first task vary wildly.
+        k = min(4, len(candidates))
+        idx = int(self.np_random.integers(0, k)) if self.np_random is not None else 0
+        _, limb, hid = candidates[idx]
+        self.cfg_env.reach_target_limb = limb
+        self.cfg_env.reach_target_hold = hid
+
+    def set_task_mode(self, mode: str) -> None:
+        """Switch continuous curriculum mode for future steps/resets."""
+        if mode not in ("hang", "reach-one", "climb"):
+            raise ValueError(f"unknown task_mode: {mode}")
+        self.cfg_env.task_mode = mode
+        self.cfg_env.reach_target_limb = None
+        self.cfg_env.reach_target_hold = None
+        self._reach_caught = False
+        self._reach_streak = 0
+        self._reach_released_once = False
+        # SB3 vec envs may auto-reset immediately before callbacks run.  If a
+        # callback switches into reach-one at that point, choose a target for
+        # the already-reset current state instead of waiting one full episode.
+        if mode == "reach-one":
+            self._configure_task_after_reset()
+        self._prev_reach_target_dist = self._reach_target_dist()
 
     def _current_max_grip_z(self) -> float:
         """Highest z of any currently gripped hold; 0.0 if no grips."""
@@ -410,6 +519,7 @@ class Climbing3DEnv(gym.Env):
         match_bonus = 0.0
         high_grip_bonus = 0.0
         n_released = 0
+        released_limbs: list[Limb] = []
         for limb in LIMBS:
             cur = self.world.on_hold(limb)
             prev = self._prev_grip.get(limb)
@@ -428,7 +538,20 @@ class Climbing3DEnv(gym.Env):
                     self._max_grip_z = hold_z
             if prev is not None and cur is None:
                 n_released += 1
+                released_limbs.append(limb)
             self._prev_grip[limb] = cur
+
+        self._update_episode_progress_metrics()
+
+        if self.cfg_env.task_mode != "climb":
+            return self._step_curriculum_task(
+                slips=slips,
+                body_intersections=body_intersections,
+                ctrl_l2_sq=ctrl_l2_sq,
+                released_limbs=released_limbs,
+                match_bonus=match_bonus,
+                high_grip_bonus=high_grip_bonus,
+            )
 
         # Dense finish-approach shaping — potential-based so it cannot be
         # exploited by oscillating near the finish without touching it.
@@ -446,8 +569,9 @@ class Climbing3DEnv(gym.Env):
         # closing distance to its nearest eligible hold. This gives the agent
         # a dense gradient for "move your free hand toward something grippable"
         # without needing to accidentally land on a hold first.
-        # ONE-SIDED: only reward closing the gap, never penalise retreating.
-        # GATED on at least one hand being gripped — same gate as survival_bonus.
+        # Signed potential shaping: closing the gap pays, moving away costs.
+        # This avoids oscillation farming where away motion is free and toward
+        # motion is repeatedly paid. GATED on at least one hand being gripped.
         # Without the gate the agent learned to release all grips, fall to the
         # floor, and collect reach reward while free limbs swung toward holds
         # on the way down (week7: body at floor, +10k reward, zero climbing).
@@ -459,7 +583,7 @@ class Climbing3DEnv(gym.Env):
                 for limb in LIMBS:
                     if self.world.on_hold(limb) is None:
                         delta = self._prev_reach_dists.get(limb, 0.0) - cur_reach[limb]
-                        reach_reward += max(0.0, delta)
+                        reach_reward += delta
                 reach_reward *= self.cfg_env.reach_approach_coeff
                 self._prev_reach_dists = cur_reach
             else:
@@ -539,6 +663,128 @@ class Climbing3DEnv(gym.Env):
         info["high_grip_bonus"] = float(high_grip_bonus)
         info["release_penalty"] = float(release_penalty)
         info["energy_penalty"] = float(self.cfg_env.energy_penalty_coeff * ctrl_l2_sq)
+        return self._obs(), float(reward), terminated, truncated, info
+
+    def _step_curriculum_task(
+        self,
+        *,
+        slips: int,
+        body_intersections: int,
+        ctrl_l2_sq: float,
+        released_limbs: list[Limb],
+        match_bonus: float,
+        high_grip_bonus: float,
+    ) -> tuple[np.ndarray, float, bool, bool, dict]:
+        """Reward/termination for continuous-only hang and reach-one tasks."""
+        n_hand = sum(1 for l in HAND_LIMBS if self.world.on_hold(l) is not None)
+        n_foot = sum(1 for l in FOOT_LIMBS if self.world.on_hold(l) is not None)
+        weighted_contacts = (2 * n_hand + n_foot) / 6.0
+        target_limb = self.cfg_env.reach_target_limb
+        non_target_releases = sum(1 for l in released_limbs if l != target_limb)
+        if self.cfg_env.task_mode == "reach-one":
+            survival_reward = self.cfg_env.reach_stability_reward * weighted_contacts
+            time_penalty = self.cfg_env.reach_time_penalty
+        else:
+            survival_reward = self.cfg_env.hang_survival_reward * weighted_contacts
+            time_penalty = 0.0
+        release_penalty = self.cfg_env.hang_release_penalty * non_target_releases
+        energy_penalty = self.cfg_env.energy_penalty_coeff * ctrl_l2_sq
+        reward = (
+            survival_reward
+            - time_penalty
+            - release_penalty
+            - self.cfg_env.slip_penalty * slips
+            - self.cfg_env.body_intersection_penalty * body_intersections
+            - energy_penalty
+        )
+        info: dict[str, Any] = {
+            "task_mode": self.cfg_env.task_mode,
+            "height_reward": 0.0,
+            "upward_reward": 0.0,
+            "approach_reward": 0.0,
+            "survival_reward": float(survival_reward),
+            "match_bonus": float(match_bonus),
+            "high_grip_bonus": float(high_grip_bonus),
+            "release_penalty": float(release_penalty),
+            "time_penalty": float(time_penalty),
+            "energy_penalty": float(energy_penalty),
+        }
+
+        if self.cfg_env.task_mode == "reach-one":
+            target_hold = self.cfg_env.reach_target_hold
+            if target_limb is None or target_hold is None:
+                reward -= self.cfg_env.reach_timeout_penalty
+                info.update({
+                    "reach_target_limb": target_limb,
+                    "reach_target_hold": target_hold,
+                    "reach_target_dist": 0.0,
+                    "reach_caught": False,
+                    "reach_streak": 0,
+                    "outcome": "invalid_target",
+                })
+                info.update(self._info())
+                info["slips"] = slips
+                info["body_intersections"] = body_intersections
+                return self._obs(), float(reward), True, False, info
+
+            cur_target_dist = self._reach_target_dist()
+            target_progress = self.cfg_env.reach_distance_coeff * (
+                self._prev_reach_target_dist - cur_target_dist
+            )
+            self._prev_reach_target_dist = cur_target_dist
+            reward += target_progress
+            info["approach_reward"] = float(target_progress)
+            info["reach_target_limb"] = target_limb
+            info["reach_target_hold"] = target_hold
+            info["reach_target_dist"] = float(cur_target_dist)
+
+            if (
+                target_limb in released_limbs
+                and not self._reach_released_once
+                and n_hand >= 1
+            ):
+                reward += self.cfg_env.reach_release_bonus
+                self._reach_released_once = True
+
+            caught = (
+                target_limb is not None
+                and target_hold is not None
+                and self.world.on_hold(target_limb) == target_hold
+            )
+            if caught and not self._reach_caught:
+                reward += self.cfg_env.reach_target_bonus
+                self._reach_caught = True
+            self._reach_streak = self._reach_streak + 1 if caught else 0
+            info["reach_caught"] = bool(caught)
+            info["reach_streak"] = int(self._reach_streak)
+
+        terminated = False
+        truncated = False
+        pelvis_z = float(self.world.pelvis_pos()[2])
+        if pelvis_z < self.cfg_env.fall_z:
+            reward -= self.cfg_env.fall_penalty
+            terminated = True
+            info["outcome"] = "fell"
+        elif (
+            self.cfg_env.task_mode == "reach-one"
+            and self._reach_streak >= self.cfg_env.reach_stabilize_frames
+        ):
+            reward += self.cfg_env.reach_stabilize_bonus
+            terminated = True
+            info["outcome"] = "completed"
+        elif self._step_count >= self.cfg_env.max_steps:
+            if self.cfg_env.task_mode == "hang":
+                reward += self.cfg_env.reach_stabilize_bonus
+                terminated = True
+                info["outcome"] = "completed"
+            else:
+                reward -= self.cfg_env.reach_timeout_penalty
+                truncated = True
+                info["outcome"] = "timeout"
+
+        info.update(self._info())
+        info["slips"] = slips
+        info["body_intersections"] = body_intersections
         return self._obs(), float(reward), terminated, truncated, info
 
     # ─── Action handling ─────────────────────────────────────────────
@@ -679,6 +925,45 @@ class Climbing3DEnv(gym.Env):
             np.linalg.norm(fp - ref_pos) for fp in finish_positions
         ))
 
+    def _reach_target_dist(self) -> float:
+        limb = self.cfg_env.reach_target_limb
+        hold = self.cfg_env.reach_target_hold
+        if limb is None or hold is None or hold not in self.world._hold_meta_by_id:
+            return 0.0
+        tip = np.array(self.world.limb_tip_pos(limb), dtype=np.float64)
+        target = np.array(self.world._hold_meta_by_id[hold]["world_pos"], dtype=np.float64)
+        return float(np.linalg.norm(target - tip))
+
+    def _update_episode_progress_metrics(self) -> None:
+        self._episode_max_com_z = max(self._episode_max_com_z, float(self.world.com()[2]))
+        self._episode_max_pelvis_z = max(
+            self._episode_max_pelvis_z,
+            float(self.world.pelvis_pos()[2]),
+        )
+        current_grip_z = self._current_max_grip_z()
+        self._episode_max_grip_z_metric = max(
+            self._episode_max_grip_z_metric,
+            current_grip_z,
+        )
+        seed_grip_floor = self._seed_max_grip_z
+        for limb in LIMBS:
+            hid = self.world.on_hold(limb)
+            if hid is None:
+                continue
+            self._unique_holds_gripped.add(hid)
+            z = float(self.world._hold_meta_by_id[hid]["world_pos"][2])
+            if z > seed_grip_floor + 1e-6:
+                self._unique_higher_holds_gripped.add(hid)
+
+    def _is_limb_eligible_hold(self, limb: Limb, hid: str) -> bool:
+        try:
+            idx = self._hold_index[hid]
+        except KeyError:
+            return False
+        if limb in HAND_LIMBS:
+            return bool(self._hand_eligible[idx])
+        return bool(self._foot_eligible[idx])
+
     def _reach_dists(self) -> dict[str, float]:
         """For each ungripped limb: distance to its nearest eligible hold.
         Gripped limbs get distance 0.0 (no approach reward while anchored)."""
@@ -696,12 +981,14 @@ class Climbing3DEnv(gym.Env):
             candidates = [
                 m for m in self.world._hold_meta_by_id.values()
                 if m["hold_id"] not in gripped_ids
+                and self._is_limb_eligible_hold(limb, m["hold_id"])
                 and float(m["world_pos"][2]) > tip_z
             ]
             if not candidates:
                 candidates = [
                     m for m in self.world._hold_meta_by_id.values()
                     if m["hold_id"] not in gripped_ids
+                    and self._is_limb_eligible_hold(limb, m["hold_id"])
                 ]
             if not candidates:
                 result[limb] = 0.0
@@ -724,4 +1011,11 @@ class Climbing3DEnv(gym.Env):
             "limbs": {l: self.world.on_hold(l) for l in LIMBS},
             "step": self._step_count,
             "start_mode": self.cfg_env.start_mode,
+            "task_mode": self.cfg_env.task_mode,
+            "max_com_z": float(self._episode_max_com_z),
+            "max_pelvis_z": float(self._episode_max_pelvis_z),
+            "max_grip_z": float(self._episode_max_grip_z_metric),
+            "unique_holds_gripped": int(len(self._unique_holds_gripped)),
+            "unique_higher_holds_gripped": int(len(self._unique_higher_holds_gripped)),
+            "finish_streak": int(self._finish_streak),
         }

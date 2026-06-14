@@ -83,14 +83,14 @@ class RollingBestCheckpointCallback(BaseCallback):
                                  over the last ``window`` episodes hits a
                                  new high (with a small improvement floor
                                  so noise can't trigger constant rewrites)
-        model_best_height.zip    overwritten when a new max final_com_z is
-                                 observed across the run
+        model_best_height.zip    overwritten when a new episode max progress
+                                 height is observed across the run
 
     The two metrics tracked are intentional: rolling reward catches "the
-    overall policy is getting better", and max com_z catches "the climber
-    actually moved upward" — neither alone is sufficient (a perfect-hang
-    policy maxes reward but plateaus on height; a one-time lucky high
-    com_z spike doesn't mean the policy learned anything).
+    overall policy is getting better", and progress height catches "the
+    climber actually moved upward" — neither alone is sufficient (a
+    perfect-hang policy maxes reward but plateaus on higher holds; a one-time
+    lucky height spike doesn't mean the policy learned anything).
     """
 
     REWARD_IMPROVE_FLOOR = 1.0   # require ≥ +1.0 reward gain to overwrite
@@ -141,19 +141,27 @@ class RollingBestCheckpointCallback(BaseCallback):
                         if self.verbose:
                             print(f"[RollingBest] new best avg_rew={avg:+.2f} "
                                   f"at step {self.num_timesteps}")
-            # final_com_z lives in info['com'] (set by env._info()).
-            com = info.get("com") if isinstance(info, dict) else None
-            if com is not None:
+            # Prefer non-gameable route progress: highest gripped hold.  Fall
+            # back to max COM/final COM for older envs that don't report it.
+            z = None
+            if isinstance(info, dict):
                 try:
-                    z = float(com[2])
-                except (TypeError, IndexError):
+                    z = float(info.get("max_grip_z", info.get("max_com_z")))
+                except (TypeError, ValueError):
                     z = None
-                if z is not None and z > self._best_com_z + self.HEIGHT_IMPROVE_FLOOR:
-                    self._best_com_z = z
-                    self._save_atomic("model_best_height.zip")
-                    if self.verbose:
-                        print(f"[RollingBest] new max com_z={z:.3f} m "
-                              f"at step {self.num_timesteps}")
+                if z is None:
+                    com = info.get("com")
+                    if com is not None:
+                        try:
+                            z = float(com[2])
+                        except (TypeError, IndexError):
+                            z = None
+            if z is not None and z > self._best_com_z + self.HEIGHT_IMPROVE_FLOOR:
+                self._best_com_z = z
+                self._save_atomic("model_best_height.zip")
+                if self.verbose:
+                    print(f"[RollingBest] new best progress_z={z:.3f} m "
+                          f"at step {self.num_timesteps}")
         return True
 
     def _on_training_end(self) -> None:
@@ -204,6 +212,88 @@ class RollingBestCheckpointCallback(BaseCallback):
                     os.remove(tmp_path)
             except OSError:
                 pass
+
+class ContinuousTaskCurriculumCallback(BaseCallback):
+    """Advance continuous task_mode based on rolling completion rate.
+
+    This is intentionally orthogonal to wall-difficulty curriculum.  It keeps
+    the action space continuous-joint for every stage and only changes the
+    reward/termination target exposed through EnvConfig.task_mode.
+    """
+
+    def __init__(
+        self,
+        stages: list[str],
+        *,
+        window: int = 20,
+        threshold: float = 0.80,
+        min_episodes: int = 10,
+        eval_env=None,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        clean = [s.strip() for s in stages if s.strip()]
+        if not clean:
+            raise ValueError("ContinuousTaskCurriculumCallback requires at least one stage")
+        for stage in clean:
+            if stage not in ("hang", "reach-one", "climb"):
+                raise ValueError(f"unknown task curriculum stage: {stage}")
+        self._stages = clean
+        self._window = max(1, int(window))
+        self._threshold = float(threshold)
+        self._min_episodes = max(1, int(min_episodes))
+        self._stage_idx = 0
+        self._history: collections.deque[bool] = collections.deque(maxlen=self._window)
+        self._eval_env = eval_env
+
+    @property
+    def current_stage(self) -> str:
+        return self._stages[self._stage_idx]
+
+    def _on_training_start(self) -> None:
+        self._apply_stage(self.current_stage)
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", None)
+        if dones is None:
+            dones = [False] * len(infos)
+        for info, done in zip(infos, dones):
+            if not done or not isinstance(info, dict):
+                continue
+            if info.get("task_mode") != self.current_stage:
+                continue
+            self._history.append(info.get("outcome") == "completed")
+            self._maybe_advance()
+        return True
+
+    def _maybe_advance(self) -> None:
+        if self._stage_idx >= len(self._stages) - 1:
+            return
+        if len(self._history) < min(self._window, self._min_episodes):
+            return
+        rate = sum(self._history) / len(self._history)
+        if rate < self._threshold:
+            return
+        old = self.current_stage
+        self._stage_idx += 1
+        self._history.clear()
+        new = self.current_stage
+        self._apply_stage(new)
+        if self.verbose:
+            print(
+                f"[TaskCurriculum] advanced {old} -> {new} "
+                f"at step {self.num_timesteps} (success_rate={rate:.2f})"
+            )
+
+    def _apply_stage(self, stage: str) -> None:
+        try:
+            self.training_env.env_method("set_task_mode", stage)
+            if self._eval_env is not None and hasattr(self._eval_env, "set_task_mode"):
+                self._eval_env.set_task_mode(stage)
+        except Exception as e:  # noqa: BLE001
+            if self.verbose:
+                print(f"[TaskCurriculum] failed to set task_mode={stage}: {e}")
 
 
 class VideoRolloutCallback(BaseCallback):
@@ -307,7 +397,16 @@ class VideoRolloutCallback(BaseCallback):
                     return
 
         while not done and steps < self._max_frames:
-            action, _ = self.model.predict(obs, deterministic=True)
+            policy_obs = obs
+            # If training used VecNormalize, the fresh eval env emits raw obs.
+            # Feed the policy normalized obs so videos reflect the trained model.
+            try:
+                from stable_baselines3.common.vec_env import VecNormalize as _VN
+                if isinstance(self.training_env, _VN):
+                    policy_obs = self.training_env.normalize_obs(np.array([obs]))[0]
+            except Exception:
+                policy_obs = obs
+            action, _ = self.model.predict(policy_obs, deterministic=True)
             obs, _, terminated, truncated, _ = env.step(action)
             renderer.update_scene(world.data, camera=cam)
             frames.append(renderer.render().copy())

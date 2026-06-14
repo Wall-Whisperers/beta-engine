@@ -1,9 +1,9 @@
 """Observation builder for the 3D climbing environment.
 
 The observation is wall-size-independent: it always reports K=8 nearest holds
-in the climber's local frame plus per-limb goal vectors to the (single)
-finish hold. This makes the same policy applicable to MoonBoard 11×18, the
-generic editor walls, and any synthetic wall.
+in the climber's local frame, per-limb nearest-hold goal vectors, finish
+distance, and continuous-task hints. This makes the same policy applicable to
+MoonBoard 11×18, the generic editor walls, and any synthetic wall.
 
 Layout (fixed dimension, regardless of wall size):
 
@@ -20,6 +20,9 @@ Layout (fixed dimension, regardless of wall size):
     [..  : .. + 12)     per-limb anchor/goal vector    (12)
                           zero if gripped, else (nearest_hold_world - tip_world)
     [..  : .. + 1)      euclid dist (highest gripped hand → nearest finish)
+    [..  : .. + 3)      task mode one-hot [hang, reach-one, climb]
+    [..  : .. + 4)      reach-one target limb one-hot [LH,RH,LF,RF]
+    [..  : .. + 12)     reach-one per-limb target vectors (target - tip)
 
 Per-stream NaN/Inf guard: each stream is checked at the end and replaced
 with zeros, with a one-line warning printed on first occurrence (so it does
@@ -58,6 +61,7 @@ def observation_dim(world: "Climb3DWorld") -> int:
         + K_NEAREST_HOLDS * HOLD_OBS_DIM
         + 4 * 3                  # anchor/goal vectors per limb
         + 1                      # finish distance scalar
+        + 3 + 4 + 4 * 3          # task one-hot + target limb + task target vectors
     )
 
 
@@ -74,6 +78,22 @@ def _guard(arr: np.ndarray, name: str) -> np.ndarray:
             )
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     return arr
+
+
+def _is_official_route_meta(meta: dict) -> bool:
+    return bool(
+        meta.get("is_start")
+        or meta.get("is_finish")
+        or str(meta.get("color", "")).lower() != "#888888"
+    )
+
+
+def _eligible_for_limb(meta: dict, limb: str, env_config: "EnvConfig") -> bool:
+    if getattr(env_config, "official_route_only", False) and not _is_official_route_meta(meta):
+        return False
+    if limb in ("LH", "RH") and bool(meta.get("is_foothold_only", False)):
+        return False
+    return True
 
 
 def _rot6d_from_quat(q_wxyz: np.ndarray) -> np.ndarray:
@@ -99,8 +119,6 @@ def build_observation(world: "Climb3DWorld", env_config: "EnvConfig") -> np.ndar
     Returns:
         float32 1-D ndarray of length `observation_dim(world)`.
     """
-    del env_config  # reserved for future use
-
     d = world.data
     m = world.model
     n_act = int(m.nu)
@@ -198,12 +216,14 @@ def build_observation(world: "Climb3DWorld", env_config: "EnvConfig") -> np.ndar
         candidates = [
             m for m in all_hold_metas
             if m["hold_id"] not in currently_gripped_ids
+            and _eligible_for_limb(m, limb, env_config)
             and float(m["world_pos"][2]) > tip_z
         ]
         if not candidates:
             candidates = [
                 m for m in all_hold_metas
                 if m["hold_id"] not in currently_gripped_ids
+                and _eligible_for_limb(m, limb, env_config)
             ]
         if not candidates:
             continue  # nowhere to reach — leave zero
@@ -240,5 +260,34 @@ def build_observation(world: "Climb3DWorld", env_config: "EnvConfig") -> np.ndar
     )
     stream4 = _guard(finish_dist, "finish-dist")
 
-    obs = np.concatenate([stream1, stream2, stream3, stream4]).astype(np.float32)
+    # ── Stream 5 — task hint / reach-one target ────────────────────────
+    # The same continuous-joint policy is used for all tasks, so expose the
+    # active curriculum mode and (for reach-one) a stable target vector.  The
+    # nearest-hold stream above is useful but changes with the limb pose; this
+    # fixed target tells the policy which limb/hold the sub-task is asking for.
+    task_mode = getattr(env_config, "task_mode", "climb")
+    task_onehot = np.zeros(3, dtype=np.float64)
+    if task_mode == "hang":
+        task_onehot[0] = 1.0
+    elif task_mode == "reach-one":
+        task_onehot[1] = 1.0
+    else:
+        task_onehot[2] = 1.0
+
+    target_limb = getattr(env_config, "reach_target_limb", None)
+    target_hold = getattr(env_config, "reach_target_hold", None)
+    target_limb_onehot = np.zeros(4, dtype=np.float64)
+    target_vecs = np.zeros(12, dtype=np.float64)
+    if target_limb in _LIMBS and target_hold in world._hold_meta_by_id:
+        li = _LIMBS.index(target_limb)
+        target_limb_onehot[li] = 1.0
+        target_pos = np.array(world._hold_meta_by_id[target_hold]["world_pos"], dtype=np.float64)
+        tip = np.array(world.limb_tip_pos(target_limb), dtype=np.float64)
+        target_vecs[li * 3: li * 3 + 3] = target_pos - tip
+    stream5 = _guard(
+        np.concatenate([task_onehot, target_limb_onehot, target_vecs]),
+        "task-hint",
+    )
+
+    obs = np.concatenate([stream1, stream2, stream3, stream4, stream5]).astype(np.float32)
     return obs

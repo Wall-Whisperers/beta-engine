@@ -44,10 +44,12 @@ What we still **don't** have:
 
 - A policy that completes any problem with > 0% success.
 - An episode long enough to climb (see 0.1 — this is the headline bug).
-- A first task the agent can actually solve from random init (curriculum
-  "hang" mode does not exist yet).
+- A first task the agent can actually solve from random init. `EnvConfig.task_mode`
+  now supports continuous-only `hang` and `reach-one`; `--task-curriculum` can
+  advance `hang → reach-one → climb` automatically by completion rate.
 - Obs/reward normalization, or any dense signal toward the next hold.
-- A success-rate eval harness on a held-out split.
+- A broader held-out eval harness for MoonBoard splits. A single-wall deterministic
+  evaluator now exists at `python -m sim3d.evaluate`.
 
 Honest framing: the simulator is solid; the **training loop is configured
 in a way that cannot produce a climb**, and the reward landscape has no
@@ -120,19 +122,43 @@ below 2 contacts. (a) is the cheapest and should be done alongside A3.
 
 ### A1. Curriculum: start with "hang", then "reach-one"
 
-Add `EnvConfig.task_mode ∈ {hang, reach-one, climb}` and gate the reward:
+`EnvConfig.task_mode ∈ {hang, reach-one, climb}` gates the continuous-control reward.
+Use `python -m sim3d.train --task-curriculum ...` to advance stages automatically:
 
 - **hang** — from the 4-grip seed, reward `+1 per step survived, −50 on
   fall`, episode caps at N seconds. Teaches which grip intents keep welds
   engaged and how to balance joint torque against gravity. Solvable from
   near-random init, unlike the full climb.
-- **reach-one** — hang, then move one hand to a single target hold for a
-  big bonus. Teaches release→reach→regrip.
+- **reach-one** — hang, then move one hand to a single *new higher* hand hold
+  within a local reach radius for catch + stabilization bonuses. The target
+  filter is deliberately strict: if the wall cannot provide a valid higher
+  local target, the episode is marked invalid instead of training lateral or
+  downward catches that look successful in the subtask but do not teach climbing
+  progress. Teaches release→reach→regrip without using `discrete-move`.
 - **climb** — the current full reward.
 
 A policy that solves "hang 10 s" is a far better init than random weights.
-This is the single most important new capability — without an achievable
-first task the reward is flat and PPO converges to "do nothing."
+This is the single most important capability — without an achievable first
+task the reward is flat and PPO converges to "do nothing."
+
+#### A1 adversarial review notes
+
+The dangerous failure mode for `reach-one` is not a crash; it is a policy that
+"passes" the subtask by learning a proxy. Current guardrails:
+
+- no-catch hanging is negative-EV (`reach_stability_reward` is tiny, with
+  per-step time pressure and a timeout penalty);
+- approach shaping is signed potential shaping, so oscillating away/toward the
+  target cannot repeatedly collect only positive deltas;
+- default target selection requires an unoccupied, hand-eligible, higher hold
+  within `--reach-max-target-dist`;
+- `--allow-lateral-reach-targets` exists only as a sparse-wall/debug escape
+  hatch and should not be used for real training runs.
+
+Still not guaranteed: PPO can fail on contact timing, some walls may have no
+valid local higher target from the seed pose, and solving local reaches does not
+automatically solve route sequencing. Reject runs where reward improves but
+`max_grip_z` and `unique_higher_holds_gripped` stay flat.
 
 ### A2. Dense potential-based shaping toward the next hold (NEW)
 
