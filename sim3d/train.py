@@ -65,8 +65,14 @@ class TrainConfig:
     batch_size: int = 64
     gamma: float = 0.99
     seed: int = 42
-    move_mode: str = "reach"            # snap is faster but less realistic
+    move_mode: str = "reach"            # legacy discrete-move only; continuous training does not use it
     start_mode: str = "seed"            # seed | ground-reach
+    task_mode: str = "climb"            # hang | reach-one | climb
+    task_curriculum: bool = False
+    task_curriculum_stages: str = "hang,reach-one,climb"
+    task_curriculum_window: int = 20
+    task_curriculum_threshold: float = 0.80
+    task_curriculum_min_episodes: int = 10
     move_frames: int = 24               # shorter for snap, longer for reach
     # Continuous-joint control runs at ~7.8 Hz, so 30 steps = 3.84 s — far
     # too short to climb (a MoonBoard problem takes 10-60 s). 1000 ≈ 128 s.
@@ -144,6 +150,19 @@ class TrainConfig:
     # Restore fall penalty to 50 — reducing it to 30 made short jackpot
     # episodes too cheap. Falling must cost more than a single grip bonus.
     fall_penalty: float = 50.0
+    # Continuous-only curriculum task coefficients.
+    hang_survival_reward: float = 1.0
+    hang_release_penalty: float = 2.0
+    reach_target_bonus: float = 100.0
+    reach_stabilize_bonus: float = 100.0
+    reach_stabilize_frames: int = 12
+    reach_release_bonus: float = 5.0
+    reach_distance_coeff: float = 25.0
+    reach_stability_reward: float = 0.05
+    reach_time_penalty: float = 0.02
+    reach_timeout_penalty: float = 25.0
+    reach_max_target_dist: float = 1.25
+    reach_require_higher_target: bool = True
     # Warm-start: path to an existing model.zip whose policy weights are
     # copied into the new model at construction. Hyperparameters (lr,
     # clip_range, ent_coef, etc.) and reward coefficients come from the
@@ -212,8 +231,10 @@ class _EpisodeStatsCallback:
                     outer._writer = csv.writer(outer._fh)
                     outer._writer.writerow([
                         "episode", "total_steps", "reward", "length",
-                        "outcome", "final_com_z", "n_slips", "body_intersections",
-                        "curriculum_difficulty",
+                        "outcome", "task_mode", "final_com_z", "max_com_z",
+                        "max_pelvis_z", "max_grip_z", "unique_holds_gripped",
+                        "unique_higher_holds_gripped", "finish_streak",
+                        "n_slips", "body_intersections", "curriculum_difficulty",
                     ])
 
             def _on_step(self) -> bool:
@@ -241,7 +262,14 @@ class _EpisodeStatsCallback:
                         round(float(ep.get("r", 0.0)), 3),
                         int(ep.get("l", 0)),
                         outcome,
+                        info.get("task_mode", "?"),
                         round(float(com[2]), 3),
+                        round(float(info.get("max_com_z", com[2])), 3),
+                        round(float(info.get("max_pelvis_z", 0.0)), 3),
+                        round(float(info.get("max_grip_z", 0.0)), 3),
+                        int(info.get("unique_holds_gripped", 0)),
+                        int(info.get("unique_higher_holds_gripped", 0)),
+                        int(info.get("finish_streak", 0)),
                         int(info.get("slips", 0)),
                         int(info.get("body_intersections", 0)),
                         round(float(info.get("curriculum_difficulty", 0.0)), 4),
@@ -290,6 +318,7 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
     env_cfg = EnvConfig(
         move_mode=cfg.move_mode,
         start_mode=cfg.start_mode,
+        task_mode=cfg.task_mode,
         move_frames=cfg.move_frames,
         max_steps=cfg.max_episode_steps,
         enable_slip=cfg.enable_slip,
@@ -306,6 +335,18 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
         hold_match_bonus=cfg.hold_match_bonus,
         new_high_grip_bonus=cfg.new_high_grip_bonus,
         fall_penalty=cfg.fall_penalty,
+        hang_survival_reward=cfg.hang_survival_reward,
+        hang_release_penalty=cfg.hang_release_penalty,
+        reach_target_bonus=cfg.reach_target_bonus,
+        reach_stabilize_bonus=cfg.reach_stabilize_bonus,
+        reach_stabilize_frames=cfg.reach_stabilize_frames,
+        reach_release_bonus=cfg.reach_release_bonus,
+        reach_distance_coeff=cfg.reach_distance_coeff,
+        reach_stability_reward=cfg.reach_stability_reward,
+        reach_time_penalty=cfg.reach_time_penalty,
+        reach_timeout_penalty=cfg.reach_timeout_penalty,
+        reach_max_target_dist=cfg.reach_max_target_dist,
+        reach_require_higher_target=cfg.reach_require_higher_target,
     )
 
     def _factory():
@@ -364,6 +405,18 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
 def train(cfg: TrainConfig) -> Path:
     sb3, BaseCallback, DummyVecEnv, SubprocVecEnv = _require_sb3()
     from stable_baselines3.common.monitor import Monitor
+
+    if cfg.start_mode != "seed":
+        raise SystemExit(
+            "continuous-only training requires --start-mode seed; "
+            "ground-reach uses the legacy scripted reach helper."
+        )
+    if cfg.task_curriculum:
+        first_stage = next(
+            (s.strip() for s in cfg.task_curriculum_stages.split(",") if s.strip()),
+            "hang",
+        )
+        cfg.task_mode = first_stage
 
     if cfg.run_id is None:
         cfg.run_id = time.strftime("run_%Y%m%d_%H%M%S")
@@ -499,7 +552,14 @@ def train(cfg: TrainConfig) -> Path:
         FirstMidLastCheckpointCallback,
         RollingBestCheckpointCallback,
         VideoRolloutCallback,
+        ContinuousTaskCurriculumCallback,
     )
+    eval_env = None
+    if cfg.video_freq > 0:
+        # Use a fresh env (not the vec_env) for deterministic eval rollouts.
+        eval_env = factory()
+        eval_env.reset(seed=cfg.seed + 9999)
+
     callbacks = [
         csv_cb,
         FirstMidLastCheckpointCallback(
@@ -515,10 +575,18 @@ def train(cfg: TrainConfig) -> Path:
             verbose=1,
         ),
     ]
-    if cfg.video_freq > 0:
-        # Use a fresh env (not the vec_env) for deterministic eval rollouts.
-        eval_env = factory()
-        eval_env.reset(seed=cfg.seed + 9999)
+    if cfg.task_curriculum:
+        callbacks.append(
+            ContinuousTaskCurriculumCallback(
+                [s.strip() for s in cfg.task_curriculum_stages.split(",")],
+                window=cfg.task_curriculum_window,
+                threshold=cfg.task_curriculum_threshold,
+                min_episodes=cfg.task_curriculum_min_episodes,
+                eval_env=eval_env,
+                verbose=1,
+            )
+        )
+    if cfg.video_freq > 0 and eval_env is not None:
         callbacks.append(
             VideoRolloutCallback(
                 eval_env=eval_env,
@@ -568,9 +636,17 @@ def train(cfg: TrainConfig) -> Path:
         f" --height {cfg.height_cm}"
         f" --wingspan {cfg.wingspan_cm}"
         f" --mass {cfg.mass_kg}"
+        f" --task-mode {cfg.task_mode}"
         f" --move-mode {cfg.move_mode}"
         f" --play-frames {cfg.move_frames}"
     )
+    if cfg.task_curriculum:
+        print(
+            "  task curriculum: "
+            f"{cfg.task_curriculum_stages} "
+            f"(window={cfg.task_curriculum_window}, "
+            f"threshold={cfg.task_curriculum_threshold})"
+        )
     print(f"  replay:       {replay_cmd}")
     return out_dir / "model.zip"
 
@@ -616,7 +692,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--move-mode", default="reach", choices=("snap", "reach", "dyno"))
     p.add_argument("--start-mode", default="seed", choices=("seed", "ground-reach"),
-                   help="seed starts welded on route holds; ground-reach starts on the floor and reaches to start hands.")
+                   help="seed starts welded on route holds; ground-reach is legacy/debug only and not recommended for training.")
+    p.add_argument("--task-mode", default="climb", choices=("hang", "reach-one", "climb"),
+                   help="Continuous-only task curriculum stage. Train hang → reach-one → climb.")
+    p.add_argument("--task-curriculum", action="store_true",
+                   help="Automatically advance continuous task_mode by success rate (default stages: hang,reach-one,climb).")
+    p.add_argument("--task-curriculum-stages", default="hang,reach-one,climb",
+                   help="Comma-separated stages for --task-curriculum.")
+    p.add_argument("--task-curriculum-window", type=int, default=20,
+                   help="Rolling episode window for automatic task advancement.")
+    p.add_argument("--task-curriculum-threshold", type=float, default=0.80,
+                   help="Completion rate required to advance to the next task stage.")
+    p.add_argument("--task-curriculum-min-episodes", type=int, default=10,
+                   help="Minimum episodes in a stage before automatic advancement.")
     p.add_argument("--move-frames", type=int, default=24)
     p.add_argument("--episode-steps", type=int, default=1000,
                    help="Max env steps per episode. Continuous control is ~7.8 Hz, "
@@ -658,14 +746,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Initial log-std for the Gaussian policy. -1.5 -> std~0.22, "
                         "keeps early actions small so grips aren't randomly dropped on step 1.")
     p.add_argument("--grip-deadband", type=float, default=0.5,
-                   help="Grip intent deadband. Intents in (-db, +db) hold current grip state. "
-                        "At db=0.5 + log_std_init=-1.5 (std≈0.22), release is a 2.3σ event "
-                        "(P≈1%%) — deliberate, not random noise.")
+                   help="Asymmetric release deadband. intent > 0 tries to engage; "
+                        "intent < -db releases. At db=0.5 + log_std_init=-1.5 "
+                        "release is deliberate, not random noise.")
     p.add_argument("--clip-range", type=float, default=0.2,
                    help="PPO clip range. Lower (0.1) when clip_fraction is high (>0.4).")
-    p.add_argument("--ent-coef", type=float, default=0.01,
-                   help="PPO entropy coefficient. 0.01 encourages grip-release exploration; "
-                        "0.005 converges to 'hang still' local minimum.")
+    p.add_argument("--ent-coef", type=float, default=0.005,
+                   help="PPO entropy coefficient. 0.005 keeps exploration while preserving hang stability; "
+                        "higher values can cause noisy grip releases.")
     p.add_argument("--n-epochs", type=int, default=10,
                    help="PPO optimisation epochs per rollout. Default SB3=10.")
     p.add_argument("--finish-approach-coeff", type=float, default=100.0,
@@ -673,9 +761,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "Full 2 m route → +200 total at coeff=100. Primary dense signal; "
                         "use ≥ 50. Default 100 (CLAUDE.md recommended).")
     p.add_argument("--reach-approach-coeff", type=float, default=20.0,
-                   help="Per-step reward for each free limb CLOSING distance to its "
-                        "nearest eligible hold (one-sided: no penalty for retreating). "
-                        "Dense gradient for learning to reach without swamping other signals.")
+                   help="Signed potential reward for each free limb reducing distance to its "
+                        "nearest eligible hold; moving away costs symmetrically to prevent oscillation farming.")
     p.add_argument("--survival-bonus-coeff", type=float, default=0.01,
                    help="Per-step reward: coeff * weighted_grip_fraction "
                         "(hands 2x, feet 1x; capped at coeff). Must be ≤ 0.02. "
@@ -706,6 +793,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--energy-penalty-coeff", type=float, default=0.001,
                    help="Per-step energy penalty: coeff * sum(ctrl^2). "
                         "Default 0.001 (was 0.005 which swamped the height signal).")
+    p.add_argument("--hang-survival-reward", type=float, default=1.0,
+                   help="Per-step weighted contact reward for task-mode=hang/reach-one.")
+    p.add_argument("--hang-release-penalty", type=float, default=2.0,
+                   help="Penalty for releasing non-target limbs in hang/reach-one.")
+    p.add_argument("--reach-target-bonus", type=float, default=100.0,
+                   help="One-time bonus for catching the reach-one target hold.")
+    p.add_argument("--reach-stabilize-bonus", type=float, default=100.0,
+                   help="Bonus for stabilizing after reach-one catch; also hang success bonus.")
+    p.add_argument("--reach-stabilize-frames", type=int, default=12,
+                   help="Consecutive target-grip frames required to complete reach-one.")
+    p.add_argument("--reach-release-bonus", type=float, default=5.0,
+                   help="Small one-time bonus for releasing the selected reach-one limb while another hand remains attached.")
+    p.add_argument("--reach-distance-coeff", type=float, default=25.0,
+                   help="Potential shaping coefficient toward the fixed reach-one target.")
+    p.add_argument("--reach-stability-reward", type=float, default=0.05,
+                   help="Small per-step contact stability reward for reach-one; keep tiny to avoid hang-still farming.")
+    p.add_argument("--reach-time-penalty", type=float, default=0.02,
+                   help="Per-step time penalty in reach-one so no-catch hanging is not profitable.")
+    p.add_argument("--reach-timeout-penalty", type=float, default=25.0,
+                   help="Timeout penalty in reach-one when target catch/stabilization did not happen.")
+    p.add_argument("--reach-max-target-dist", type=float, default=1.25,
+                   help="Maximum initial hand-to-target distance for reach-one target selection.")
+    p.add_argument("--allow-lateral-reach-targets", action="store_true",
+                   help="Allow reach-one to select non-higher hand targets when debugging sparse walls. Disabled by default.")
     p.add_argument("--curriculum", action="store_true",
                    help="Train on procedurally generated walls with automatic difficulty scheduling.")
     p.add_argument("--curriculum-start-difficulty", type=float, default=0.0,
@@ -751,6 +862,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         seed=args.seed,
         move_mode=args.move_mode,
         start_mode=args.start_mode,
+        task_mode=args.task_mode,
+        task_curriculum=args.task_curriculum,
+        task_curriculum_stages=args.task_curriculum_stages,
+        task_curriculum_window=args.task_curriculum_window,
+        task_curriculum_threshold=args.task_curriculum_threshold,
+        task_curriculum_min_episodes=args.task_curriculum_min_episodes,
         move_frames=args.move_frames,
         max_episode_steps=args.episode_steps,
         enable_slip=not args.no_slip,
@@ -780,6 +897,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         new_high_grip_bonus=args.new_high_grip_bonus,
         fall_penalty=args.fall_penalty,
         energy_penalty_coeff=args.energy_penalty_coeff,
+        hang_survival_reward=args.hang_survival_reward,
+        hang_release_penalty=args.hang_release_penalty,
+        reach_target_bonus=args.reach_target_bonus,
+        reach_stabilize_bonus=args.reach_stabilize_bonus,
+        reach_stabilize_frames=args.reach_stabilize_frames,
+        reach_release_bonus=args.reach_release_bonus,
+        reach_distance_coeff=args.reach_distance_coeff,
+        reach_stability_reward=args.reach_stability_reward,
+        reach_time_penalty=args.reach_time_penalty,
+        reach_timeout_penalty=args.reach_timeout_penalty,
+        reach_max_target_dist=args.reach_max_target_dist,
+        reach_require_higher_target=not args.allow_lateral_reach_targets,
         curriculum=args.curriculum,
         curriculum_start_difficulty=args.curriculum_start_difficulty,
         curriculum_max_difficulty=args.curriculum_max_difficulty,

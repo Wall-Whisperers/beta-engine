@@ -84,6 +84,8 @@ def replay_command_from_run_config(model_path: str) -> str | None:
         cmd += f" --move-mode {cfg['move_mode']}"
     if cfg.get("start_mode") and cfg.get("start_mode") != "seed":
         cmd += f" --start-mode {cfg['start_mode']}"
+    if cfg.get("task_mode") and cfg.get("task_mode") != "climb":
+        cmd += f" --task-mode {cfg['task_mode']}"
     if cfg.get("move_frames"):
         cmd += f" --play-frames {cfg['move_frames']}"
     return cmd
@@ -183,7 +185,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--start-mode", default="seed", choices=("seed", "ground-reach"),
-        help="seed = start welded on route holds; ground-reach = start on floor and reach to start hand holds.",
+        help="seed = start welded on route holds; ground-reach is legacy/debug only.",
+    )
+    p.add_argument(
+        "--task-mode", default="climb", choices=("hang", "reach-one", "climb"),
+        help="Continuous policy task mode to replay/smoke-test.",
     )
     p.add_argument("--height", type=float, default=175.0,
                    help="Climber total height in cm.")
@@ -324,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_steps=30,
                 move_mode=args.move_mode,
                 start_mode=args.start_mode,
+                task_mode=args.task_mode,
                 enable_slip=args.slip,
                 official_route_only=args.moonboard_full_board,
             ),
@@ -352,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_steps=30,
                 move_mode=args.move_mode,
                 start_mode=args.start_mode,
+                task_mode=args.task_mode,
                 move_frames=args.play_frames,
                 enable_slip=args.slip,
                 official_route_only=args.moonboard_full_board,

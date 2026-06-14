@@ -122,6 +122,13 @@ class MoonboardClimbing3DEnv(gym.Env):
         ).__dict__
         return obs, reward, terminated, truncated, info
 
+    def set_task_mode(self, mode: str) -> None:
+        self.cfg_env.task_mode = mode
+        self.cfg_env.reach_target_limb = None
+        self.cfg_env.reach_target_hold = None
+        if hasattr(self._env, "set_task_mode"):
+            self._env.set_task_mode(mode)
+
     def render(self):
         return self._env.render()
 

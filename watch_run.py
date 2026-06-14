@@ -22,40 +22,40 @@ STALE_COM_STEPS     = 100_000  # steps without com_z improvement = stagnation
 RE_EP_LEN  = re.compile(r"ep_len_mean\s*\|\s*([\d.]+)")
 RE_EP_REW  = re.compile(r"ep_rew_mean\s*\|\s*(-?[\d.]+)")
 RE_STEPS   = re.compile(r"total_timesteps\s*\|\s*([\d]+)")
-RE_COM_Z   = re.compile(r"new max com_z=([\d.]+) m at step (\d+)")
+RE_COM_Z   = re.compile(r"new (?:max com_z|best progress_z)=([\d.]+) m at step (\d+)")
 RE_AVG_REW = re.compile(r"new best avg_rew=(-?[\d.]+) at step (\d+)")
 
 def fmt(val, width=8):
     return str(val).rjust(width)
 
-def check(ep_len, ep_rew, steps, max_com_z, max_com_step):
+def check(ep_len, ep_rew, steps, progress_z, max_com_step):
     alerts = []
     steps_since_com = steps - max_com_step
 
     if ep_len > HANG_STILL_EP_LEN and steps_since_com > STALE_COM_STEPS:
         alerts.append(
             f"HANG-STILL EXPLOIT? ep_len={ep_len:.0f} but com_z stuck at "
-            f"{max_com_z:.3f}m for {steps_since_com:,} steps"
+            f"{progress_z:.3f}m for {steps_since_com:,} steps"
         )
 
-    if ep_rew > FARMING_REW and max_com_z < FARMING_COM_MAX:
+    if ep_rew > FARMING_REW and progress_z < FARMING_COM_MAX:
         alerts.append(
             f"REWARD FARMING? ep_rew={ep_rew:.0f} but max com_z only "
-            f"{max_com_z:.3f}m (agent not actually climbing)"
+            f"{progress_z:.3f}m (agent not actually climbing)"
         )
 
     return alerts
 
 def main():
     print(f"Watching: {LOG_PATH}")
-    print(f"NOTE: max_com_z = COM at episode termination (fall height), not peak height.")
+    print("NOTE: progress_z prefers max gripped-hold height; older logs may report max COM.")
     print(f"Thresholds — hang-still: ep_len>{HANG_STILL_EP_LEN} + no com_z gain in {STALE_COM_STEPS:,} steps")
-    print(f"            farming:    ep_rew>{FARMING_REW} + max_com_z<{FARMING_COM_MAX}m")
+    print(f"            farming:    ep_rew>{FARMING_REW} + progress_z<{FARMING_COM_MAX}m")
     print("-" * 60)
 
     ep_len = ep_rew = 0.0
     steps = max_com_step = 0
-    max_com_z = 0.0
+    progress_z = 0.0
     last_reported_steps = -1
 
     with open(LOG_PATH, "r") as f:
@@ -64,12 +64,12 @@ def main():
             m = RE_COM_Z.search(line)
             if m:
                 z, s = float(m.group(1)), int(m.group(2))
-                if z > max_com_z:
-                    max_com_z, max_com_step = z, s
+                if z > progress_z:
+                    progress_z, max_com_step = z, s
             m = RE_STEPS.search(line)
             if m:
                 steps = int(m.group(1))
-        print(f"(caught up to step {steps:,} — max_com_z so far: {max_com_z:.3f}m at step {max_com_step:,})")
+        print(f"(caught up to step {steps:,} — progress_z so far: {progress_z:.3f}m at step {max_com_step:,})")
         print("(tailing new output...)\n")
 
         while True:
@@ -93,12 +93,12 @@ def main():
                 steps = int(m.group(1))
                 if steps != last_reported_steps:
                     last_reported_steps = steps
-                    alerts = check(ep_len, ep_rew, steps, max_com_z, max_com_step)
+                    alerts = check(ep_len, ep_rew, steps, progress_z, max_com_step)
                     status = (
                         f"[{steps:>9,} steps] "
                         f"ep_len={ep_len:6.1f}  "
                         f"ep_rew={ep_rew:8.1f}  "
-                        f"max_com_z={max_com_z:.3f}m  "
+                        f"progress_z={progress_z:.3f}m  "
                         f"(no gain for {steps - max_com_step:,} steps)"
                     )
                     print(status)
@@ -109,10 +109,10 @@ def main():
             m = RE_COM_Z.search(line)
             if m:
                 z, s = float(m.group(1)), int(m.group(2))
-                if z > max_com_z:
-                    max_com_z = z
+                if z > progress_z:
+                    progress_z = z
                     max_com_step = s
-                    print(f"  >> new max com_z={max_com_z:.3f}m at step {max_com_step:,}")
+                    print(f"  >> new max com_z={progress_z:.3f}m at step {max_com_step:,}")
                     sys.stdout.flush()
 
 if __name__ == "__main__":

@@ -173,6 +173,13 @@ class CurriculumEnv(gym.Env):
         info.update(self._curriculum_info())
         return obs, reward, terminated, truncated, info
 
+    def set_task_mode(self, mode: str) -> None:
+        self._env_cfg.task_mode = mode
+        self._env_cfg.reach_target_limb = None
+        self._env_cfg.reach_target_hold = None
+        if hasattr(self._env, "set_task_mode"):
+            self._env.set_task_mode(mode)
+
     def render(self) -> Optional[dict]:
         return self._env.render()
 
