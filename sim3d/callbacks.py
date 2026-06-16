@@ -290,6 +290,20 @@ class VideoRolloutCallback(BaseCallback):
         except Exception:
             return
 
+        # The policy was trained on VecNormalize-normalised observations, so
+        # the eval env's raw obs must be normalised with the SAME running stats
+        # before predict() — otherwise the policy gets out-of-distribution inputs
+        # and flails, making every training video a misleading record of a
+        # competent policy. (record_video / --play already do this; this callback
+        # was the one place that didn't.) normalize_obs is read-only on the
+        # running stats, so reading them mid-training is safe.
+        vec_norm = self.model.get_vec_normalize_env()
+
+        def _norm(o):
+            if vec_norm is None:
+                return o
+            return vec_norm.normalize_obs(np.asarray(o, dtype=np.float32))
+
         frames: list[np.ndarray] = []
         obs, _ = env.reset()
         done = False
@@ -307,7 +321,7 @@ class VideoRolloutCallback(BaseCallback):
                     return
 
         while not done and steps < self._max_frames:
-            action, _ = self.model.predict(obs, deterministic=True)
+            action, _ = self.model.predict(_norm(obs), deterministic=True)
             obs, _, terminated, truncated, _ = env.step(action)
             renderer.update_scene(world.data, camera=cam)
             frames.append(renderer.render().copy())

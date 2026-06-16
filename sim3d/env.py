@@ -79,10 +79,13 @@ class EnvConfig:
     hwm_height_scale: float = 0.0                # × max(0, com_z − max_com_z)
     hold_match_bonus: float = 10.0               # rising-edge first-touch
     # Bonus paid when a grip event raises the episode's max gripped-hold z.
-    # Big discrete jackpot for *vertical* progress through grips; each height
-    # level only pays once, so it can't be re-claimed by swapping limbs onto
-    # holds at the same height.
-    new_high_grip_bonus: float = 75.0
+    # INERT legacy lever (default 0.0) — matches the documented clean reward and
+    # TrainConfig. CLAUDE.md flags this jackpot as the main grab->fall->repeat
+    # farming magnet; re-enable only one-at-a-time, diagnostics-driven. (Was
+    # 75.0 here, which silently diverged from TrainConfig's 0.0 and fired on any
+    # code path building EnvConfig() directly — sanity checks, MoonboardEnv,
+    # probes.) Each height level still only pays once if it is ever turned on.
+    new_high_grip_bonus: float = 0.0
     on_finish_bonus: float = 200.0
     fall_penalty: float = 50.0
     slip_penalty: float = 5.0
@@ -91,7 +94,7 @@ class EnvConfig:
     # single-step HWM gain. This makes self-intersecting poses an outright
     # negative-EV action rather than a shaping nudge.
     body_intersection_penalty: float = 20.0
-    energy_penalty_coeff: float = 0.001          # × Σ ctrl² (was 0.005 — too large vs HWM)
+    energy_penalty_coeff: float = 0.001          # × Σ(ctrl−seed)² (deviation from seed; was 0.005 — too large vs height signal)
     invalid_action_penalty: float = 0.25
     # Dense finish-approach shaping (potential-based).
     # Per-step reward = finish_approach_coeff × (prev_dist − cur_dist).
@@ -741,7 +744,7 @@ class Climbing3DEnv(gym.Env):
 
     # ─── Action handling ─────────────────────────────────────────────
     def _step_continuous(self, action) -> tuple[int, float]:
-        """Apply joint targets + grip intents; return (slips, Σctrl²)."""
+        """Apply joint targets + grip intents; return (slips, Σ(ctrl−seed)²)."""
         action = np.asarray(action, dtype=np.float64)
         n = self._n_act
         joint_norm = np.clip(action[:n], -1.0, 1.0)
@@ -792,14 +795,29 @@ class Climbing3DEnv(gym.Env):
             self.cfg_env.sim_substeps,
             check_slip=self.cfg_env.enable_slip,
         )
-        return slips, float(np.sum(ctrl * ctrl))
+        # Energy = squared deviation from the settled seed pose (ctrl − seed),
+        # NOT absolute Σctrl². Absolute magnitude charged a standing penalty for
+        # holding necessary bent-limb climbing poses and biased the policy toward
+        # straight/extended joints; deviation-from-seed makes holding the hang
+        # (action≈0) free and only penalises active motion off the seed.
+        ctrl_dev = ctrl - seed
+        return slips, float(np.sum(ctrl_dev * ctrl_dev))
 
     def _maybe_engage_grip(self, limb: Limb) -> None:
         """Engage the weld if the tip is within proximity of a valid,
-        unoccupied hold. Picks the closest eligible hold within range."""
+        unoccupied hold. Picks the closest eligible hold within range.
+
+        ``self._grip_target_override`` (dict limb→hold_id, set by the
+        imitation wrapper) restricts the limb to ONE specific hold: with
+        reference-driven grips, "nearest eligible" re-welded a just-released
+        limb to its origin hold (distance ~0 beats any target), pinning the
+        foot before it could even start its swing — the policy measurably
+        never moved it (min distance to target ≈ start distance, every
+        episode)."""
         if self.world.on_hold(limb) is not None:
             return
         tip = self.world.limb_tip_pos(limb)
+        target_override = getattr(self, "_grip_target_override", {}).get(limb)
         # Holds currently occupied by another limb are off limits.
         occupied = {
             self.world.on_hold(l) for l in LIMBS if l != limb
@@ -809,6 +827,8 @@ class Climbing3DEnv(gym.Env):
         best_id: Optional[str] = None
         best_d = cfg.GRIP_PROXIMITY_M
         for i, hid in enumerate(self._hold_ids):
+            if target_override is not None and hid != target_override:
+                continue
             if hid in occupied:
                 continue
             if limb in HAND_LIMBS and not self._hand_eligible[i]:
@@ -821,7 +841,9 @@ class Climbing3DEnv(gym.Env):
                 best_d = d
                 best_id = hid
         if best_id is not None:
-            self.world.attach_limb(limb, best_id)
+            # Anchor where the tip touched (zero strain) — the proximity gate
+            # guarantees it's within GRIP_PROXIMITY_M of the hold centre.
+            self.world.attach_limb(limb, best_id, anchor="tip")
 
     def _step_discrete(self, action) -> tuple[int, Optional[str]]:
         limb_id = int(action) // self.n_holds

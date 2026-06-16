@@ -5,78 +5,115 @@
 > roadmap. Prune aggressively; don't let this drift into an audit doc that
 > rots while the code moves.
 >
-> Last reviewed: 2026-06-10.
+> Last reviewed: 2026-06-11.
 
 ---
 
-## Where we are (2026-06-10)
+## Where we are (2026-06-11)
 
-**The imitation + CMA-ES loop is working end-to-end. A 6-move climb is
-learned from frame 0.**
+**The body + grip physics overhaul landed.** Everything below is measured,
+not guessed (probes: `sim3d.probe_foot_reach`, `sim3d.probe_grip_strength`):
 
-Path taken:
-- Phase 0 blockers (episode length, seed pose, grip semantics, log_std_init) — DONE.
-- Potential-based reward + staged curriculum — DONE. PPO learns reach-one stably.
-- Imitation + RSI infrastructure — DONE. Single-move reference trains 0→88%.
-- CMA-ES discovery — DONE. `sim3d/discover.py` chains moves by probing nearest
-  reachable unvisited holds. `--continue-from` starts continuation from the
-  real physical end-state (not seed-pose approximation).
-  Foot moves blocked by hip_flex axis; all discovery is hand-only.
-- **6-move reference authored**: `ref_cma9_6moves_stitched.npz`, 148 frames,
-  holds h_033→h_034→h_037→h_038→h_039→h_040, pelvis 3.29→3.49m.
-- **R_min bug found and fixed**: v1 collapsed to 0% because R_min=0.75 sat
-  right at the reference's worst-case transition (r_imit=0.750). Any imperfection
-  during a reach terminated the episode. Fix: `--r-min-start 0.3` flat.
-- **Wrong-wall bug found and fixed**: `_load_wall_for_ref` was rebuilding from
-  generator seed (54 holds) not the saved `.wall.json` (58 holds). Fix: sibling
-  auto-detection.
-- **Periodic checkpointing added**: `CheckpointCallback` saves every 200k steps
-  into `checkpoints/` — runs resumable if interrupted.
-- **v2 trained** (`ref6moves_v2_rmin03`, 2M steps, uniform RSI): 70.2% success
-  — but inflated by easy late-reference starts. 0/4 eval from frame 0.
-- **v3 trained** (`ref6moves_v3_hardened`, 2M steps, RSI hardened cap→0):
-  **52.6% success from frame 0** (40/76 eps), r_imit=0.676. This is the real
-  number. Monotonic learning, no collapse. Video: `ref6moves_v3_rollout.mp4`.
+- **Zero-strain hold anchoring** — the slip model was reading kN-scale
+  constraint-solver stretch (7× body weight on settled stances) as grip
+  load; `attach_limb(anchor="tip")` + seed re-anchoring removed it. Grip
+  multipliers tightened on probe evidence: hand 2.5→2.0, foot 3.0→1.5.
+- **Foot moves unlocked** — the blocker was the hip_rot ±40° limit (NOT the
+  hip_flex axis, which is anatomically correct): the shin couldn't orient
+  wall-ward at high flexion. At ±60° (+ abduct −30..85°) CMA-ES discovered
+  its first foot move (LF +0.22 m, all anchors kept). Discovery now walks
+  the full LH→RH→LF→RF cycle, including in `--continue-from`.
+- **Spine lateral + twist DOF added** (video-retargeting prerequisite).
+  23 actuated joints; obs (131,), action (27,). All saved references
+  migrated in place (`python -m sim3d.reference --migrate`); the 6-move
+  reference is 100% RSI-holdable on the new body. **Old policy checkpoints
+  (incl. v3) are stale — first retraining run on the new body is pending.**
+- **CMA-ES hardening** — per-DOF search bounds spanning the full joint range
+  (the flat ±1.6 rad box couldn't even express a high-step), restarts with
+  sigma escalation, cycle-walking when a limb has no reachable hold, and a
+  `--stitch` CLI replacing manual reference stitching.
+- **Frame-0 success is the headline metric** — `python -m sim3d.imitation
+  --eval --model … --ref …`, plus a periodic in-training frame-0 eval.
+  Phase-averaged success is diagnostic only (v2: 70% phase-avg, 0/4 real).
+- Historical context: v3 (`ref6moves_v3_hardened`, old body) reached 52.6%
+  from frame 0 on `ref_cma9_6moves_stitched.npz` (148 frames, 6 hand moves,
+  pelvis 3.29→3.49 m).
 
 ---
 
-## Near-term: extend the reference to the top
+## Near-term: train on a new-physics reference
 
-### N1. Continue the reference past h_039/h_040
+### N0 — RESULT (2026-06-11): the old reference is untrackable; retired
 
-The ceiling was h_043 at z=3.7m — just beyond arm reach with feet still
-at h_035/h_036 (z=2.5m). Two options:
+Two full runs on the migrated 6-move reference (v1 uniform RSI 2M steps →
+v2 hardened, RSI cap annealed 148→0 over 2M): **frame-0 success 0/40; at
+cap 0 even phase-avg fell to 0%** while r_imit held ~0.6 — the policy
+tracks perfectly up to move 2's load transfer, where physics refuses.
+Diagnosis (open-loop replay + multiplier sweep): the transfer builds foot
+forces that scale to break ANY cap (co-contraction race), because the move
+was authored under foot multiplier 3.0. **Lesson, now structural: a
+reference is only trainable under the physics it was authored under.**
+Discovery vets every move against live caps, so its references are feasible
+by construction. (Historical 52.6% v3 was real, but on physics whose grip
+forces were 7×-bodyweight artifacts. Note: `--rsi-anneal` is per-env steps —
+divide by n_envs, or the cap never lands at 0.)
 
-**Option A — Foot move first** (preferred if hip_flex is fixable):
-The current `hip_flex` joint axis `[-1,0,0]` rotates the leg forward, not
-upward, capping foot z at ~0.87m. A foot hold at z≈2.8m would require
-either: (a) raising `hip_flex` axis to something like `[0,-1,0]` (rotates
-leg upward in the XZ plane), or (b) using hip_abduct + hip_rot together to
-lift the foot. Check `builder.py` joint definitions before attempting.
+### N1 — RETRACTED, THEN FIXED (2026-06-11): the wiggle-in-place degeneracy
 
-**Option B — Different wall seed** (quickest):
-Run adaptive discovery on a different seed that generates a wall where the
-holds above h_039/h_040 are closer (z=3.5m, not 3.7m). Seeds with
-consecutive moves 5-8 in gap≥0.45m list (from the seed scan): seeds 90,
-98, 101, 118, 145, 146, 151.
+The first "100% frame-0" result (`ref3moves_newphys_v1` on
+`ref_seed9_4limb.npz`) was REAL TRACKING OF A FAKE CLIMB — visual review
+caught it: the reference was one 20 cm hand move plus the feet re-gripping
+the holds they already stood on; **net pelvis movement −3 cm**. Greedy
+adaptive discovery preferred trivial re-grips: currently-held holds weren't
+excluded from candidates, and zero-strain anchors put tips a few cm below
+hold centres so "own hold" passed the 2 cm upward filter. Three fixes, all
+landed:
+1. `_reachable_holds` excludes every currently-held hold and requires
+   ≥0.08 m height gain per move;
+2. `ImitationEnv` "completed" now also requires the END GRIPS to match the
+   reference's final holds (window-survival alone can be gamed);
+3. discovery prints `net pelvis rise` and brands `< 0.10 m` as NOT A CLIMB.
+The training-loop mechanics (0→100% in 300k steps under honest physics) are
+validated; the climbing content was not. Lesson for every future metric:
+**watch the video before believing the number.**
 
-**Option C — Continue from ref6moves with a new adaptive run**:
-`--continue-from ref_cma9_6moves_stitched.npz` after training finishes,
-targeting a wall with holds at reachable z from h_039/h_040. Note: the
-continuation needs the body's FEET to advance (h_035/h_036 are at z=2.5m
-and have been there since the beginning); pure hand moves can't gain height
-indefinitely.
+### N1b. Longer real reference — IN PROGRESS
 
-### N2. Get ≥8 moves on a single generated wall (Option B above)
+Stand-up machinery landed earlier (knees in the arm-move search, hand probe
+radius 0.50→0.80 m so post-foot-step crouches can target what leg extension
+reaches, cycle-walking, restarts). Mid-wall `seed_pose` starts don't work
+(stances collapse on release — only bottom-up chained discovery yields
+release-vetted stances). Running now: bottom-up seeds 9 + 98 with the
+anti-degeneracy fixes. Aim ≥8 moves, ≥2 REAL foot moves, net rise ≥1 m.
 
-Seeds 90, 98, 101, 118, 145, 146, 151 all have ≥9 gap≥0.45m moves in the
-feasibility scan. Run:
-```bash
-python -m sim3d.discover --adaptive --seed <N> --max-evals 600 --max-moves 10 \
-  --out data/runs/sim3d/imitation/ref_seed<N>_adaptive10.npz
-```
-Pick the seed that produces the most moves (aim for ≥8). Then train
-imitation on that reference with the same schedule as above.
+### N2. Train on the ladder reference — chain curriculum (IN PROGRESS)
+
+Training-loop lessons from the 11-move attempts (all structural, all fixed):
+- **The imitation mesa**: on long references with quasi-static stretches,
+  "hold still and sag slowly" outscores the brief critical transitions —
+  full-length RSI-annealed episodes trained sagging (one move then a
+  0.44 m sag read as mean len 120). Cap→0 annealing also makes the policy
+  FORGET the upper moves (train with mixed sampling if annealing at all).
+- **References must be smooth**: CMA-authored stand-ups without a velocity
+  penalty are open-loop jerks; every run died at EXACTLY the frame a
+  recorded stand-up ends. Discovery now penalises mean qvel² (0.4×) in
+  moves and stands; horizons lengthened (move 40, stand 32).
+- **Chain curriculum** (`--chain`): every episode starts at frame 0;
+  stage k ends at move k's boundary; success = the reference's stance
+  there is actually HELD (grip match — un-inflatable); ≥70% ground-start
+  success unlocks stage k+1. Half the episodes RSI mid-window (a frame-0
+  policy parks a foot 27 cm short forever; mid-move starts teach the
+  swing) but only ground starts count toward advancement.
+- **Verification discipline**: the only believable evidence is a
+  FIXED-CAMERA video checked against pelvis-z numbers. Tracking-camera
+  stills lie (the camera follows the body — wall motion reads as climbing).
+
+Current run: `ladder_v6_chain2` on `ref_ladder_v6_smooth.npz` (10 smooth
+moves, +0.28 m net). Stage 1 (first move from the ground, grips verified)
+trains to ≥70% quickly; stage 2 (the foot step) went 0% → ~25% with
+mid-window mixing. Full-route frame-0 episodes reach frame 85/552.
+Headline metric unchanged: full-reference frame-0 success with end-grip
+match.
 
 ---
 
@@ -88,7 +125,7 @@ Once the single-wall imitation controller works (≥60% success), author
 short single-move primitives covering the basic technique set:
 - Left-hand reach (up-left, up-right, straight up) × 3 variants each
 - Right-hand reach × 3 variants
-- Left-foot step (once hip_flex axis is fixed — see N1)
+- Left-foot step (unblocked 2026-06-11 — hips fixed)
 - Right-foot step
 
 Each primitive is a short ~30-frame clip (one move only). Author using
@@ -118,26 +155,36 @@ CLAUDE.md §"The video pipeline" for the full architectural rationale.
 
 ### V1. Pose extraction tooling
 
-Set up 4D-Humans or WHAM locally. Verify on a short MoonBoard send video —
-confirm SMPL body parameters look plausible (no flipped limbs, reasonable
-joint angles). Tools are pre-trained and public; this is mostly environment
-setup.
+**2D feasibility CONFIRMED (2026-06-11)** on the first real video
+(`data/video/moonboard/spike1/`, 9 clips V3–V7, static head-on shot):
+YOLO11s-pose detects the climber in ≥99% of frames at every grade tested,
+wrist confidence 0.90–0.95, ankles 0.85–0.92, drop-knee poses tracked
+cleanly. See the dataset README for the full table.
+
+**Remaining:** SMPL (3D) extraction — set up 4D-Humans or WHAM. Needs a
+GPU-friendly environment (Linux/CUDA or Colab; macOS install is painful).
+Verify on spike1 clips: no flipped limbs, plausible joint angles.
 
 ```bash
 # 4D-Humans (recommended — best occlusion handling)
 pip install git+https://github.com/shubham-goel/4D-Humans
-python demo.py --video my_moonboard_clip.mp4 --out smpl_output/
+python demo.py --video data/video/moonboard/spike1/clip01_v3a.mp4 --out smpl_output/
 ```
 
 ### V2. MoonBoard video dataset
 
-Collect 50–100 MoonBoard send videos spanning V3–V8. YouTube and
-Instagram are the sources. Label each video with its problem ID (which
-holds are active) — this is knowable from the MoonBoard problem database
-in `data/moonboard/`. Organise as:
+**Started (2026-06-11):** `data/video/moonboard/spike1/` — 9 clips
+(V3×2, V4×2, V5×2, V6×2, V7) from one static-camera video; problem names
+visible in the overlay (e.g. "The Warm up Problem" / RussK, "Black
+Muffler" / Koala Climbing). TODO in its README: resolve overlay names to
+hold sets via `data/moonboard/`, note board version + angle.
+
+Target: 50–100 MoonBoard send videos spanning V3–V8. YouTube and
+Instagram are the sources. Organise as:
 ```
-data/video/moonboard/<problem_id>/<clip_n>.mp4
-data/video/moonboard/<problem_id>/holds.json  ← active hold coords
+data/video/moonboard/<dataset>/<clip_n>.mp4   (gitignored)
+data/video/moonboard/<dataset>/README.md      (tracked: timestamps, problems, QA)
+data/video/moonboard/<dataset>/holds.json     ← active hold coords
 ```
 
 ### V3. Clip segmentation + contact labelling

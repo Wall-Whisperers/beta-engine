@@ -98,6 +98,16 @@ JOINT_LIMITS_RAD = {
     # operating point.
     "spine_lean":      (-15 * DEG, 15 * DEG),
 
+    # Spine lateral flexion + axial rotation (added 2026-06-11). Real climbing
+    # is full of torso rotation — cross-throughs, drop-knees, reaching across
+    # the body — and SMPL clips from real climbers are unrepresentable without
+    # these two DOF (the video/AMP pipeline retargets real footage onto this
+    # body). Ranges are thoracolumbar-combined anatomical values (Norkin &
+    # White): lateral ~25–35°, axial ~30–45°; we sit at the conservative end
+    # so the RL agent can't fold into silly poses.
+    "spine_lat":       (-25 * DEG, 25 * DEG),
+    "spine_twist":     (-30 * DEG, 30 * DEG),
+
     # Shoulder (3-axis Euler around hinges). Order matters: az is
     # forward/back, then el (abduction), then roll (internal/external).
     # No hyper-extension behind the back (humans clear ~50° max).
@@ -115,9 +125,21 @@ JOINT_LIMITS_RAD = {
 
     # Hip flex (knee to chest), abduction (legs apart), rotation.
     # Bias hip_flex high so high-step betas are reachable.
+    #
+    # hip_rot/hip_abduct widened ±40→±60 / (−20..70)→(−30..85) (2026-06-11),
+    # measured via sim3d.probe_foot_reach: with ±40 rotation the shin cannot
+    # orient wall-ward at high flexion, so the best stance-preserving foot
+    # placement near the wall plane was pelvis−0.42 m — too low to step up a
+    # hold row, which is what blocked all foot-move discovery (NEXT_STEPS N1
+    # blamed the hip_flex AXIS; the axis is anatomically right, the rotation
+    # limit was the binding constraint). At ±60 rotation the frog/high-step
+    # closes: max placeable foot rises to pelvis−0.03 with 10 distinct grid
+    # poses ≥10 cm above the starting foothold. 60° external rotation in
+    # flexion and 85° abduction are trained-climber turnout (Norkin & White
+    # normals are ~45°; climbers and dancers exceed them substantially).
     "hip_flex":        (-20 * DEG, 140 * DEG),
-    "hip_abduct":      (-20 * DEG,  70 * DEG),
-    "hip_rot":         (-40 * DEG,  40 * DEG),
+    "hip_abduct":      (-30 * DEG,  85 * DEG),
+    "hip_rot":         (-60 * DEG,  60 * DEG),
 
     # Knee — flexion only, no hyperextension. 0° = locked-out, 150° = heel-to-butt.
     "knee":            (  0 * DEG, 150 * DEG),
@@ -139,6 +161,8 @@ JOINT_LIMITS_RAD = {
 # without ringing (ζ = d / (2√(k·I)) > 1 for each joint).
 JOINT_PASSIVE = {
     "spine_lean":    (40.0, 8.0),   # raised: was (6, 5). Keeps the spine near 0° under upper-body gravity instead of pinned at the limit.
+    "spine_lat":     (35.0, 7.0),   # lateral sag torque is smaller than sagittal but the same near-0° equilibrium logic applies
+    "spine_twist":   (20.0, 4.0),   # axial gravity torque ≈ 0; stiffness here is anti-jitter, not anti-sag
     "shoulder_az":   ( 5.0, 0.8),
     "shoulder_el":   ( 5.0, 0.8),
     "shoulder_roll": ( 3.0, 0.5),
@@ -261,6 +285,12 @@ REACH_TIMEOUT_S = 1.5
 # grip-force / reach-strength — see NEXT_STEPS A1c. Kept as a tunable lever.
 BALANCE_KP = 0.0      # N / m on the pelvis toward its pre-move position (0 = off)
 BALANCE_KD = 400.0    # N·s / m damping
+# Rotational PD on the free root to keep the pelvis upright during AUTHORING
+# (stops the torso pitching back off the wall — the lean-back that made
+# RSI-chained references flop into a backbend). Active only when
+# _balance_upright is set, which is authoring-only.
+BALANCE_ROT_KP = 1500.0   # N·m / rad toward the upright orientation
+BALANCE_ROT_KD = 120.0    # N·m·s / rad angular damping
 
 # Dyno: explosive whole-body extension when the moving limb is too far
 # for a static reach. We boost legs / hips toward extension and fly the
@@ -291,24 +321,27 @@ GRIP_PROXIMITY_M = 0.08
 
 # Feet push on overhangs; hands pull. Per-limb capacity multiplier so feet can
 # generate more reaction force than the hands' rated grip strength.
-# Raised 1.5 → 3.0 (2026-06-05) alongside HAND_FORCE_MULTIPLIER: when a hand
-# releases for a move, its load redistributes onto the anchor hand AND both
-# feet, so the feet need headroom too. With foot 1.5 the feet slipped during the
-# transition and the stance still collapsed; 3.0 holds a one-hand stance solidly
-# (verified: anchors survive 40/40 steps through a hand release, even under
-# joint jitter). Same training-phase rationale as HAND_FORCE_MULTIPLIER.
-FOOT_FORCE_MULTIPLIER = 3.0
+#
+# Tightened 3.0 → 1.5 (2026-06-11), back to its original value. The 2026-06-05
+# raise to 3.0 was sized against kN-scale constraint-solver strain that the
+# zero-strain attach fix (world.attach_limb anchor="tip" + seed re-anchoring)
+# has since removed — settled stances measured 7× body weight of purely
+# geometric weld stretch. With that artifact gone, sim3d.probe_grip_strength
+# (4 stances × hang/LH-release/RH-release, slip off, wall seed 9) measures the
+# worst typical foot requirement at 1.23×; 1.5 gives ~20% margin. One
+# barn-door outlier needs 3.7× — that stance SHOULD shed a limb; discovery's
+# dropped-anchor penalty routes around genuinely hard stances.
+FOOT_FORCE_MULTIPLIER = 1.5
 
-# Hand grip-strength multiplier (2026-06-05). Raised from an implicit 1.0 after
-# a decisive finding: with the default grip cap the body CANNOT hold a one-hand
-# stance — releasing either hand collapses the (already ~1.3× over-braced) grips
-# and the climber drops. That is the physical reason every run learned to cling
-# and never climb: with weak hands, "let go and reach" is a losing move. 2.5×
-# lets the body bear the load transfer a hand move requires (verified: anchors
-# survive the release, the reach reward fires). This is a training-phase choice
-# — the roadmap defers realistic grip force to the torque/muscle phase; tighten
-# it back toward 1.0 once the agent reliably climbs.
-HAND_FORCE_MULTIPLIER = 2.5
+# Hand grip-strength multiplier. Tightened 2.5 → 2.0 (2026-06-11) on the same
+# probe evidence as FOOT_FORCE_MULTIPLIER: worst typical one-hand-release
+# requirement 1.71×, so 2.0 keeps ~17% margin while shedding the superhuman
+# headroom that existed only to mask constraint strain. Residual inflation
+# above 1.0 reflects the isometric co-contraction inherent to position servos
+# pressing against rigid welds (~1–1.6 kN steady per limb vs ~0.2–0.4 kN for a
+# relaxed human stance); re-probe and tighten toward ~1.2 once policies learn
+# active weight-shift before a release, and again at the torque/muscle phase.
+HAND_FORCE_MULTIPLIER = 2.0
 
 # ─── Kickboard ─────────────────────────────────────────────────────────────
 # A "kickboard" is a secondary near-vertical plate below the main wall with a

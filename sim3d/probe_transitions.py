@@ -221,7 +221,8 @@ def main() -> None:
         print(f"    base-hang(4grip)={oc[base['outcome']]}   "
               f"release(3grip)={oc[rel['outcome']]}"
               f"  (grips {rel['grips0']}→{rel['grips_end']}, min_pelvis_z={rel['min_pelvis_z']})")
-        print(f"    expert-reach: {'land' if reach['landed'] else f'snap@{reach['min_reach_d']:.2f}m'}"
+        _snap = "" if reach['landed'] else ("snap@%.2fm" % reach['min_reach_d'])
+        print(f"    expert-reach: {'land' if reach['landed'] else _snap}"
               f"  {anchor_note}  slips={reach['slips']}  barn-door Δy={reach['barn_door_dy']:+.3f}m")
         print(f"    rsi-faithful={'OK' if rsi_ok else 'no'}")
         print()

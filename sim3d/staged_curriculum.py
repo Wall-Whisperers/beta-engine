@@ -108,16 +108,26 @@ def reach_one_seed(hand_seq, footholds, move_k: int, wall: Wall):
     seed["lh" if mover_limb == "LH" else "rh"] = mover_hold.hold_id
     seed["lh" if anchor_limb == "LH" else "rh"] = anchor_hold.hold_id
 
-    # Feet: prefer one foothold on each side, both below the anchor stance.
+    # Feet: one foothold per side, targeting a hand−foot gap of ~0.6 m —
+    # measured Goldilocks (sim3d ladder sweep, 2026-06-12): reaches land at
+    # gap 0.5–0.7 m (knees bent = push reserve for the weight-shift), miss by
+    # 0.3–0.4 m when extended (≥0.9 m, straight legs can't push) and by 0.76 m
+    # from a crouch (0.3 m, releases slump). The original rule ("highest
+    # foothold below the hands") seeded crouches on any dense foot ladder.
     below = [f for f in footholds if f.grid_y < anchor_hold.grid_y]
     cx = wall.cols / 2.0
+    target_y = anchor_hold.y_cm - 60.0
     if len(below) >= 2:
-        left = next((f for f in reversed(below) if f.grid_x <= cx), None)
-        right = next((f for f in reversed(below) if f.grid_x > cx), None)
+        def _closest(side_left: bool):
+            cands = [f for f in below if (f.grid_x <= cx) == side_left]
+            return min(cands, key=lambda f: abs(f.y_cm - target_y)) if cands else None
+        left = _closest(True)
+        right = _closest(False)
         if left is None:
-            left = below[-1]
+            left = min(below, key=lambda f: abs(f.y_cm - target_y))
         if right is None or right is left:
-            right = next((f for f in reversed(below) if f is not left), below[-1])
+            rest = [f for f in below if f is not left]
+            right = min(rest, key=lambda f: abs(f.y_cm - target_y)) if rest else left
         seed["lf"] = left.hold_id
         seed["rf"] = right.hold_id
     elif below:

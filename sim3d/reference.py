@@ -44,6 +44,21 @@ FALL_Z = 0.20
 
 # ─── Bounded DeepMimic imitation reward ──────────────────────────────────────
 
+# Actuated-joint indices (into qpos[7:] / qvel[6:]) that drive each limb's tip.
+# Used to EXCLUDE a moving limb from pose/endeff tracking so PPO can discover a
+# servo-feasible swing instead of being chained to an infeasible recorded one
+# (the recorded foot swing is an authoring-controller artifact — a stiff
+# Cartesian reach + weld-snap — that the PD servos cannot reproduce; see
+# NEXT_STEPS). The anchored limbs + CoM stay tracked, so the stance and the
+# pelvis weight-shift still follow the reference.
+LIMB_ACT_IDX: dict[str, list[int]] = {
+    "LH": [3, 4, 5, 6, 7],       # l_shoulder az/el/roll, l_elbow, l_wrist
+    "RH": [8, 9, 10, 11, 12],    # r_shoulder az/el/roll, r_elbow, r_wrist
+    "LF": [13, 14, 15, 16, 17],  # l_hip flex/abduct/rot, l_knee, l_ankle
+    "RF": [18, 19, 20, 21, 22],  # r_hip flex/abduct/rot, r_knee, r_ankle
+}
+
+
 @dataclass
 class ImitationCoeffs:
     """Weights (sum to 1) + sensitivity exponents for the bounded reward.
@@ -64,16 +79,31 @@ class ImitationCoeffs:
 
 
 def imitation_reward(world: Climb3DWorld, ref: "Reference", t: int,
-                     c: ImitationCoeffs) -> tuple[float, dict]:
+                     c: ImitationCoeffs,
+                     free_limb: Optional[str] = None) -> tuple[float, dict]:
     """Bounded [0,1] DeepMimic reward of the world's current state against
-    reference frame ``t``. Returns ``(r_imit, components)``."""
+    reference frame ``t``. Returns ``(r_imit, components)``.
+
+    ``free_limb`` (e.g. ``"RF"``) excludes that limb's actuated joints from
+    ``r_pose`` and its tip from ``r_endeff`` — so the moving limb is judged ONLY
+    by its reach reward (which targets the actual hold), not by matching the
+    infeasible recorded swing. Velocity and CoM stay full-body so the stance and
+    pelvis weight-shift still track. ``None`` = full-body tracking (calibration,
+    and any limb the reference holds gripped)."""
     q, qd = world.data.qpos, world.data.qvel
-    pose_err = q[7:] - ref.qpos[t, 7:]                       # 21 joint angles
-    r_pose = float(np.exp(-c.k_pose * np.mean(pose_err ** 2)))
-    vel_err = qd[6:] - ref.qvel[t, 6:]                       # 21 joint velocities
-    r_vel = float(np.exp(-c.k_vel * np.mean(vel_err ** 2)))
+    pose_err = q[7:] - ref.qpos[t, 7:]                       # actuated joint angles
     eef = np.array([world.limb_tip_pos(l) for l in LIMBS])   # (4,3)
     eef_err = eef - ref.eef[t]
+    if free_limb is not None:
+        keep_j = np.ones(pose_err.shape[0], dtype=bool)
+        keep_j[LIMB_ACT_IDX[free_limb]] = False
+        pose_err = pose_err[keep_j]
+        keep_e = [l for l in LIMBS if l != free_limb]
+        eef_err = np.array([eef[LIMBS.index(l)] - ref.eef[t, LIMBS.index(l)]
+                            for l in keep_e])
+    r_pose = float(np.exp(-c.k_pose * np.mean(pose_err ** 2)))
+    vel_err = qd[6:] - ref.qvel[t, 6:]                       # actuated joint velocities
+    r_vel = float(np.exp(-c.k_vel * np.mean(vel_err ** 2)))
     r_endeff = float(np.exp(-c.k_endeff * np.mean(np.sum(eef_err ** 2, axis=1))))
     com_err = world.com() - ref.com[t]
     r_com = float(np.exp(-c.k_com * np.sum(com_err ** 2)))
@@ -344,6 +374,32 @@ def author_climb_reference(
     return ref, diag
 
 
+def migrate_reference_spine(ref: "Reference") -> "Reference":
+    """Upgrade a pre-spine reference (nq=28, nv=27) to the 2026-06-11 body
+    layout (nq=30, nv=29: spine_lat + spine_twist added to the chest).
+
+    The new joints are inserted at their qpos/qvel addresses with zeros —
+    a zero angle on both is exactly the old rigid chest, so the migrated
+    frames are kinematically identical to what was recorded. eef/com/grips
+    are untouched. Idempotent: an already-migrated reference passes through.
+    """
+    nq = ref.qpos.shape[1]
+    if nq == 30:
+        return ref
+    if nq != 28:
+        raise ValueError(f"don't know how to migrate a reference with nq={nq}")
+    # qpos: free joint occupies [0:7), spine_lean at 7 → new joints at 8, 9.
+    qpos = np.insert(ref.qpos, 8, 0.0, axis=1)
+    qpos = np.insert(qpos, 9, 0.0, axis=1)
+    # qvel: free joint occupies [0:6), spine_lean at 6 → new dofs at 7, 8.
+    qvel = np.insert(ref.qvel, 7, 0.0, axis=1)
+    qvel = np.insert(qvel, 8, 0.0, axis=1)
+    meta = dict(ref.meta)
+    meta["migrated"] = meta.get("migrated", []) + ["spine_lat+spine_twist 2026-06-11"]
+    return Reference(qpos=qpos, qvel=qvel, eef=ref.eef, com=ref.com,
+                     grips=ref.grips, wall_gen_seed=ref.wall_gen_seed, meta=meta)
+
+
 def stitch_references(refs: list["Reference"]) -> "Reference":
     """Concatenate per-move references into one full-climb trajectory.
 
@@ -425,7 +481,36 @@ def main() -> None:
                     help="index into feasible moves to author (default: a mid move)")
     ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--out", type=str, default="data/runs/sim3d/imitation/ref_move.npz")
+    ap.add_argument("--migrate", nargs="+", default=None, metavar="REF_NPZ",
+                    help="migrate reference files in place to the current body "
+                         "layout (a .pre-spine.npz backup is left alongside)")
+    ap.add_argument("--stitch", nargs="+", default=None, metavar="REF_NPZ",
+                    help="concatenate reference files into one (use with --out); "
+                         "replaces the error-prone manual stitching step")
     args = ap.parse_args()
+
+    if args.migrate:
+        for p in args.migrate:
+            p = Path(p)
+            ref = Reference.load(p)
+            migrated = migrate_reference_spine(ref)
+            if migrated is ref:
+                print(f"{p}: already current (nq={ref.qpos.shape[1]})")
+                continue
+            backup = p.with_suffix(".pre-spine.npz")
+            if not backup.exists():
+                p.rename(backup)
+            migrated.save(p)
+            print(f"{p}: migrated nq 28→30 (backup at {backup.name})")
+        return
+
+    if args.stitch:
+        refs = [migrate_reference_spine(Reference.load(p)) for p in args.stitch]
+        stitched = stitch_references(refs)
+        stitched.save(args.out)
+        print(f"Stitched {len(refs)} references ({[len(r) for r in refs]} frames) "
+              f"→ {args.out} ({len(stitched)} frames)")
+        return
 
     wall, profile, feasible = build_wall_and_moves(seed=args.seed)
     if not feasible:

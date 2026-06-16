@@ -14,3 +14,7 @@ data/runs/
 moonboard-rl/output/videos
 moonboard-rl/output/tb_logs
 temp
+
+# Video clips for the pose-extraction pipeline (large binaries; the per-dataset
+# README.md files ARE tracked — force-add them).
+data/video/**/*.mp4

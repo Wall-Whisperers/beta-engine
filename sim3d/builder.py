@@ -104,14 +104,14 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
     Tree layout — DOF count in parens:
 
         pelvis (free, 6)
-        ├── chest (spine_lean, 1)
+        ├── chest (spine_lean + spine_lat + spine_twist, 3)
         │   ├── head
         │   ├── L shoulder (3) → upper_arm → elbow (1) → forearm → wrist (1) → hand
         │   └── R shoulder (3) → upper_arm → elbow (1) → forearm → wrist (1) → hand
         ├── L thigh (hip 3) → shin (knee 1) → foot (ankle 1)
         └── R thigh (hip 3) → shin (knee 1) → foot (ankle 1)
 
-    Total non-free DOF: 1 + 5×2 + 5×2 = 21, plus 6 free = 27.
+    Total non-free DOF: 3 + 5×2 + 5×2 = 23, plus 6 free = 29.
 
     Collision groups:
         contype=1, conaffinity=1 — torso/limbs
@@ -165,6 +165,10 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
         <body name="chest" pos="0 0 {0.12:.4f}">
             <joint name="spine_lean" type="hinge" axis="1 0 0" class="j_spine"
                    range="{R('spine_lean')}" {P('spine_lean')}/>
+            <joint name="spine_lat" type="hinge" axis="0 1 0" class="j_spine"
+                   range="{R('spine_lat')}" {P('spine_lat')}/>
+            <joint name="spine_twist" type="hinge" axis="0 0 1" class="j_spine"
+                   range="{R('spine_twist')}" {P('spine_twist')}/>
             <geom name="g_chest" type="ellipsoid"
                   size="{sw*0.9:.4f} 0.115 {s.spine/2:.4f}"
                   pos="0 0 {s.spine/2:.4f}"
@@ -625,7 +629,9 @@ def _build_actuators() -> str:
     target angle (radians); the actuator servos the joint to that
     angle with a stiff PD plus the joint's passive stiffness/damping."""
     joints = [
-        ("spine_lean", "spine"),
+        ("spine_lean",  "spine"),
+        ("spine_lat",   "spine"),
+        ("spine_twist", "spine"),
         ("l_shoulder_az",   "shoulder"),
         ("l_shoulder_el",   "shoulder"),
         ("l_shoulder_roll", "shoulder"),
@@ -664,6 +670,8 @@ def _build_actuators() -> str:
 # ─── Per-joint armature lookup ────────────────────────────────────────────
 _JOINT_GROUP = {
     "spine_lean":    "spine",
+    "spine_lat":     "spine",
+    "spine_twist":   "spine",
     "l_shoulder_az": "shoulder", "r_shoulder_az": "shoulder",
     "l_shoulder_el": "shoulder", "r_shoulder_el": "shoulder",
     "l_shoulder_roll": "shoulder", "r_shoulder_roll": "shoulder",

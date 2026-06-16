@@ -161,9 +161,16 @@ class Climb3DWorld:
         # targets" without writing a long lookup loop.
         self._jnt_qposadr: dict[str, int] = {}
         self._actuator_jnt_qposadr: list[int] = []
+        # Public joint-name → ctrl-index map. Anything outside this class that
+        # writes data.ctrl (discovery, probes) must look indices up here, not
+        # hardcode them — actuator order shifts whenever the body gains joints.
+        self.actuator_id_by_joint: dict[str, int] = {}
         for i in range(self.model.nu):
             jnt_id = self.model.actuator_trnid[i, 0]
             self._actuator_jnt_qposadr.append(int(self.model.jnt_qposadr[jnt_id]))
+            jname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, int(jnt_id))
+            if jname is not None:
+                self.actuator_id_by_joint[jname] = i
 
         # Map limb → list of actuator indices for that limb's chain.
         # Used by the reach controller to relax those actuators while
@@ -216,6 +223,24 @@ class Climb3DWorld:
         # reach starts; the balance PD pins the pelvis here so the reach
         # controller's reaction can't tip the body off its support.
         self._balance_target: Optional[np.ndarray] = None
+        # Optional pelvis ORIENTATION target (quat) for authoring. The position
+        # balance above can't stop the torso pitching backward off the wall (the
+        # progressive lean-back that made RSI-chained references flop into a
+        # backbend). When set, a rotational PD on the free root keeps the pelvis
+        # near this orientation — active whenever set (incl. settle frames), not
+        # gated on an active reach. Authoring-only; None in training.
+        self._balance_upright: Optional[np.ndarray] = None
+        # Capped balance assist for OPEN-LOOP authoring (discover_move). The
+        # position assist above only fires while the reach controller is active;
+        # discover_move drives constant joint targets with no "reaching" limb, so
+        # the body sags during the swing (the 2026-06-15 transition-authoring
+        # blocker). When ``_balance_force_active`` is True the position assist
+        # fires regardless, but the force is CLAMPED to ``_balance_cap_n`` newtons
+        # — so it can only supply balance a trained policy could plausibly produce
+        # by weight-shifting (a small, trackable nudge), not the kN-scale pin that
+        # made reach-controller references untrackable.
+        self._balance_force_active: bool = False
+        self._balance_cap_n: float = 0.0
 
         # Tip-anchor bodies are fixed children at the contact sites, so hold
         # constraints can pin the actual hand/toe contact point rather than
@@ -389,11 +414,14 @@ class Climb3DWorld:
         #         during settle — the spike forces here are an
         #         artefact of the warm-start, not a real grip event.
         #
-        #         Exception: the spine actuator stays active at full gain
-        #         targeting a slight forward lean. Without it, the 66 Nm
-        #         gravitational torque on the upper body overwhelms the
-        #         6 Nm/rad passive spring and slams the spine to its limit,
-        #         driving the head through the wall.
+        #         Exception: the spine actuators stay active at full gain
+        #         targeting upright. Without this, the gravitational torque
+        #         on the upper body (~66 Nm sagittal; the welds also feed
+        #         large lateral/axial moments through asymmetric hand holds)
+        #         overwhelms the passive springs and slams each spine joint
+        #         to its limit — spine_lean drives the head through the wall,
+        #         and spine_twist pins at ±30°, settling a corkscrewed stance
+        #         that collapses as soon as slip is enabled.
         kp_backup = self.model.actuator_gainprm[:, 0].copy()
         gravity_backup = np.array(self.model.opt.gravity)
         self.model.actuator_gainprm[:, 0] = 0.0
@@ -402,16 +430,15 @@ class Climb3DWorld:
             jname = mujoco.mj_id2name(
                 self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_id,
             )
-            if jname == "spine_lean":
-                # During settle we need ≫ normal kp to resist the ~66 Nm
-                # gravitational torque on the upper body. Normal kp=120 gives
-                # equilibrium at ~44° (still clipping). kp=1000 → ~4° lean.
+            if jname in ("spine_lean", "spine_lat", "spine_twist"):
+                # During settle we need ≫ normal kp to resist the gravity +
+                # weld moments on the upper body. Normal kp=120 gives
+                # equilibrium at ~44° (still clipping). kp=1000 → ~4°.
                 self.model.actuator_gainprm[i, 0] = 1000.0
-                self.data.ctrl[i] = 0.0  # target upright; gravity settles ~4°
+                self.data.ctrl[i] = 0.0  # target upright
                 # Also zero the spine qpos so the ramp starts from upright.
                 jnt_qpos_adr = self.model.jnt_qposadr[jnt_id]
                 self.data.qpos[jnt_qpos_adr] = 0.0
-                break
         try:
             ramp_steps = int(cfg.SEED_RAMP_S / cfg.PHYS_DT)
             hold_steps = int(cfg.SEED_HOLD_S / cfg.PHYS_DT)
@@ -426,15 +453,54 @@ class Climb3DWorld:
             self.model.actuator_gainprm[:, 0] = kp_backup
             self.model.opt.gravity[:] = gravity_backup
 
-        # ── 4) Capture settled joint angles → actuator targets ────
+        # ── 4) Re-anchor welds at their settled tips ──────────────
+        # The settle pulls every tip toward its hold, but on stances the
+        # body can't exactly span, a tip ends up several cm short and the
+        # weld holds it there under permanent stretch — kN-scale solver
+        # strain that the slip model misreads as grip load (this, not real
+        # load, is what the over-brace warnings were reporting). Moving
+        # each mocap to the tip's settled position zeroes that strain;
+        # whatever force remains afterwards is real (gravity + actuators).
+        #
+        # Consolidation: the gains-off settle pose is not the equilibrium of
+        # the normal-gain dynamics (e.g. the spine settles under kp=1000 but
+        # relaxes under kp=250), and any post-settle pose drift re-strains
+        # the fixed anchors (measured: 0.1 kN → 1.8 kN over 100 frames).
+        # Sequence:
+        #   a. re-anchor at the settled tips (zero strain), target the
+        #      settle pose, then settle 0.5 s under NORMAL gains — the body
+        #      finds its play-time equilibrium, where servo error
+        #      (target − pos) plus a share of weld strain carries gravity;
+        #   b. re-anchor the welds at the equilibrium tips, KEEPING the
+        #      targets — re-syncing targets here would erase the very servo
+        #      error that holds the body up and restart the sag;
+        #   c. short settle + final re-anchor to absorb the small jump the
+        #      anchor move itself causes.
+        mujoco.mj_forward(self.model, self.data)
+        for limb in LIMBS:
+            if self._on_hold[limb] is not None:
+                self.data.mocap_pos[self._mocap_idx[limb]] = (
+                    self.data.site_xpos[self._tip_site_idx[limb]])
         self._sync_actuator_targets_to_pose()
+        self.data.qvel[:] = 0.0
+        for _ in range(int(0.5 / cfg.PHYS_DT)):
+            mujoco.mj_step(self.model, self.data)
+        for _pass in range(2):
+            mujoco.mj_forward(self.model, self.data)
+            for limb in LIMBS:
+                if self._on_hold[limb] is not None:
+                    self.data.mocap_pos[self._mocap_idx[limb]] = (
+                        self.data.site_xpos[self._tip_site_idx[limb]])
+            self.data.qvel[:] = 0.0
+            for _ in range(int(0.25 / cfg.PHYS_DT)):
+                mujoco.mj_step(self.model, self.data)
 
-        # Damp out residual velocities. The welds settled the pose;
-        # the actuator targets now match it; momentum can be reset.
+        # Damp out residual velocities. The welds + servo errors now hold
+        # the body in a play-time equilibrium; momentum can be reset.
         self.data.qvel[:] = 0.0
         self.slip_events.clear()
 
-        # ── 5) Over-brace guard ───────────────────────────────────
+        # ── 6) Over-brace guard ───────────────────────────────────
         # The settle finds a self-consistent pose, but on geometry where
         # the start holds force a contorted hang (e.g. hands near ankle
         # height) the welds end up fighting each other and a limb can
@@ -481,12 +547,28 @@ class Climb3DWorld:
             )
 
     # ─── Attach / release ─────────────────────────────────────────────
-    def attach_limb(self, limb: Limb, hold_id: str) -> None:
+    def attach_limb(self, limb: Limb, hold_id: str, *, anchor: str = "hold") -> None:
         """Activate the per-limb weld between the hold (mocap) and the
         limb's fixed tip-anchor body.
 
+        ``anchor`` selects where the weld pins the tip:
+
+        * ``"hold"`` — mocap at the hold centre; the weld *pulls* the tip
+          there. Right for seeding (the settle yanks the body into the
+          stance from a guessed pose) and for snap-mode teleports.
+        * ``"tip"`` — mocap at the tip's CURRENT world position (zero
+          initial strain). Right for in-play grabs and RSI: the grab is
+          gated on GRIP_PROXIMITY_M, so the anchor is within 8 cm of the
+          hold centre — physically "you hold the part you touched". The
+          old always-snap-to-centre behaviour stretched the closed chain
+          when the demanded pose wasn't reachable, and the constraint
+          solver answered with kN-scale fictitious forces that the slip
+          model misread as grip load (measured: 4.9 kN on a settled
+          stance with actuators AND passive springs disabled — 7× body
+          weight of pure geometric strain).
+
         On attach we:
-            1. Set the mocap to the hold's world position.
+            1. Set the mocap to the anchor position.
             2. Update eq_data so the weld's "relative pose" target is
                identity (limb tip ↔ mocap → snap together).
             3. Set eq_active = 1.
@@ -497,9 +579,16 @@ class Climb3DWorld:
         mocap_idx = self._mocap_idx[limb]
         eq_idx = self._eq_idx[limb]
 
-        # Position the mocap exactly at the hold's outer surface; body2 of
-        # the weld is the fixed tip-anchor body colocated with the site.
-        target = np.array(meta["world_pos"], dtype=np.float64)
+        if anchor == "tip":
+            mujoco.mj_forward(self.model, self.data)   # fresh site_xpos
+            target = np.array(
+                self.data.site_xpos[self._tip_site_idx[limb]], dtype=np.float64)
+        elif anchor == "hold":
+            # The hold's outer surface; body2 of the weld is the fixed
+            # tip-anchor body colocated with the site.
+            target = np.array(meta["world_pos"], dtype=np.float64)
+        else:
+            raise ValueError(f"unknown anchor mode: {anchor!r}")
         self.data.mocap_pos[mocap_idx] = target
         self.data.mocap_quat[mocap_idx] = (1.0, 0.0, 0.0, 0.0)
 
@@ -517,7 +606,7 @@ class Climb3DWorld:
         self.data.eq_active[eq_idx] = 1
         self._on_hold[limb] = HoldAttachment(
             hold_id=hold_id,
-            world_pos=tuple(float(v) for v in target),
+            world_pos=tuple(float(v) for v in meta["world_pos"]),
             max_force_n=self._max_force_for(limb, meta),
         )
 
@@ -712,12 +801,30 @@ class Climb3DWorld:
         # that breaks chaining). qfrc_applied[0:3] are world-frame forces on the
         # free root translation; qvel[0:3] is its world-frame linear velocity.
         if (cfg.BALANCE_KP > 0.0 and self._balance_target is not None
-                and any(self._reaching[l] is not None for l in LIMBS)):
+                and (self._balance_force_active
+                     or any(self._reaching[l] is not None for l in LIMBS))):
             pelvis = self.data.qpos[0:3]
             pvel = self.data.qvel[0:3]
-            self.data.qfrc_applied[0:3] += (
-                cfg.BALANCE_KP * (self._balance_target - pelvis)
-                - cfg.BALANCE_KD * pvel
+            force = (cfg.BALANCE_KP * (self._balance_target - pelvis)
+                     - cfg.BALANCE_KD * pvel)
+            # Capped mode (open-loop authoring): clamp to a policy-plausible
+            # magnitude so the recorded swing stays trackable.
+            if self._balance_force_active and self._balance_cap_n > 0.0:
+                mag = float(np.linalg.norm(force))
+                if mag > self._balance_cap_n:
+                    force *= self._balance_cap_n / mag
+            self.data.qfrc_applied[0:3] += force
+
+        # ── Upright-orientation assist (authoring only) ──────────────────
+        # Rotational PD on the free root to stop the torso pitching back off the
+        # wall. Active whenever a target is set (including settle frames), so the
+        # lean can't accumulate across RSI-chained moves.
+        if cfg.BALANCE_KP > 0.0 and self._balance_upright is not None:
+            err = np.zeros(3)
+            mujoco.mju_subQuat(err, self._balance_upright, self.data.qpos[3:7])
+            avel = self.data.qvel[3:6]
+            self.data.qfrc_applied[3:6] += (
+                cfg.BALANCE_ROT_KP * err - cfg.BALANCE_ROT_KD * avel
             )
 
     def _dyno_leg_push(self, torque_nm: float) -> None:
@@ -750,14 +857,15 @@ class Climb3DWorld:
                 rs.closest_t = rs.t_remaining
             rs.t_remaining -= dt
             if dist < cfg.REACH_ATTACH_RADIUS:
-                # On target — engage weld and clear reach.
-                self.attach_limb(limb, rs.target_hold_id)
+                # On target — engage weld where the tip touched (zero strain).
+                self.attach_limb(limb, rs.target_hold_id, anchor="tip")
                 self._reaching[limb] = None
             elif rs.t_remaining <= 0.0:
-                # Timeout — weld at the closest-approach if reasonable,
-                # else snap (the move "failed" but we don't leave the
-                # limb dangling forever).
-                self.attach_limb(limb, rs.target_hold_id)
+                # Timeout — weld where the limb ended up (the move "failed"
+                # but we don't leave the limb dangling forever). Anchoring at
+                # the tip avoids the old teleport-yank to a hold the reach
+                # never got near.
+                self.attach_limb(limb, rs.target_hold_id, anchor="tip")
                 self._reaching[limb] = None
 
     def limb_grip_force(self, limb: Limb) -> float:
@@ -805,20 +913,17 @@ class Climb3DWorld:
         mujoco.mj_forward(self.model, self.data)
         for limb, hid in grips.items():
             if hid is not None:
-                self.attach_limb(limb, hid)
+                # Anchor at the reference tip position (zero strain): the
+                # reference frame was recorded weld-consistent, so welding
+                # the tip where the reference puts it reproduces the grip
+                # without the snap-to-hold-centre reconstruction spike.
+                self.attach_limb(limb, hid, anchor="tip")
         mujoco.mj_forward(self.model, self.data)
         self._sync_actuator_targets_to_pose()
         if settle_frames > 0:
             self.step(settle_frames, check_slip=False)
             self.data.qvel[:] = 0.0
             self.slip_events.clear()
-
-    def _sync_actuator_targets_to_pose(self) -> None:
-        """Snapshot the current joint angles and write them as actuator
-        targets. After this, the actuators try to *hold* the current
-        pose rather than servo toward zero."""
-        for i, qadr in enumerate(self._actuator_jnt_qposadr):
-            self.data.ctrl[i] = self.data.qpos[qadr]
 
     def _sync_actuator_targets_to_pose(self) -> None:
         """Snapshot the current joint angles and write them as actuator

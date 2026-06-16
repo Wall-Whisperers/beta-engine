@@ -167,6 +167,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Render frames per policy action when replaying (default 120 = 2 s).",
     )
     p.add_argument(
+        "--play-steps", type=int, default=1000,
+        help="Max policy actions (env steps) per replay episode. Continuous "
+             "control is ~7.8 Hz, so 1000 ~= 128 s — enough to watch a full "
+             "climb. The old hardcoded 30 (~4 s) was a discrete-move holdover "
+             "that truncated continuous policies mid-climb.",
+    )
+    p.add_argument(
         "--slowmo", type=float, default=1.0,
         help="Replay slow-motion factor. 1.0=real time, 4.0=4x slower, "
              "10.0=ultra slow. Each policy action's physics is broken into "
@@ -349,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         env = Climbing3DEnv(
             wall, profile,
             config=EnvConfig(
-                max_steps=30,
+                max_steps=args.play_steps,
                 move_mode=args.move_mode,
                 start_mode=args.start_mode,
                 move_frames=args.play_frames,
