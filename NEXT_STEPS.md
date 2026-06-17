@@ -5,7 +5,58 @@
 > roadmap. Prune aggressively; don't let this drift into an audit doc that
 > rots while the code moves.
 >
-> Last reviewed: 2026-06-11.
+> Last reviewed: 2026-06-17.
+
+---
+
+## Where we are (2026-06-17) — the single-move reach gap is the blocker
+
+**Diagnosis (measured, not guessed).** The imitation policy cannot close a
+single move's reach deterministically. On a clean one-hand move
+(`ref_adaptive_s14`, RH h_002 -> h_048) training reaches ~80% phase-avg but
+**0% frame-0**: the deterministic hand parks **0.197 m** from the target hold
+(grip radius 0.08 m) and never grips; only exploration noise closes the last
+~12 cm (hence ~40% stochastic / 0% deterministic). Ruled out, each with a probe:
+- NOT balance/physics — the post-release 3-grip stance holds 60 steps under
+  zero action, pelvis steady;
+- NOT frame-0 undertraining — RSI annealed to cap 0 (~50% frame-0 starts) is
+  still 0%;
+- NOT the off-reference R_min cut — removing it (R_min=0) leaves the 0.197 m
+  park and 0% unchanged.
+
+This matches the long-standing `imitation.py` note ("deterministic gap 0.23 m
+while stochastic min 0.09 m"). The body is capable and stable; the wall is
+**reach precision / grip acquisition at the single-move level** — upstream of
+chaining AND of any motion-data / AMP work.
+
+**Implication: do NOT invest in the video/footage pipeline (Path C) yet.** It
+feeds styles to a controller that can't drive a limb the last 12 cm into a
+hold. Footage becomes worth collecting only after single-move deterministic
+frame-0 execution works.
+
+### Next (data-free, cost order)
+1. **Close the determinism gap** — lower `ent_coef` so the deterministic policy
+   approaches the occasionally-succeeding stochastic one. Cheapest test
+   (~5 min/run); says how much of the 0% is just det-vs-stochastic.
+2. **Reach reward's last 12 cm** — `mover_reach_coeff` is potential-based
+   (net-zero near the target), so nothing pulls the tip into the 0.08 m grip
+   radius. Add a terminal attractor or widen grip capture.
+3. **Reference reproducibility** — refs are authored by the balance-assisted
+   Cartesian reach controller but must be reproduced by the PD-servo policy;
+   keep authoring within what the policy can execute or the gap recurs.
+
+### Landed this pass
+- **Swing-aware eval** (`sim3d/imitation.py`): `eval_frame0`'s off-reference cut
+  no longer penalises the reference-released limb mid-swing — `ImitationEnv.step`
+  frees the ref-ungripped limb when `free_mover_imitation` is set and there is no
+  chain mover. Also makes the free-mover knobs function outside chain mode. (Did
+  NOT move frame-0 — the reach gap, not the cut, is the wall.)
+- **RL audit fixes** (commit `ebaa834`): VideoRolloutCallback obs-normalisation;
+  `new_high_grip_bonus` default 75 -> 0; `--play-steps` (was hardcoded 30);
+  energy penalty = `Sum((ctrl-seed)^2)` not absolute `Sum(ctrl^2)`.
+- **`dense-from-stances` refs retired** (`ref_overhang_dense_v1..v4`): all SAG
+  (net pelvis rise -0.65 .. +0.05) — not climbs. Climbing refs remain CMA-ES
+  (`ladder_v5` +0.50, `v6_smooth` +0.28, 11 moves) and stance-keyframe.
 
 ---
 

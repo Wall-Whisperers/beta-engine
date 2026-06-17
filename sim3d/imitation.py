@@ -432,9 +432,25 @@ class ImitationEnv(gym.Env):
         # Free the mover from pose/endeff tracking while it's ungripped (mid-reach):
         # the recorded swing is an authoring artifact the servos can't reproduce.
         free_limb = None
-        if (self.icfg.free_mover_imitation and self._mover_limb is not None
-                and not self.env.world.on_hold(self._mover_limb)):
-            free_limb = self._mover_limb
+        if self.icfg.free_mover_imitation:
+            if (self._mover_limb is not None
+                    and not self.env.world.on_hold(self._mover_limb)):
+                free_limb = self._mover_limb
+            elif self._mover_limb is None:
+                # No chain mover (e.g. eval_frame0 runs chain_stages=False, so
+                # _compute_mover_target returns None): free whichever limb the
+                # REFERENCE itself has released at frame t and that is currently
+                # ungripped in the env — it is mid-swing. Without this the
+                # off-reference r_imit cut terminates the episode for failing to
+                # reproduce the un-trackable recorded swing, even though
+                # free-mover TRAINING told the policy to ignore that limb's pose.
+                # This makes the headline frame-0 eval swing-aware (and makes
+                # --free-mover-imitation actually do something outside chain mode).
+                ref_g = self.ref.frame_grips(t)
+                for _l in LIMBS:
+                    if ref_g.get(_l) is None and not self.env.world.on_hold(_l):
+                        free_limb = _l
+                        break
         r_imit, comp = imitation_reward(self.env.world, self.ref, t, self.icfg.coeffs,
                                         free_limb=free_limb)
         reward = (1.0 - self.icfg.w_task) * r_imit + self.icfg.w_task * self._task_reward(t)
