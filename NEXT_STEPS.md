@@ -9,61 +9,71 @@
 
 ---
 
-## Where we are (2026-06-17) — the single-move reach gap is the blocker
+## Where we are (2026-06-17) — single-move 100%, next: multi-move
 
-**Diagnosis (measured, not guessed).** The imitation policy cannot close a
-single move's reach deterministically. On a clean one-hand move
-(`ref_adaptive_s14`, RH h_002 -> h_048) training reaches ~80% phase-avg but
-**0% frame-0**: the deterministic hand parks **0.197 m** from the target hold
-(grip radius 0.08 m) and never grips; only exploration noise closes the last
-~12 cm (hence ~40% stochastic / 0% deterministic). Ruled out, each with a probe:
-- NOT balance/physics — the post-release 3-grip stance holds 60 steps under
-  zero action, pelvis steady;
-- NOT frame-0 undertraining — RSI annealed to cap 0 (~50% frame-0 starts) is
-  still 0%;
-- NOT the off-reference R_min cut — removing it (R_min=0) leaves the 0.197 m
-  park and 0% unchanged.
+**Single-move SOLVED (2026-06-17).** `capture_v2` on `ref_adaptive_s14` (RH
+h_002→h_048, 33 frames, 3-frame swing) reached **100% frame-0 (40/40 eps)**
+deterministically. Video: 4/4 episodes reach the regrip.
+`data/runs/sim3d/imitation/capture_v2/`
 
-This matches the long-standing `imitation.py` note ("deterministic gap 0.23 m
-while stochastic min 0.09 m"). The body is capable and stable; the wall is
-**reach precision / grip acquisition at the single-move level** — upstream of
-chaining AND of any motion-data / AMP work.
+**What actually fixed it — two independent blockers, both needed:**
 
-**Implication: do NOT invest in the video/footage pipeline (Path C) yet.** It
-feeds styles to a controller that can't drive a limb the last 12 cm into a
-hold. Footage becomes worth collecting only after single-move deterministic
-frame-0 execution works.
+1. **RSI gradient starvation** (the main wall): uniform RSI over 33 frames gave
+   the 3-frame swing only 9% of training gradient. The policy learned the settled
+   final-stance phase (85% of the reference) and never trained on the swing.
+   Fix: `--rsi-phase-max 1` caps all training starts to frames [0,1] (before RH
+   releases at f02), forcing 100% of episodes through the swing. Phase-avg went
+   0%→0% for 163k steps, then jumped 0%→70% over 40k steps as the swing clicked.
 
-### Next (data-free, cost order)
-1. **Close the determinism gap** — lower `ent_coef` so the deterministic policy
-   approaches the occasionally-succeeding stochastic one. Cheapest test
-   (~5 min/run); says how much of the 0% is just det-vs-stochastic.
-2. **Reach reward's last 12 cm** — LANDED (2026-06-17): `mover_capture_coeff`
-   added to `ImitationConfig`. Fires `coeff×(1−gap/R)` per step while the mover
-   tip is inside the grip radius (0.08 m) but not yet gripped. Potential-based
-   `mover_reach_coeff` is net-zero once the tip is stationary; this term gives a
-   gradient toward the hold centre throughout the capture sphere. Expose via
-   `--mover-capture-coeff`. Try 0.2–0.5 (same scale as r_imit).
-   **Recommended first run**: `--free-mover-imitation --mover-reach-coeff 50
-   --mover-capture-coeff 0.3 --mover-grip-bonus 20 --ent-coef 0.001`
-   (lower ent_coef + tip-capture + grip bonus together; addresses all three
-   determinism-gap causes in one run on `ref_adaptive_s14`).
-3. **Reference reproducibility** — refs are authored by the balance-assisted
-   Cartesian reach controller but must be reproduced by the PD-servo policy;
-   keep authoring within what the policy can execute or the gap recurs.
+2. **Capture sphere gradient** (`mover_capture_coeff=0.3`): `mover_reach_coeff`
+   is potential-based (net-zero when stationary), so once the tip parked short
+   there was no gradient to pull it into the 0.08 m grip radius. The capture term
+   fires `coeff×(1−gap/R)` per step inside the sphere.
 
-### Landed this pass
+**Lesson (structural, applies to all future single-move references):**
+- Always set `--rsi-phase-max` to just before the mover releases. For a
+  reference where the swing starts at frame F, use `--rsi-phase-max F`.
+- Always pair `--mover-reach-coeff` with `--mover-capture-coeff`.
+- The 3-frame swing proved physically achievable with PD servos (CMA-ES authored
+  it directly in MuJoCo with the same servo model). The policy can execute it
+  once it has enough gradient.
+
+### Next: apply the recipe to the multi-move case
+
+The same two fixes should apply to `ref_ladder_v6_smooth` (11 moves, 552 frames)
+using the chain curriculum. For each chain stage k:
+- `chain_rsi_at_stage_start=True` already focuses mid-window RSI at the stage
+  boundary — combine with the capture_coeff.
+- Add `--mover-capture-coeff 0.3 --mover-grip-bonus 20 --ent-coef 0.001` to
+  the chain run.
+
+**Recommended next run** (chain on the 11-move reference with capture fix):
+```
+python -m sim3d.imitation --train \
+  --ref data/runs/sim3d/imitation/ref_ladder_v6_smooth.npz \
+  --chain --chain-rsi-at-stage-start \
+  --free-mover-imitation \
+  --mover-reach-coeff 50 --mover-capture-coeff 0.3 --mover-grip-bonus 20 \
+  --ent-coef 0.001 \
+  --steps 2000000 --n-envs 8 --run-id imitation/ladder_chain_capture_v1
+```
+
+Watch for: stage advancement log (`stages X-X`), and per-stage frame-0
+sub-evals if you add them. The chain curriculum already gates each move behind
+a 70% ground-start success bar — with the RSI cap fix baked in via
+`chain_rsi_at_stage_start`, each stage should now behave like the single-move
+case did.
+
+### Landed this session (2026-06-17)
+- **`mover_capture_coeff`** — dense within-grip-sphere bonus; fixes the
+  "last 12 cm" gradient gap that potential-based `mover_reach_coeff` can't supply.
 - **Swing-aware eval** (`sim3d/imitation.py`): `eval_frame0`'s off-reference cut
-  no longer penalises the reference-released limb mid-swing — `ImitationEnv.step`
-  frees the ref-ungripped limb when `free_mover_imitation` is set and there is no
-  chain mover. Also makes the free-mover knobs function outside chain mode. (Did
-  NOT move frame-0 — the reach gap, not the cut, is the wall.)
+  no longer penalises the reference-released limb mid-swing.
 - **RL audit fixes** (commit `ebaa834`): VideoRolloutCallback obs-normalisation;
-  `new_high_grip_bonus` default 75 -> 0; `--play-steps` (was hardcoded 30);
+  `new_high_grip_bonus` default 75 → 0; `--play-steps` (was hardcoded 30);
   energy penalty = `Sum((ctrl-seed)^2)` not absolute `Sum(ctrl^2)`.
-- **`dense-from-stances` refs retired** (`ref_overhang_dense_v1..v4`): all SAG
-  (net pelvis rise -0.65 .. +0.05) — not climbs. Climbing refs remain CMA-ES
-  (`ladder_v5` +0.50, `v6_smooth` +0.28, 11 moves) and stance-keyframe.
+- **`dense-from-stances` refs retired** (`ref_overhang_dense_v1..v4`): all SAG.
+  Climbing refs remain CMA-ES (`ladder_v5` +0.50, `v6_smooth` +0.28, 11 moves).
 
 ---
 
