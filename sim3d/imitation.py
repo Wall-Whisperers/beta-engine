@@ -344,15 +344,15 @@ class ImitationEnv(gym.Env):
             if self.np_random.random() >= self.icfg.chain_mid_frac:
                 self._phase = 0
             else:
-                if self.icfg.chain_rsi_at_stage_start and self._chain_stage >= 2:
-                    # RSI exactly at the stage boundary: 100% of mid-window
-                    # gradient goes to the move that stage k must learn.
-                    # For stage 3 (RF high-step, boundary f84): all 65% of
-                    # mid-window episodes start at f84 where LH/RH/LF are
-                    # correctly welded and RF is free, so the policy is
-                    # continuously trained on the RF swing from the right state.
-                    # No free-grip inflation (RF is not gripped at stage boundary).
-                    prev_end = self._chain_bounds[self._chain_stage - 2]
+                if self.icfg.chain_rsi_at_stage_start:
+                    # RSI exactly at the PRIOR stage boundary so 100% of
+                    # mid-window gradient goes to the move stage k must learn.
+                    # For stage 1 the prior boundary is frame 0 (start of the
+                    # reference), making every mid-window episode a ground start
+                    # — same effect as rsi_phase_max=0 on a single-move ref.
+                    # For stage k≥2 it's the frame where the prior move settled.
+                    prev_end = (0 if self._chain_stage == 1
+                                else self._chain_bounds[self._chain_stage - 2])
                     self._phase = prev_end
                 elif self.icfg.chain_rsi_before_stage and self._chain_stage >= 2:
                     # Restrict RSI to before the current stage's active window
