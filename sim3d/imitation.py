@@ -160,6 +160,16 @@ class ImitationConfig:
     # 0.23 m while stochastic min 0.09 m). A big grip payoff makes committing
     # to the full swing worth the slip/fall risk. 0.0 disables.
     mover_grip_bonus: float = 0.0
+    # Dense per-step bonus when the mover tip is INSIDE the grip capture sphere
+    # (within GRIP_PROXIMITY_M of the target hold). The potential-based
+    # mover_reach_coeff creates a gradient toward the hold from far away but is
+    # net-zero once the tip stops moving — it cannot pull the tip the last few
+    # cm into the 0.08 m radius. This term gives r = coeff × (1 - gap/R) per
+    # step while gap < R, peaking at 1×coeff at the hold center and 0 at the
+    # boundary. Unlike mover_grip_bonus (one-shot on grip), this fires every
+    # step inside the radius so the optimization landscape has a gradient toward
+    # commitment. 0.0 disables. Try coeff ≈ 0.2–0.5 (same scale as r_imit).
+    mover_capture_coeff: float = 0.0
 
     # ── Stance-milestone mode (the 2026-06-15 reframe) ──────────────────────
     # When True, the reference is a STANCE-KEYFRAME skeleton (settled welded
@@ -500,6 +510,20 @@ class ImitationEnv(gym.Env):
             self._mover_grip_awarded = True
             reward += self.icfg.mover_grip_bonus
 
+        # Dense capture bonus: fires every step the mover tip is within the
+        # grip radius of its target hold (but hasn't gripped yet). Adds a
+        # gradient the potential-based mover_reach_coeff can't supply: once
+        # the tip is stationary Δdist = 0 and that reward is zero; this term
+        # keeps pulling toward the hold centre throughout the capture sphere.
+        if (self.icfg.mover_capture_coeff > 0 and not terminated
+                and self._mover_limb is not None
+                and self._mover_hold_pos is not None
+                and not self.env.world.on_hold(self._mover_limb)):
+            tip = self.env.world.limb_tip_pos(self._mover_limb)
+            gap = float(np.linalg.norm(tip - self._mover_hold_pos))
+            if gap < cfg.GRIP_PROXIMITY_M:
+                reward += self.icfg.mover_capture_coeff * (1.0 - gap / cfg.GRIP_PROXIMITY_M)
+
         # Per-step grip-retention penalty for non-mover limbs: fires each step
         # a limb the reference keeps gripped has slipped. Directly addresses the
         # "lose LH during foot step" local optimum where the diluted endeff
@@ -617,6 +641,8 @@ class ImitationEnv(gym.Env):
             if self._prev_mover_gap < float("inf"):
                 reward += self.icfg.mover_reach_coeff * (self._prev_mover_gap - gap)
             self._prev_mover_gap = gap
+            if (self.icfg.mover_capture_coeff > 0 and gap < cfg.GRIP_PROXIMITY_M):
+                reward += self.icfg.mover_capture_coeff * (1.0 - gap / cfg.GRIP_PROXIMITY_M)
 
         terminated = False
         outcome = ""
@@ -1051,6 +1077,14 @@ def main() -> None:
                     help="Sparse one-shot reward the step the mover limb grips its "
                          "target hold. Rewards the reach OUTCOME so committing the "
                          "full swing beats parking the foot short. Try 20-40.")
+    ap.add_argument("--mover-capture-coeff", type=float, default=0.0,
+                    help="Dense per-step bonus when the mover tip is inside the grip "
+                         "capture sphere (within GRIP_PROXIMITY_M = 0.08 m). Fires "
+                         "coeff×(1-gap/R) each step, peaking at coeff at the hold "
+                         "center. Addresses the 'last 12 cm' problem: mover_reach_coeff "
+                         "is potential-based (net-zero when stationary) so has no "
+                         "gradient inside the capture sphere; this term does. "
+                         "Try 0.2-0.5 (same scale as r_imit). 0.0 disables.")
     ap.add_argument("--stance-milestone", action="store_true",
                     help="stance-keyframe milestone mode: RSI to a stance, reach "
                          "the next one (pose attractor + grip-match); RL learns "
@@ -1102,6 +1136,7 @@ def main() -> None:
                            chain_rsi_at_stage_start=args.chain_rsi_at_stage_start,
                            free_mover_imitation=args.free_mover_imitation,
                            mover_grip_bonus=args.mover_grip_bonus,
+                           mover_capture_coeff=args.mover_capture_coeff,
                            stance_milestone=args.stance_milestone,
                            milestone_budget=args.milestone_budget)
 

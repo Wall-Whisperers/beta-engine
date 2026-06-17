@@ -38,9 +38,16 @@ frame-0 execution works.
 1. **Close the determinism gap** — lower `ent_coef` so the deterministic policy
    approaches the occasionally-succeeding stochastic one. Cheapest test
    (~5 min/run); says how much of the 0% is just det-vs-stochastic.
-2. **Reach reward's last 12 cm** — `mover_reach_coeff` is potential-based
-   (net-zero near the target), so nothing pulls the tip into the 0.08 m grip
-   radius. Add a terminal attractor or widen grip capture.
+2. **Reach reward's last 12 cm** — LANDED (2026-06-17): `mover_capture_coeff`
+   added to `ImitationConfig`. Fires `coeff×(1−gap/R)` per step while the mover
+   tip is inside the grip radius (0.08 m) but not yet gripped. Potential-based
+   `mover_reach_coeff` is net-zero once the tip is stationary; this term gives a
+   gradient toward the hold centre throughout the capture sphere. Expose via
+   `--mover-capture-coeff`. Try 0.2–0.5 (same scale as r_imit).
+   **Recommended first run**: `--free-mover-imitation --mover-reach-coeff 50
+   --mover-capture-coeff 0.3 --mover-grip-bonus 20 --ent-coef 0.001`
+   (lower ent_coef + tip-capture + grip bonus together; addresses all three
+   determinism-gap causes in one run on `ref_adaptive_s14`).
 3. **Reference reproducibility** — refs are authored by the balance-assisted
    Cartesian reach controller but must be reproduced by the PD-servo policy;
    keep authoring within what the policy can execute or the gap recurs.
