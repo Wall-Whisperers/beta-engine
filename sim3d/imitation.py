@@ -464,17 +464,19 @@ class ImitationEnv(gym.Env):
                 free_limb = self._mover_limb
             elif self._mover_limb is None:
                 # No chain mover (e.g. eval_frame0 runs chain_stages=False, so
-                # _compute_mover_target returns None): free whichever limb the
-                # REFERENCE itself has released at frame t and that is currently
-                # ungripped in the env — it is mid-swing. Without this the
-                # off-reference r_imit cut terminates the episode for failing to
-                # reproduce the un-trackable recorded swing, even though
-                # free-mover TRAINING told the policy to ignore that limb's pose.
-                # This makes the headline frame-0 eval swing-aware (and makes
-                # --free-mover-imitation actually do something outside chain mode).
-                ref_g = self.ref.frame_grips(t)
+                # _compute_mover_target returns None): free whichever limb is
+                # currently ungripped in the ENV — it is mid-transition (swinging
+                # toward its next hold, or released). Key off the env's grip state,
+                # NOT the reference's grip schedule: stance-keyframe references
+                # (discover --stances) flip the grip label to the TARGET hold ~1
+                # frame after release, so keying off the reference stops freeing
+                # the limb while it is still mid-swing — cratering r_imit and
+                # cutting the headline frame-0 eval (observed: RH eval cut at
+                # frame 3 though the grip physically closes at ~frame 5). Once the
+                # limb grips, on_hold() is truthy and its pose is tracked again —
+                # matching the chain-mover behaviour above.
                 for _l in LIMBS:
-                    if ref_g.get(_l) is None and not self.env.world.on_hold(_l):
+                    if not self.env.world.on_hold(_l):
                         free_limb = _l
                         break
         r_imit, comp = imitation_reward(self.env.world, self.ref, t, self.icfg.coeffs,
