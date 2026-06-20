@@ -345,15 +345,31 @@ class ImitationEnv(gym.Env):
                 self._phase = 0
             else:
                 if self.icfg.chain_rsi_at_stage_start:
-                    # RSI exactly at the PRIOR stage boundary so 100% of
-                    # mid-window gradient goes to the move stage k must learn.
-                    # For stage 1 the prior boundary is frame 0 (start of the
-                    # reference), making every mid-window episode a ground start
-                    # — same effect as rsi_phase_max=0 on a single-move ref.
-                    # For stage k≥2 it's the frame where the prior move settled.
+                    # RSI at or near the PRIOR stage boundary. For stage 1 this
+                    # is frame 0 (ground start). For stage k≥2 we spread across
+                    # the free-swing window [prev_end, first_grip_frame) so that
+                    # some episodes start with the mover mid-flight — the mover
+                    # arrives at the target under its reference velocity and
+                    # falls back through the grip window in the first few steps,
+                    # giving the policy easy grip completions to bootstrap from.
+                    # This is a within-stage reverse curriculum: learn "close the
+                    # last few cm" first, then backprop to teach the full swing.
                     prev_end = (0 if self._chain_stage == 1
                                 else self._chain_bounds[self._chain_stage - 2])
-                    self._phase = prev_end
+                    swing_hi = prev_end
+                    if self._chain_stage >= 2:
+                        # Walk forward until the first frame where ALL limbs
+                        # that were free at prev_end become gripped again.
+                        grips_prev = self.ref.frame_grips(prev_end)
+                        free_at_start = {l for l in ("LH", "RH", "LF", "RF")
+                                         if grips_prev.get(l) is None}
+                        for f in range(prev_end + 1, min(prev_end + 30, stage_end)):
+                            grips_f = self.ref.frame_grips(f)
+                            if any(grips_f.get(l) is None for l in free_at_start):
+                                swing_hi = f
+                            else:
+                                break
+                    self._phase = int(self.np_random.integers(prev_end, swing_hi + 1))
                 elif self.icfg.chain_rsi_before_stage and self._chain_stage >= 2:
                     # Restrict RSI to before the current stage's active window
                     # so RSI can't auto-grip the mover limb from the reference
