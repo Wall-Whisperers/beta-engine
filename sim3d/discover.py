@@ -755,6 +755,15 @@ def _reachable_holds(
     # routes on dense walls (and, before held-hold exclusion, outright
     # wiggle-in-place re-grips). Hopeless probes keep the by-gap order as a
     # fallback tail.
+    # FEET rank by closest gap, not highest hold. The "aim high" heuristic is
+    # for hands (avoid timid micro-moves); applied to feet it picks a foothold
+    # higher than the foot's ~5-6 cm open-loop reach ceiling, so the foot never
+    # grips (measured 2026-06-19: the cycle kept trying 10-16 cm footholds and
+    # skipping the 6 cm one that DOES grip). For feet, the closest reachable
+    # foothold is the only one that closes, so try it first.
+    if mover in ("LF", "RF"):
+        results.sort(key=lambda r: r[0])
+        return results
     plausible = [r for r in results if r[0] < 0.25]
     hopeless = [r for r in results if r[0] >= 0.25]
     plausible.sort(key=lambda r: -float(w._hold_meta_by_id[r[1]]["world_pos"][2]))
@@ -812,6 +821,7 @@ def discover_climb_adaptive(
     sigma0: float = 0.5, settle_pre: int = 2, wall_gen_seed: int = 7,
     max_gap_m: float = 0.04, probe_evals: int = 80, restarts: int = 1,
     foot_balance_cap_n: float = 0.0, seed_x0: np.ndarray | None = None,
+    foot_max_gap_m: float | None = None,
 ) -> tuple[Reference, list[dict]]:
     """Adaptive CMA-ES climb discovery: after each move, probe all reachable
     holds for the next free hand and greedily pick the closest-landing one.
@@ -910,13 +920,18 @@ def discover_climb_adaptive(
                 # from a post-foot-step crouch the reachable holds sit 0.7-1.0 m
                 # from the tip; knee extension (stand-up) closes them, but only
                 # if the probe radius lets them be candidates at all
+            # Feet: lower the upward-gain floor (default 0.08). The open-loop
+            # foot reaches only ~5-6 cm up, so an 8 cm floor excludes every
+            # foothold the foot can actually grip. 0.04 lets a small (5-7 cm)
+            # foot step be an eligible target — the foot CAN grip those.
+            min_gain = 0.04 if next_mover in _LEG else 0.08
             print(f"  probing {next_mover} candidates (visited={len(visited)})…", flush=True)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 candidates = _reachable_holds(w, start, next_mover,
                                               max_dist_m=max_dist,
                                               max_probe_evals=probe_evals,
-                                              visited=visited)
+                                              visited=visited, min_z_gain_m=min_gain)
             if not candidates:
                 diag.append({"status": f"no holds within range for {next_mover} "
                                        f"after step {step}"})
@@ -926,26 +941,29 @@ def discover_climb_adaptive(
             # tries the full budget — the probe is a ranker, not a filter.
             for probe_gap, hid, probe_x in candidates[:4]:
                 print(f"    trying {next_mover}→{hid} (probe_gap={probe_gap:.3f}m)…", flush=True)
-                # Foot moves: the open-loop swing sags ~9 cm short of any target
-                # (true even with 10 cm-spaced footholds — it's leg-lift-under-
-                # hang, NOT foothold spacing). A capped pelvis balance assist
-                # holds the body during the swing (≈ what a trained policy
-                # weight-shifts), letting the foot reach the hold. Hands don't
-                # need it (their reach closes open-loop).
-                bcap = foot_balance_cap_n if next_mover in _LEG else 0.0
+                # Foot moves: the open-loop swing tops out ~5-6 cm above its hang
+                # start and won't close to a tight grip (NOT fixable by balance
+                # assist or foothold spacing — measured 2026-06-19). So accept a
+                # looser landing for feet (foot_max_gap_m, default = max_gap_m):
+                # a foot that GRIPS inside the 0.08 m capture sphere is trainable
+                # by free_mover_imitation even though it isn't tight. Hands keep
+                # the tight bar. balance_cap_n is opt-in (default off — no effect).
+                is_foot = next_mover in _LEG
+                gap_bar = (foot_max_gap_m if foot_max_gap_m is not None else max_gap_m) if is_foot else max_gap_m
+                bcap = foot_balance_cap_n if is_foot else 0.0
                 _, full_info = discover_move(w, start, next_mover, hid,
                                              horizon=horizon, max_evals=max_evals,
                                              sigma0=sigma0 * 0.5,   # tighter sigma — warm-starting
                                              x0=probe_x, restarts=restarts,
-                                             max_gap_m=max_gap_m, balance_cap_n=bcap)
+                                             max_gap_m=gap_bar, balance_cap_n=bcap)
                 diag.append({"probe": {"mover": next_mover, "target": hid,
                                        "probe_gap": round(probe_gap, 3),
                                        "full_gap": round(full_info["gap"], 3),
                                        "landed": full_info["landed"],
                                        "warm_start": probe_x is not None}})
-                full_tight = bool(full_info["landed"]) and full_info["gap"] <= max_gap_m
+                full_tight = bool(full_info["landed"]) and full_info["gap"] <= gap_bar
                 print(f"    → gap={full_info['gap']:.3f}m  landed={full_info['landed']}  "
-                      f"tight={full_tight} (≤{max_gap_m:.2f})", flush=True)
+                      f"accept={full_tight} (≤{gap_bar:.2f})", flush=True)
                 if full_tight:
                     current_mover, current_target = next_mover, hid
                     found = True
@@ -1027,6 +1045,12 @@ def main() -> None:
                     help="adaptive mode: probe the feasible first-moves and pick "
                          "the tightest-landing one instead of feas[0]. feas[0] is "
                          "only 2D-vetted and is often unclosable by the 3D body.")
+    ap.add_argument("--foot-max-gap", type=float, default=None,
+                    help="adaptive mode: separate (looser) landing bar for FOOT "
+                         "moves. Open-loop foot reach tops out ~5-6 cm short, so a "
+                         "foot that merely GRIPS (gap < 0.08) is trainable by "
+                         "free_mover_imitation. Hands keep --max-gap. Default: "
+                         "same as --max-gap.")
     ap.add_argument("--foot-balance", type=float, default=0.0,
                     help="adaptive mode: capped pelvis balance-assist force (N) "
                          "during FOOT-move swings only. The open-loop foot reach "
@@ -1329,7 +1353,7 @@ def main() -> None:
             max_moves=args.max_moves, max_evals=args.max_evals,
             max_gap_m=args.max_gap, restarts=args.restarts,
             foot_balance_cap_n=args.foot_balance, seed_x0=seed_x0,
-            wall_gen_seed=args.seed,
+            foot_max_gap_m=args.foot_max_gap, wall_gen_seed=args.seed,
         )
     else:
         want = [int(x) for x in args.moves.split(",")]

@@ -55,40 +55,44 @@ fixable by the above:
   still needs the move to be *action-reachable*, which open-loop CMA can't
   currently author here.
 
-### Authoring-side foot fixes — TESTED AND RULED OUT (2026-06-19)
+### Foot-move AUTHORING — SOLVED (2026-06-19). The blocker was candidate selection, not foot reach.
 
-The foot reaches a HARD CEILING of ~5–6 cm up from a hang stance in open-loop
-`discover_move`, and won't close to a tight grip. Measured on the fine test
-walls (`footstep-fine-v1.json` @10 cm, `footstep-fine5-v1.json` @5 cm):
-- **Balance assist does NOTHING** — LF→f_003 (11.3 cm straight up): gap 7.7 cm
-  at 0 N, 7.8 at 250 N, 7.9 at 500 N. Flat. The shortfall is not body-sag.
-- **Finer footholds don't help** — at 5 cm spacing the foot still can't close:
-  6.3 cm step → 4.9 cm gap, 11.3 → 7.1, 16.3 → 10.0 (no grip). The foot tops
-  out at ~0.48 m (~5 cm above its 0.41 m start) regardless of target.
-- So smaller steps + balance + spacing are all dead ends. **Open-loop CMA is the
-  wrong tool for foot moves** — it can't produce the active weight-shift that
-  lifts an unweighted foot.
+Foot moves DO author tight — the earlier "open-loop foot reach is a hard wall"
+read was wrong. The real blocker was the cycle picking the WRONG foothold:
+- `_reachable_holds` ranked candidates "aim high" (highest hold first) — correct
+  for hands, fatal for feet: it forced the foot at footholds 10–16 cm up, beyond
+  its ~5–6 cm reach, so the foot never gripped. The close 6 cm foothold (which
+  DOES grip) was skipped, AND the 0.08 m `min_z_gain_m` floor excluded it too.
+- Fix (both in `_reachable_holds` / the cycle): FEET rank by CLOSEST gap, and use
+  a 0.04 m gain floor. Plus `--foot-max-gap` (looser accept bar for feet; hands
+  keep `--max-gap`).
+- Result: `ref_footstep_fm1.npz` (3 moves on `footstep-fine5-v1.json` @5 cm):
+  RH hand 0.014 m, **LF foot 0.031 m, RF foot 0.040 m — all tight**, +0.07 m net.
+  Command: `python -m sim3d.discover --adaptive --wall
+  data/examples/footstep-fine5-v1.json --auto-first-move --max-moves 3
+  --max-gap 0.04 --foot-max-gap 0.08 --restarts 3`.
+- Balance assist (`--foot-balance`) turned out NOT needed (it did nothing in the
+  earlier sweep because the target was unreachable, not because of sag).
 
-### Concrete next step — TRAIN the foot move with free-mover (training-side, not authoring)
+### Concrete next step — TRAIN ref_footstep_fm1 with free-mover (the actual headline test)
 
-The closed-loop RL policy CAN do what open-loop CMA can't (active weight-shift +
-capture-sphere closing). `free_mover_imitation` already exists
-(`sim3d/imitation.py:154,461`; `--free-mover-imitation`): it excludes the
-mover's joints/tip from the pose term and rewards reaching the REAL hold, so it
-doesn't need a tight authored foot landing — only that the foot grip be inside
-the 0.08 m capture sphere (it is: open-loop lands ~7.7 cm = within 8 cm).
-- Author a short reference whose foot move grips (gap < 0.08, which open-loop
-  CAN do) on a fine-foothold wall via the now-reliable hand pipeline
-  (`--auto-first-move`) + the foot move.
-- Train: `--chain --free-mover-imitation --mover-capture-coeff 0.3
-  --rsi-phase-max <foot-swing-start>` (the capture_v2 recipe, foot variant).
-- Headline question: can the policy close the last ~6 cm the open-loop author
-  couldn't? If yes, foot moves are unblocked. If no, the foot ROM/strength under
-  hang needs a body-model look (hip_flex torque cap, or a stand-up primitive).
+`probe_footstep ref_footstep_fm1.npz`: **LF move FEASIBLE** (constant-replay
+7.1 cm, inside the 0.08 m capture sphere); RF marginal (9.0 cm). The recorded
+POSES sag on replay (3–4 cm authored → 7–9 cm replayed) — the documented reason
+foot moves need `free_mover_imitation` (reward reaching the real hold, ignore the
+un-trackable foot pose). `free_mover_imitation` is wired (`imitation.py:154,461`;
+`--free-mover-imitation`).
+- Train the LF foot move (stage with the feasible foot move): `--chain
+  --free-mover-imitation --mover-capture-coeff 0.3 --rsi-phase-max <LF-swing-start>`
+  (capture_v2 recipe). LF swing starts at frame ~43 (move_starts[1]).
+- Headline question: can the closed-loop policy + capture sphere close the LF
+  foot grip the way it did the hand move in capture_v2? If yes → foot moves
+  unblocked, first time. If no → look at hip_flex torque cap under hang.
+- (Optional) re-author with `--max-moves 2` for a cleaner single-foot-move
+  reference, or pick a wall/stance where the RF move is also feasible.
 
-**Do NOT** re-litigate hand-move selection/tightness (solved), retry balance
-assist / finer footholds / smaller steps for foot AUTHORING (all ruled out
-above), or sweep `build_tight_wall` seeds blindly.
+**Do NOT** re-litigate hand-move selection/tightness or foot candidate selection
+(both solved), or retry foot balance-assist (no effect).
 
 ---
 
