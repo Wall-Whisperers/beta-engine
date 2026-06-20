@@ -169,7 +169,7 @@ def discover_move(
     horizon: int = 30, max_evals: int = 300, sigma0: float = 0.5,
     x0: np.ndarray | None = None, restarts: int = 0,
     balance_cap_n: float = 0.0, balance_kp: float = 500.0,
-    com_drop_max: float = 0.10,
+    com_drop_max: float = 0.10, max_gap_m: float | None = None,
 ) -> tuple[list[dict], dict]:
     """CMA-ES-discover a single move from ``start_frame``. Returns
     ``(recorded_frames, info)``. ``w`` is a scratch world reused across the
@@ -306,10 +306,25 @@ def discover_move(
             cost, frames, info = rollout(np.asarray(xbest), record=True)
             info["x_best"] = xbest   # expose best residual for warm-starting
             info["attempts"] = attempt + 1
-            key = (0 if info["landed"] else 1, cost)
+            # Selection key. By default rank landed attempts by full cost
+            # (posture/smoothness/lean matter for trackability). But when chasing
+            # a tight landing, rank by GAP first — cost is dominated by the
+            # posture term (~1.5) over 10·gap (~0.5 at small gaps), so a
+            # cost-ranked best returned a loose 0.054 m attempt even though a
+            # 0.017 m one was found, contradicting the chase. Tie-break by cost.
+            if max_gap_m is not None:
+                key = (0 if info["landed"] else 1, info["gap"], cost)
+            else:
+                key = (0 if info["landed"] else 1, cost)
             if best is None or key < best[0]:
                 best = (key, frames, info)
-            if info["landed"]:
+            # Stop early only on a TIGHT landing. Without max_gap_m, any landing
+            # inside the 0.08 m grip radius ends the search — so a loose 6 cm
+            # attempt-0 result was returned and restarts never tightened it.
+            # With max_gap_m set, keep restarting until the tip lands within it
+            # (or restarts exhaust), returning the tightest attempt.
+            tight_enough = info["landed"] and (max_gap_m is None or info["gap"] <= max_gap_m)
+            if tight_enough:
                 break
     finally:
         cfg.BALANCE_KP = kp0
@@ -747,11 +762,56 @@ def _reachable_holds(
     return plausible + hopeless
 
 
+def select_first_move(
+    wall: Wall, profile: ClimberProfile, feas: list[dict], *,
+    max_candidates: int = 8, probe_evals: int = 250, sigma0: float = 0.5,
+    restarts: int = 1, max_gap_m: float = 0.05,
+) -> tuple[dict, dict]:
+    """Probe the feasible first-moves and return the one that lands TIGHTEST.
+
+    ``feasible_reach_moves`` only vets hang-stability + a 2D reach distance
+    (≤ max_reach_m); it never checks the move actually closes to the grip
+    radius under the 3D body. Greedy ``feas[0]`` therefore often starts the
+    whole chain on an unclosable move (seed 14: LH→h_049 is "feasible" but CMA
+    lands it at 0.37 m even full-strength). Rank candidates by their REAL CMA
+    landing gap instead. Returns ``(best_move, best_info)``.
+
+    Probes the closest-reach candidates first (smallest ``reach_d0``) and caps
+    at ``max_candidates`` to bound cost; uses light ``probe_evals`` since this
+    is a ranker — the chosen move is re-run at full budget by discovery.
+    """
+    cands = sorted(feas, key=lambda m: m.get("reach_d0", 1e9))[:max_candidates]
+    scored: list[tuple[float, bool, dict, dict]] = []
+    for m in cands:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            w = Climb3DWorld(wall, profile)
+            w.seed_pose(**m["seed_kwargs"])
+        start = _snapshot(w)
+        _frames, info = discover_move(
+            w, start, m["mover"], m["target"], max_evals=probe_evals,
+            sigma0=sigma0, restarts=restarts, max_gap_m=max_gap_m,
+        )
+        tight = bool(info["landed"]) and info["gap"] <= max_gap_m
+        scored.append((info["gap"], tight, m, info))
+        print(f"  first-move probe: {m['mover']}→{m['target']} "
+              f"(k={m['move_k']}, reach_d0={m.get('reach_d0')})  "
+              f"gap={info['gap']:.3f}m  landed={info['landed']}  tight={tight}",
+              flush=True)
+    # Prefer a tight landing, then any landing, then smallest gap.
+    scored.sort(key=lambda s: (0 if s[1] else 1, 0 if s[3]["landed"] else 1, s[0]))
+    best_gap, _tight, best_move, best_info = scored[0]
+    print(f"  → selected first move {best_move['mover']}→{best_move['target']} "
+          f"(k={best_move['move_k']}, probe gap {best_gap:.3f}m)", flush=True)
+    return best_move, best_info
+
+
 def discover_climb_adaptive(
     wall: Wall, profile: ClimberProfile, seed_move: dict, *,
     max_moves: int = 12, horizon: int = 40, max_evals: int = 350,
     sigma0: float = 0.5, settle_pre: int = 2, wall_gen_seed: int = 7,
-    max_gap_m: float = 0.04, probe_evals: int = 80,
+    max_gap_m: float = 0.04, probe_evals: int = 80, restarts: int = 1,
+    foot_balance_cap_n: float = 0.0, seed_x0: np.ndarray | None = None,
 ) -> tuple[Reference, list[dict]]:
     """Adaptive CMA-ES climb discovery: after each move, probe all reachable
     holds for the next free hand and greedily pick the closest-landing one.
@@ -792,19 +852,32 @@ def discover_climb_adaptive(
             break
 
         move_starts.append(len(frames))
+        # Warm-start the FIRST move from the selector's probe solution. CMA
+        # landing gap has high run-to-run variance (same move: 0.013 m one run,
+        # 0.062 m the next); without this the full-budget step-0 search cold-
+        # starts and often lands in a looser basin than the probe already found,
+        # so auto-selected moves were rejected by the tight bar they'd passed.
+        move_x0 = seed_x0 if step == 0 else None
         move_frames, info = discover_move(
             w, start, current_mover, current_target,
-            horizon=horizon, max_evals=max_evals, sigma0=sigma0, restarts=1,
+            horizon=horizon, max_evals=max_evals, sigma0=sigma0, restarts=restarts,
+            max_gap_m=max_gap_m, x0=move_x0,
         )
         entry = {"step": step, "mover": current_mover,
                  "target": current_target, **info}
         diag.append(entry)
+        # Tight-landing bar: a move that grips but parks at gap ~0.07 m trains
+        # poorly (the policy can't reliably get the tip inside 0.08 to grip).
+        # Require gap ≤ max_gap_m, not just the loose `landed` (on_hold) flag.
+        tight = bool(info["landed"]) and info["gap"] <= max_gap_m
         print(f"  step {step}: {current_mover}→{current_target}  "
-              f"gap={info['gap']:.3f}m  landed={info['landed']}", flush=True)
+              f"gap={info['gap']:.3f}m  landed={info['landed']}  "
+              f"tight={tight} (≤{max_gap_m:.2f})", flush=True)
         frames.extend(move_frames)
 
-        if not info["landed"]:
-            msg = f"aborted at step {step}: gap {info['gap']:.3f}m on {current_mover}→{current_target}"
+        if not tight:
+            why = "did not grip" if not info["landed"] else f"gap {info['gap']:.3f}m > {max_gap_m:.2f}m (marginal)"
+            msg = f"aborted at step {step}: {why} on {current_mover}→{current_target}"
             diag.append({"status": msg})
             print(f"  {msg}", flush=True)
             break
@@ -853,17 +926,27 @@ def discover_climb_adaptive(
             # tries the full budget — the probe is a ranker, not a filter.
             for probe_gap, hid, probe_x in candidates[:4]:
                 print(f"    trying {next_mover}→{hid} (probe_gap={probe_gap:.3f}m)…", flush=True)
+                # Foot moves: the open-loop swing sags ~9 cm short of any target
+                # (true even with 10 cm-spaced footholds — it's leg-lift-under-
+                # hang, NOT foothold spacing). A capped pelvis balance assist
+                # holds the body during the swing (≈ what a trained policy
+                # weight-shifts), letting the foot reach the hold. Hands don't
+                # need it (their reach closes open-loop).
+                bcap = foot_balance_cap_n if next_mover in _LEG else 0.0
                 _, full_info = discover_move(w, start, next_mover, hid,
                                              horizon=horizon, max_evals=max_evals,
                                              sigma0=sigma0 * 0.5,   # tighter sigma — warm-starting
-                                             x0=probe_x, restarts=1)
+                                             x0=probe_x, restarts=restarts,
+                                             max_gap_m=max_gap_m, balance_cap_n=bcap)
                 diag.append({"probe": {"mover": next_mover, "target": hid,
                                        "probe_gap": round(probe_gap, 3),
                                        "full_gap": round(full_info["gap"], 3),
                                        "landed": full_info["landed"],
                                        "warm_start": probe_x is not None}})
-                print(f"    → gap={full_info['gap']:.3f}m  landed={full_info['landed']}", flush=True)
-                if full_info["landed"]:
+                full_tight = bool(full_info["landed"]) and full_info["gap"] <= max_gap_m
+                print(f"    → gap={full_info['gap']:.3f}m  landed={full_info['landed']}  "
+                      f"tight={full_tight} (≤{max_gap_m:.2f})", flush=True)
+                if full_tight:
                     current_mover, current_target = next_mover, hid
                     found = True
                     break
@@ -932,8 +1015,24 @@ def main() -> None:
                          "end-of-move stance instead of a fixed move list)")
     ap.add_argument("--max-moves", type=int, default=12,
                     help="max moves to discover in adaptive mode")
+    ap.add_argument("--max-gap", type=float, default=0.04,
+                    help="adaptive mode: tight landing bar (m). A move is only "
+                         "accepted if its tip lands within this gap of the hold, "
+                         "not merely inside the 0.08 m grip radius. Marginal "
+                         "landings (gap ~0.07) grip but don't train — see "
+                         "NEXT_STEPS 'Landing tightness'. Default 0.04.")
     ap.add_argument("--first-move", type=str, default=None,
                     help="adaptive mode: 'move_k' of the first move (default: first feasible)")
+    ap.add_argument("--auto-first-move", action="store_true",
+                    help="adaptive mode: probe the feasible first-moves and pick "
+                         "the tightest-landing one instead of feas[0]. feas[0] is "
+                         "only 2D-vetted and is often unclosable by the 3D body.")
+    ap.add_argument("--foot-balance", type=float, default=0.0,
+                    help="adaptive mode: capped pelvis balance-assist force (N) "
+                         "during FOOT-move swings only. The open-loop foot reach "
+                         "sags ~9 cm short of any target (leg-lift-under-hang); a "
+                         "small cap (~150-300 N ≈ a policy's weight-shift) closes "
+                         "it. 0 = off. Hands never use it.")
     ap.add_argument("--continue-from", type=str, default=None,
                     help="adaptive mode: continue from the last frame of an existing "
                          "reference .npz (loads the matching .wall.json alongside it); "
@@ -1193,7 +1292,12 @@ def main() -> None:
         profile = ClimberProfile()
         with contextlib.redirect_stderr(io.StringIO()), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            wall = load_wall(wd, cell_size_cm=DEFAULT_CELL_SIZE_CM)
+            # Respect the wall's own cell_size_cm (fall back to the default only
+            # if the JSON omits it). Forcing DEFAULT_CELL_SIZE_CM here silently
+            # rescaled fine-grid walls (e.g. a 10 cm foot-step test wall) to
+            # 20 cm, defeating finer foothold spacing.
+            cell = wd.get("grid", {}).get("cell_size_cm")
+            wall = load_wall(wd, cell_size_cm=cell or DEFAULT_CELL_SIZE_CM)
             feas = feasible_reach_moves(wall, profile)
     else:
         with contextlib.redirect_stderr(io.StringIO()):
@@ -1203,12 +1307,18 @@ def main() -> None:
         if not feas:
             print(f"No feasible moves on {'wall ' + args.wall if args.wall else f'seed {args.seed}'}")
             return
+        seed_x0 = None
         if args.first_move is not None:
             k0 = int(args.first_move)
             seed_move = next((m for m in feas if m["move_k"] == k0), None)
             if seed_move is None:
                 print(f"move {k0} not feasible; feasible: {[m['move_k'] for m in feas]}")
                 return
+        elif args.auto_first_move:
+            print(f"Auto-selecting first move from {len(feas)} feasible candidates…")
+            seed_move, seed_info = select_first_move(
+                wall, profile, feas, max_gap_m=args.max_gap, restarts=args.restarts)
+            seed_x0 = seed_info.get("x_best")
         else:
             seed_move = feas[0]
         print(f"Adaptive CMA-ES discovery: seed {args.seed}, reach_frac {args.reach_frac}, "
@@ -1217,6 +1327,8 @@ def main() -> None:
         ref, diag = discover_climb_adaptive(
             wall, profile, seed_move,
             max_moves=args.max_moves, max_evals=args.max_evals,
+            max_gap_m=args.max_gap, restarts=args.restarts,
+            foot_balance_cap_n=args.foot_balance, seed_x0=seed_x0,
             wall_gen_seed=args.seed,
         )
     else:

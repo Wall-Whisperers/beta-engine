@@ -9,6 +9,89 @@
 
 ---
 
+## Where we are (2026-06-19) — discovery pipeline overhauled; HAND-move authoring now reliable, FOOT reach is the lone wall
+
+This session fixed the reference-authoring pipeline and isolated the one real
+remaining blocker. **Hand-move authoring is now reliable; the foot reach is the
+only thing left.**
+
+**Verified fixes (all in `sim3d/discover.py`, ~124 LOC):**
+1. **`--auto-first-move`** — probes the feasible first-moves and picks the
+   tightest-lander instead of greedy `feas[0]` (which is only 2D-vetted and is
+   often unclosable: seed 14's feas[0] failed at 0.37 m). VERIFIED: hand moves
+   now land **0.004–0.017 m** on the *same walls* that used to "fail." The walls
+   were fine; greedy selection was the bug.
+2. **Tightness-chasing restarts + `--max-gap`** — `discover_move` used to break
+   on the first landing inside the loose 0.08 m radius, so restarts never bought
+   tightness. Now it chases `max_gap_m` and ranks `best` by GAP (not cost, which
+   the posture term dominated — that made it return a loose 0.054 m attempt over
+   a found 0.017 m one). VERIFIED: RH→h_004 0.054→0.015 m.
+3. **Seed-move warm-start (`seed_x0`)** — CMA gap has high run-to-run variance
+   (same move: 0.013 m one run, 0.062 m the next), so the full-budget step-0
+   search cold-started into a looser basin than the selector's probe already
+   found, getting auto-selected moves rejected. Now step 0 warm-starts from the
+   probe's `x_best`. VERIFIED: step-0 now lands 0.010 m, consistent with its
+   0.019 m probe — variance-induced rejection gone.
+4. **Respect the wall's `cell_size_cm`** — the CLI force-loaded every wall at
+   20 cm, silently rescaling fine-grid test walls.
+5. **`--foot-balance`** — capped pelvis balance assist during FOOT swings only
+   (plumbed; see below — 250 N was insufficient).
+
+**Calibration (measured): trainable landing gap is ~1–2 cm** (`ref_adaptive_s14`
+trained 100% at 0.7 cm; the chain that failed had a 7.0 cm move-0).
+
+**The lone remaining wall — FOOT REACH (was blockers #3+#4).** The open-loop
+foot swing lands **~9–12 cm short of ANY upward foothold**, and this is NOT
+fixable by the above:
+- It is NOT foothold spacing: built a 10 cm-grid foot-test wall
+  (`data/examples/footstep-fine-v1.json`); the foot still landed 9–12 cm short
+  of the 10 cm-spaced footholds. The nearest reachable foot target simply isn't
+  reached.
+- `--foot-balance 250` did NOT close it (still 12 cm short) — so it's not (only)
+  body-sag; the leg can't extend the foot far enough from a hang stance.
+- This is the documented multi-week foot-move blocker. The intended real
+  solution is `free_mover_imitation` on the TRAINING side (don't track the
+  un-trackable recorded foot pose; reward reaching the real hold) — but that
+  still needs the move to be *action-reachable*, which open-loop CMA can't
+  currently author here.
+
+### Authoring-side foot fixes — TESTED AND RULED OUT (2026-06-19)
+
+The foot reaches a HARD CEILING of ~5–6 cm up from a hang stance in open-loop
+`discover_move`, and won't close to a tight grip. Measured on the fine test
+walls (`footstep-fine-v1.json` @10 cm, `footstep-fine5-v1.json` @5 cm):
+- **Balance assist does NOTHING** — LF→f_003 (11.3 cm straight up): gap 7.7 cm
+  at 0 N, 7.8 at 250 N, 7.9 at 500 N. Flat. The shortfall is not body-sag.
+- **Finer footholds don't help** — at 5 cm spacing the foot still can't close:
+  6.3 cm step → 4.9 cm gap, 11.3 → 7.1, 16.3 → 10.0 (no grip). The foot tops
+  out at ~0.48 m (~5 cm above its 0.41 m start) regardless of target.
+- So smaller steps + balance + spacing are all dead ends. **Open-loop CMA is the
+  wrong tool for foot moves** — it can't produce the active weight-shift that
+  lifts an unweighted foot.
+
+### Concrete next step — TRAIN the foot move with free-mover (training-side, not authoring)
+
+The closed-loop RL policy CAN do what open-loop CMA can't (active weight-shift +
+capture-sphere closing). `free_mover_imitation` already exists
+(`sim3d/imitation.py:154,461`; `--free-mover-imitation`): it excludes the
+mover's joints/tip from the pose term and rewards reaching the REAL hold, so it
+doesn't need a tight authored foot landing — only that the foot grip be inside
+the 0.08 m capture sphere (it is: open-loop lands ~7.7 cm = within 8 cm).
+- Author a short reference whose foot move grips (gap < 0.08, which open-loop
+  CAN do) on a fine-foothold wall via the now-reliable hand pipeline
+  (`--auto-first-move`) + the foot move.
+- Train: `--chain --free-mover-imitation --mover-capture-coeff 0.3
+  --rsi-phase-max <foot-swing-start>` (the capture_v2 recipe, foot variant).
+- Headline question: can the policy close the last ~6 cm the open-loop author
+  couldn't? If yes, foot moves are unblocked. If no, the foot ROM/strength under
+  hang needs a body-model look (hip_flex torque cap, or a stand-up primitive).
+
+**Do NOT** re-litigate hand-move selection/tightness (solved), retry balance
+assist / finer footholds / smaller steps for foot AUTHORING (all ruled out
+above), or sweep `build_tight_wall` seeds blindly.
+
+---
+
 ## Where we are (2026-06-17) — single-move 100%, next: multi-move
 
 **Single-move SOLVED (2026-06-17).** `capture_v2` on `ref_adaptive_s14` (RH
@@ -38,31 +121,77 @@ deterministically. Video: 4/4 episodes reach the regrip.
   it directly in MuJoCo with the same servo model). The policy can execute it
   once it has enough gradient.
 
-### Next: apply the recipe to the multi-move case
+### Multi-move chain on v6_smooth FAILED — the reference is the problem (2026-06-18)
 
-The same two fixes should apply to `ref_ladder_v6_smooth` (11 moves, 552 frames)
-using the chain curriculum. For each chain stage k:
-- `chain_rsi_at_stage_start=True` already focuses mid-window RSI at the stage
-  boundary — combine with the capture_coeff.
-- Add `--mover-capture-coeff 0.3 --mover-grip-bonus 20 --ent-coef 0.001` to
-  the chain run.
+Six chain runs (`ladder_chain_capture_v1..v6` on `ref_ladder_v6_smooth`)
+**stalled at stage 2 (the first LF foot step) at 0% for 1.5M+ steps**. Stage 1
+(the RH hand move) trained to ~56% phase-avg fine; the moment the curriculum
+advanced to the foot step, phase-avg collapsed 16%→8%→4%→0% and never recovered.
+Frame-0 episodes die at frame ~45 = exactly the LF step.
 
-**Recommended next run** (chain on the 11-move reference with capture fix):
-```
-python -m sim3d.imitation --train \
-  --ref data/runs/sim3d/imitation/ref_ladder_v6_smooth.npz \
-  --chain --chain-rsi-at-stage-start \
-  --free-mover-imitation \
-  --mover-reach-coeff 50 --mover-capture-coeff 0.3 --mover-grip-bonus 20 \
-  --ent-coef 0.001 \
-  --steps 2000000 --n-envs 8 --run-id imitation/ladder_chain_capture_v1
-```
+**Root cause (proven, not guessed) — `ref_ladder_v6_smooth`'s foot moves are
+servo-infeasible.** New tool `sim3d.probe_footstep` RSIs to the move's start,
+releases the mover, and replays the reference's own joint targets open-loop. ALL
+FOUR v6 foot moves fall short of the 0.08 m grip radius (LF stage-2: **19 cm
+short**; RF: 10 cm; the other LF/RF: 15/8.6 cm), in BOTH per-frame and
+constant-target modes. The body cannot reproduce its own recorded foot
+trajectory. The 06-17 recipe (RSI cap + capture sphere) cannot fix this — it
+supplies *gradient*, but the capture sphere (8 cm) is never even entered. The
+recipe was proven on a HAND move (`capture_v2`); the chain's blocker is a FOOT
+move on an infeasible reference — a different failure.
 
-Watch for: stage advancement log (`stages X-X`), and per-stage frame-0
-sub-evals if you add them. The chain curriculum already gates each move behind
-a 70% ground-start success bar — with the RSI cap fix baked in via
-`chain_rsi_at_stage_start`, each stage should now behave like the single-move
-case did.
+**Two layered causes, both confirmed:**
+1. v6's stances are scrunched (feet too high; the 2026-06-14 finding) — the leg
+   genuinely lacks ROM to extend the foot to the hold from that fold.
+2. **Structural, affects ALL discover-authored refs:** `discover_move` records
+   the *welded-equilibrium* `qpos`, where a mid-swing weld froze the leg
+   half-extended. Replaying those poses sags ~22 cm even on a wall where the
+   move IS reachable (verified on a fresh ladder foot move: the discovered
+   *action* reaches 0.022 m, but replaying its recorded *poses* sags 22.8 cm).
+   **Implication: pose-tracking imitation is the wrong frame for foot moves.**
+   `free_mover_imitation` (exclude the mover's joints/tip from the pose term;
+   reward reaching the real hold) is the correct mode — it ignores the
+   un-trackable recorded foot pose. The remaining requirement is only that the
+   foot move be *action-reachable* from the stance, which a feasible wall gives.
+
+### Now: train foot moves on an action-feasible reference (IN PROGRESS)
+
+Authored `ref_feasfoot_v2` (3 moves LH→RH→LF on `data/examples/ladder-v1.json`
+via `python -m sim3d.discover --adaptive --wall data/examples/ladder-v1.json
+--max-moves 6 --max-evals 350`). The LF foot move is **action-feasible** (CMA
+lands it at gap 0.010–0.054 m; re-confirmed reachable from its start stance).
+Note: net pelvis rise is −0.05 m (lateral, "not a climb") — it is a *foot-move
+test bed*, not a route. The ladder wall is where moves are reachable; the
+generated tight walls (`build_tight_wall`) were too far even for move 0.
+
+Ran `imitation/feasfoot_chain_v1` (chain + chain-rsi-at-stage-start +
+free-mover + reach 50/capture 0.3/grip-bonus 20, ent 0.001, 8 envs). **RESULT
+(killed at 620k): even STAGE 1 stuck at 0.0% — a NEW blocker surfaced.** Mean
+episode len 43 = exactly the stage-1 boundary (`move_starts[1]`), so episodes
+*reach* the stage end but the grip never closes. Cause: `ref_feasfoot_v2`'s
+first move (LH→h_003) lands at gap **0.073 m** — right at the 0.08 m grip
+radius. **Marginal landings (gap ≳ 0.05) don't train** — the policy can't
+reliably get the tip inside 0.08 to grip. (v6's stage-1 RH landed cleaner and
+reached 56%, which is why v6 at least advanced to stage 2.)
+
+So there are TWO independent reference-quality bars, and discovery clears
+neither reliably:
+1. **Action-feasibility** (the foot move must be reachable from the stance) —
+   `sim3d.probe_footstep` checks this. v6 fails it; the ladder wall passes.
+2. **Landing tightness** (every move must land at gap ≲ 0.04, not just <0.08) —
+   marginal 0.07 landings are accepted by discovery's `landed` criterion but
+   are untrainable. `discover_climb_adaptive` has `max_gap_m=0.04` but the
+   `--adaptive` CLI path uses `discover_move`'s `<0.08` landed bar, so it ships
+   marginal moves.
+
+### (Superseded — see the 2026-06-19 section at the top.)
+
+The mid-investigation "four blockers" framing from this session resolved as:
+#1 move-selection → FIXED (`--auto-first-move`); #2 sideways-shuffle → was an
+artifact of #1 (those seeds aborted at move-0); #3 grid-quantization → NOT the
+issue (10 cm footholds still landed 9–12 cm short); #4 → the real lone wall is
+FOOT REACH (open-loop foot swing falls ~9–12 cm short, balance-assist 250 N
+insufficient). Full detail + next steps are in the top section.
 
 ### Landed this session (2026-06-17)
 - **`mover_capture_coeff`** — dense within-grip-sphere bonus; fixes the
