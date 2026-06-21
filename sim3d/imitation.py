@@ -171,6 +171,18 @@ class ImitationConfig:
     # commitment. 0.0 disables. Try coeff ≈ 0.2–0.5 (same scale as r_imit).
     mover_capture_coeff: float = 0.0
 
+    # Dense ABSOLUTE reach pull over the full mover_reach_radius (NOT potential-
+    # based): `coeff·max(0, 1 − gap/radius)` every step the mover is ungripped.
+    # mover_reach_coeff is potential-based (prev−curr gap) ⇒ zero gradient from
+    # a standstill, so a foot 17 cm from its hold never starts moving (the closed-
+    # loop foot-move blocker, 2026-06-21). This term gives a continuous gradient
+    # from rest: any motion that reduces the gap earns more cumulative reward, so
+    # the policy discovers its own swing (goal-reaching, not trajectory tracking).
+    # Keep coeff modest vs completion_bonus so parking just outside the grip
+    # radius can't out-earn gripping: farm ≈ coeff·1·budget must stay < bonus.
+    mover_reach_abs_coeff: float = 0.0
+    mover_reach_radius: float = 0.25
+
     # ── Stance-milestone mode (the 2026-06-15 reframe) ──────────────────────
     # When True, the reference is a STANCE-KEYFRAME skeleton (settled welded
     # stances only; see discover.author_stance_reference). Each episode RSIs to
@@ -642,9 +654,13 @@ class ImitationEnv(gym.Env):
         self._milestone_step += 1
         self._total_steps += 1
 
-        # Pose attractor to the NEXT stance. Free the mover from pose/endeff while
-        # it's ungripped — its swing is the policy's to discover, not to track.
-        free_limb = (mover if (mover is not None
+        # Pose attractor to the NEXT stance. With --free-mover-imitation the mover
+        # is freed from pose/endeff while ungripped (its swing is the policy's to
+        # discover). WITHOUT the flag the mover is TRACKED toward the target
+        # stance's pose — a dense exp(-k*err) pull the potential-based
+        # mover_reach can't supply, needed to bootstrap a foot lift from rest when
+        # the target stance pose is an authored, reachable high-step.
+        free_limb = (mover if (self.icfg.free_mover_imitation and mover is not None
                                and not self.env.world.on_hold(mover)) else None)
         r_imit, comp = imitation_reward(self.env.world, self.ref, target_frame,
                                         self.icfg.coeffs, free_limb=free_limb)
@@ -661,6 +677,18 @@ class ImitationEnv(gym.Env):
             self._prev_mover_gap = gap
             if (self.icfg.mover_capture_coeff > 0 and gap < cfg.GRIP_PROXIMITY_M):
                 reward += self.icfg.mover_capture_coeff * (1.0 - gap / cfg.GRIP_PROXIMITY_M)
+
+        # Dense absolute reach pull (goal-reaching): continuous gradient from rest
+        # over the full radius, so the mover starts moving toward its hold even
+        # when stationary (potential mover_reach gives nothing then). The mover is
+        # freed from pose tracking (free_limb above), so THIS is its main signal.
+        if (self.icfg.mover_reach_abs_coeff > 0 and mover is not None
+                and self._mover_hold_pos is not None
+                and not self.env.world.on_hold(mover)):
+            gap = float(np.linalg.norm(
+                self.env.world.limb_tip_pos(mover) - self._mover_hold_pos))
+            reward += self.icfg.mover_reach_abs_coeff * max(
+                0.0, 1.0 - gap / self.icfg.mover_reach_radius)
 
         terminated = False
         outcome = ""
@@ -941,7 +969,9 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
 def record_video(model_path: str, ref_path: str, out_path: str, *,
                  vecnorm: Optional[str] = None, n_episodes: int = 4,
                  fps: int = 10, size: int = 480, wall_json: Optional[str] = None,
-                 rsi_phase_max: Optional[int] = 0, r_min: float = 0.5) -> None:
+                 rsi_phase_max: Optional[int] = 0, r_min: float = 0.5,
+                 cam_azimuth: float = 270.0, cam_elevation: float = -10.0,
+                 cam_distance: float = 3.6) -> None:
     """Roll out the trained policy in its ImitationEnv and render to mp4.
 
     Critically applies the saved VecNormalize obs stats — without them the
@@ -983,7 +1013,8 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
     # Front view (az 270): the climber's back against the wall FACE, so the
     # coloured holds are visible and upward progress along them is legible. A
     # side view hides the holds (they lie flat on the face) and reads as "leaning".
-    cam.azimuth, cam.elevation, cam.distance = 270.0, -10.0, 3.6
+    # az 225/315 give a 3/4 (45 degrees) view that shows depth off the wall.
+    cam.azimuth, cam.elevation, cam.distance = cam_azimuth, cam_elevation, cam_distance
 
     frames, n_done, n_succ = [], 0, 0
     for ep in range(n_episodes):
@@ -1016,6 +1047,12 @@ def main() -> None:
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--record", type=str, default=None,
                     help="render a trained model to this mp4 (needs --model + --ref)")
+    ap.add_argument("--cam-azimuth", type=float, default=270.0,
+                    help="record camera azimuth deg (270=front-on, 225/315=45 deg 3/4)")
+    ap.add_argument("--cam-elevation", type=float, default=-10.0,
+                    help="record camera elevation deg (negative looks down)")
+    ap.add_argument("--cam-distance", type=float, default=3.6,
+                    help="record camera distance (m)")
     ap.add_argument("--eval", action="store_true",
                     help="frame-0 evaluation of a trained model (needs --model "
                          "+ --ref, optionally --vecnorm); the headline metric")
@@ -1103,6 +1140,14 @@ def main() -> None:
                          "is potential-based (net-zero when stationary) so has no "
                          "gradient inside the capture sphere; this term does. "
                          "Try 0.2-0.5 (same scale as r_imit). 0.0 disables.")
+    ap.add_argument("--mover-reach-abs-coeff", type=float, default=0.0,
+                    help="Dense ABSOLUTE reach pull over --mover-reach-radius "
+                         "(milestone mode): coeff×max(0,1-gap/radius) every step the "
+                         "mover is ungripped. Gradient from rest (unlike potential "
+                         "mover-reach-coeff) — the closed-loop foot-move fix. Keep "
+                         "small vs --completion-bonus. Try 0.1.")
+    ap.add_argument("--mover-reach-radius", type=float, default=0.25,
+                    help="radius (m) for --mover-reach-abs-coeff")
     ap.add_argument("--stance-milestone", action="store_true",
                     help="stance-keyframe milestone mode: RSI to a stance, reach "
                          "the next one (pose attractor + grip-match); RL learns "
@@ -1155,6 +1200,8 @@ def main() -> None:
                            free_mover_imitation=args.free_mover_imitation,
                            mover_grip_bonus=args.mover_grip_bonus,
                            mover_capture_coeff=args.mover_capture_coeff,
+                           mover_reach_abs_coeff=args.mover_reach_abs_coeff,
+                           mover_reach_radius=args.mover_reach_radius,
                            stance_milestone=args.stance_milestone,
                            milestone_budget=args.milestone_budget)
 
@@ -1192,7 +1239,9 @@ def main() -> None:
               f"({res['n_succ']}/{res['n_episodes']} eps, mean len {res['mean_len']:.0f})")
     if args.record:
         record_video(args.model, args.ref, args.record, vecnorm=args.vecnorm,
-                     wall_json=wall_json, r_min=args.r_min_end)
+                     wall_json=wall_json, r_min=args.r_min_end,
+                     cam_azimuth=args.cam_azimuth, cam_elevation=args.cam_elevation,
+                     cam_distance=args.cam_distance)
     if args.smoke:
         smoke(args.ref, icfg, wall_json)
     if args.train:
