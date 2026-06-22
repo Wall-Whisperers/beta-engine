@@ -195,6 +195,11 @@ class ImitationConfig:
     # termination is fall / success / budget instead.
     stance_milestone: bool = False
     milestone_budget: int = 40        # max env steps to complete one transition
+    # Sequential chain (true multi-move climb): start at the bottom stance and,
+    # on each grip-match, advance the target to the next stance WITHOUT reset, so
+    # move k+1 trains from move k's real on-policy landing (fixes composition).
+    # Success = reaching the FINAL stance. Per-transition budget still applies.
+    sequential_chain: bool = False
 
 
 class ImitationEnv(gym.Env):
@@ -329,7 +334,12 @@ class ImitationEnv(gym.Env):
             # because we RSI to the TRUE stance c, each transition is trainable
             # independently — no stage curriculum needed.
             n = len(self._stance_frames)
-            c = int(self.np_random.integers(0, max(1, n - 1)))   # [0, n-2]
+            # Sequential chain: always start at the BOTTOM stance and climb up,
+            # advancing the target on each grip WITHOUT reset (see _step_stance).
+            # This trains move k+1 from move k's ACTUAL landing (the on-policy
+            # distribution) — fixing the composition gap where per-move skills
+            # trained from fixed authored stances don't chain.
+            c = 0 if self.icfg.sequential_chain else int(self.np_random.integers(0, max(1, n - 1)))
             self._target_stance = c + 1
             self._milestone_step = 0
             self._prev_mover_gap = float("inf")
@@ -692,12 +702,26 @@ class ImitationEnv(gym.Env):
 
         terminated = False
         outcome = ""
+        last_stance = len(self._stance_frames) - 1
         if fell:
             terminated, outcome = True, "fell"
         elif self._grips_match(target_frame):
-            # Verified grip-match on the next stance = transition completed.
-            terminated, outcome = True, "completed"
             reward += self.icfg.completion_bonus
+            if self.icfg.sequential_chain and self._target_stance < last_stance:
+                # Sequential chain: grip reached, but more moves remain. ADVANCE
+                # the target to the next stance WITHOUT resetting the body, so the
+                # next move trains from this real landing. Re-arm per-transition
+                # state + re-point the mover obs at the new target.
+                self._target_stance += 1
+                self._milestone_step = 0
+                self._prev_mover_gap = float("inf")
+                self._mover_grip_awarded = False
+                self._mover_limb, self._mover_hold_pos = self._stance_mover(self._target_stance)
+                obs = self._patch_mover_obs(obs)
+                outcome = "advanced"
+            else:
+                # Final stance reached (or non-sequential single transition).
+                terminated, outcome = True, "completed"
         elif self._milestone_step >= self.icfg.milestone_budget:
             terminated, outcome = True, "timeout"
 
@@ -1160,6 +1184,11 @@ def main() -> None:
                          "`sim3d.discover --stances`.")
     ap.add_argument("--milestone-budget", type=int, default=40,
                     help="max env steps per stance transition (stance-milestone mode)")
+    ap.add_argument("--sequential-chain", action="store_true",
+                    help="true multi-move climb: start at the bottom stance and "
+                         "advance the target on each grip WITHOUT reset, so each move "
+                         "trains from the previous move's real landing. Success = "
+                         "reaching the final stance. Use with --stance-milestone.")
     ap.add_argument("--free-mover-imitation", action="store_true",
                     help="Exclude the current stage's mover limb from pose/endeff "
                          "tracking while it is ungripped (mid-reach). Lets PPO find "
@@ -1209,6 +1238,7 @@ def main() -> None:
                            mover_reach_radius=args.mover_reach_radius,
                            w_task=args.w_task,
                            stance_milestone=args.stance_milestone,
+                           sequential_chain=args.sequential_chain,
                            milestone_budget=args.milestone_budget)
 
     if args.author:
