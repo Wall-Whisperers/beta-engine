@@ -1148,6 +1148,11 @@ def main() -> None:
                          "small vs --completion-bonus. Try 0.1.")
     ap.add_argument("--mover-reach-radius", type=float, default=0.25,
                     help="radius (m) for --mover-reach-abs-coeff")
+    ap.add_argument("--w-task", type=float, default=0.0,
+                    help="weight on task vs imitation reward (0=pure pose imitation). "
+                         "In stance-milestone, w_task=1 drops the pose attractor "
+                         "entirely → PURE goal-reaching (reach+capture+grip), removing "
+                         "the pose-stillness valley that freezes the foot at the hang.")
     ap.add_argument("--stance-milestone", action="store_true",
                     help="stance-keyframe milestone mode: RSI to a stance, reach "
                          "the next one (pose attractor + grip-match); RL learns "
@@ -1202,6 +1207,7 @@ def main() -> None:
                            mover_capture_coeff=args.mover_capture_coeff,
                            mover_reach_abs_coeff=args.mover_reach_abs_coeff,
                            mover_reach_radius=args.mover_reach_radius,
+                           w_task=args.w_task,
                            stance_milestone=args.stance_milestone,
                            milestone_budget=args.milestone_budget)
 
