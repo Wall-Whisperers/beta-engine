@@ -1184,6 +1184,9 @@ def main() -> None:
                          "`sim3d.discover --stances`.")
     ap.add_argument("--milestone-budget", type=int, default=40,
                     help="max env steps per stance transition (stance-milestone mode)")
+    ap.add_argument("--inner-max-steps", type=int, default=200,
+                    help="inner-env episode cap. Raise for --sequential-chain with "
+                         "many moves (needs > n_moves x milestone-budget).")
     ap.add_argument("--sequential-chain", action="store_true",
                     help="true multi-move climb: start at the bottom stance and "
                          "advance the target on each grip WITHOUT reset, so each move "
@@ -1239,7 +1242,8 @@ def main() -> None:
                            w_task=args.w_task,
                            stance_milestone=args.stance_milestone,
                            sequential_chain=args.sequential_chain,
-                           milestone_budget=args.milestone_budget)
+                           milestone_budget=args.milestone_budget,
+                           inner_max_steps=args.inner_max_steps)
 
     if args.author:
         from sim3d.probe_transitions import build_wall_and_moves
