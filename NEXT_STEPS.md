@@ -52,6 +52,9 @@ per-move skills → `--sequential-chain` warm-start to compose. macOS long runs:
 ### Slow moves — DEFERRED (2026-06-24): velocity penalty does NOT work; needs a structural fix
 Tried hard: warm-start snap policy + --vel-penalty-coeff (sum qvel², calibrated 0.2-0.25 vs snap peak ~90) over 6 runs → still 2-frame/0.03s snaps (entrenched policy eats the penalty, never explores slow control). From SCRATCH with the penalty (slow_scratch, coeff 0.15) → 0% (penalty suppresses the exploration needed to learn the move at all). CONCLUSION: a soft velocity reward can't produce slow moves here — too weak to shift a converged policy, too strong to learn from scratch. Real fix = HARD action-rate limit (clamp |action_t - action_{t-1}| in the env wrapper, or cap joint velocity) so snapping is physically impossible; OR defer to the torque/muscle phase (servo snaps won't exist there). Deferred for now.
 
+### 3-MOVE climb COMPOSES (2026-06-24): 20/20, the composition wall is at depth 4
+chain3_seq = hands-first 3-move sequential (hang→RH:h_012→LH:h_013→LF:f_047), warm-started from handsfirst_ms (per-move 16/16). Full-climb completion rose cleanly 20%→80% over 1.5M; deterministic sequential eval (start=bottom, no reset) = **20/20 full 3-move climbs**, net com rise +0.05 m, real (video chain3_seq/climb3.mp4). So: 2-move=1 composition (20/20), 3-move=2 compositions (20/20), 4-move=3 compositions (stalled ~30%). The wall is the 3rd composition. KEY PATH: build the 4-move INCREMENTALLY — warm-start the 4-move sequential from the working 3-move policy (chain3_seq) so moves 1-3 stay reliable and move 4 (RF) gets consistent gradient (it was starved before, only reached when 1-3 happened to all fire). Net rise stays small (~0.05 m) — still needs the com-rise authoring work.
+
 ### NEXT (priority order)
 
 1. **STYLE / naturalness — the climbing is JANKY (leans back, barn-doors).** Direct
