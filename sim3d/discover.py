@@ -170,6 +170,7 @@ def discover_move(
     x0: np.ndarray | None = None, restarts: int = 0,
     balance_cap_n: float = 0.0, balance_kp: float = 500.0,
     com_drop_max: float = 0.10, max_gap_m: float | None = None,
+    com_rise_reward: float = 0.0,
 ) -> tuple[list[dict], dict]:
     """CMA-ES-discover a single move from ``start_frame``. Returns
     ``(recorded_frames, info)``. ``w`` is a scratch world reused across the
@@ -267,12 +268,19 @@ def discover_move(
         # posture terms keep the body upright with a smooth CoM arc, no sharp troughs.
         # Smoothness (0.4·mean qvel²): CMA otherwise authors jerky open-loop
         # reaches that no closed-loop policy can track within the R_min leash.
+        # Net-rise reward: chains currently gain ~0 pelvis height (each move keeps
+        # the com level — balance assist pins it + only com_drop is penalized).
+        # Rewarding the com ENDING higher steers authored moves to pull the body
+        # UP, so a chain accumulates real height. (Pair with a raised balance
+        # target if the assist caps the rise.)
+        com_rise = max(0.0, float(w.com()[2]) - com_z0)
         cost = (10.0 * gap + 8.0 * max(0, n_anchor0 - n_anchor)
                 + (25.0 if fell else 0.0)
                 + 2.0 * lean_back + 1.5 * com_trough + 2.0 * com_drop
                 + 1.5 * posture
                 + 0.4 * vel_sq
-                + 0.08 * float(np.linalg.norm(residual)))
+                + 0.08 * float(np.linalg.norm(residual))
+                - com_rise_reward * com_rise)
         if record:
             return cost, frames, {"gap": round(gap, 3), "landed": bool(landed),
                                   "n_anchor": n_anchor, "fell": bool(fell),
