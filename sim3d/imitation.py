@@ -201,6 +201,19 @@ class ImitationConfig:
     # Success = reaching the FINAL stance. Per-transition budget still applies.
     sequential_chain: bool = False
 
+    # Naturalness shaping (fixes the lean-back/barn-door jank that w_task=1 leaves
+    # unpenalized). Both are gentle so they don't recreate the stillness valley:
+    # lean penalizes a SPECIFIC bad direction (off the wall), com-rise REWARDS
+    # motion (up) — neither rewards holding still.
+    lean_penalty_coeff: float = 0.0   # × max(0, pelvis_y − start_y): discourage leaning off the wall (+Y)
+    com_rise_coeff: float = 0.0       # × (com_z − prev_com_z): reward pulling the body UP (potential, un-farmable)
+    # Slow the moves down. Goal-reaching with no speed cost makes the policy SNAP
+    # each limb to its hold in ~2 control steps (0.03 s; a human move is ~1 s) — the
+    # jerk. Penalizing mean joint-speed² makes a fast snap (high v) cost far more
+    # than a slow controlled move (the quadratic does the work), so moves stretch
+    # toward realistic, smoother, and land cleaner (helps long-chain composition).
+    vel_penalty_coeff: float = 0.0    # × mean(qvel[6:]²)
+
 
 class ImitationEnv(gym.Env):
     """RSI + bounded-imitation-reward + termination-curriculum wrapper around one
@@ -243,6 +256,8 @@ class ImitationEnv(gym.Env):
         self._stance_frames = self._compute_stance_frames()
         self._target_stance: int = 1
         self._milestone_step: int = 0
+        self._pelvis_y0: float = 0.0
+        self._prev_com_z: float = 0.0
 
     def _compute_stance_frames(self) -> list[int]:
         """The settled (last-dwell) frame index of each stance, from
@@ -351,6 +366,8 @@ class ImitationEnv(gym.Env):
                 settle_frames=self.icfg.settle_frames,
             )
             obs = self._patch_mover_obs(obs)
+            self._pelvis_y0 = float(self.env.world.pelvis_pos()[1])
+            self._prev_com_z = float(self.env.world.com()[2])
             info.update(self._info(r_imit=1.0))
             info["target_stance"] = self._target_stance
             return obs, info
@@ -699,6 +716,27 @@ class ImitationEnv(gym.Env):
                 self.env.world.limb_tip_pos(mover) - self._mover_hold_pos))
             reward += self.icfg.mover_reach_abs_coeff * max(
                 0.0, 1.0 - gap / self.icfg.mover_reach_radius)
+
+        # Naturalness shaping. Anti-lean: penalize TORSO TILT from upright — the
+        # visible "leaning back" is a ~15-26 deg pelvis PITCH, not hip sag (the hips
+        # actually hug the wall). upz = pelvis-up·world-up = 1-2(qx²+qy²); (1-upz) is
+        # 0 upright, grows with any tilt. com-rise: reward upward com motion so the
+        # body pulls UP over its holds (net ascent); potential ⇒ un-farmable by bobbing.
+        if self.icfg.lean_penalty_coeff > 0:
+            q = self.env.world.data.qpos[3:7]   # free-joint quat, wxyz
+            upz = 1.0 - 2.0 * (float(q[1]) ** 2 + float(q[2]) ** 2)
+            reward -= self.icfg.lean_penalty_coeff * max(0.0, 1.0 - upz)
+        if self.icfg.com_rise_coeff > 0:
+            com_z = float(self.env.world.com()[2])
+            reward += self.icfg.com_rise_coeff * (com_z - self._prev_com_z)
+            self._prev_com_z = com_z
+        if self.icfg.vel_penalty_coeff > 0:
+            # SUM (not mean) of joint-speed²: only the mover swings fast, so a mean
+            # over all 23 joints dilutes it ~23× and the penalty vanishes. Sum keeps
+            # the snap's spike intact; by ∫v²dt a 2-step snap costs ~15× a slow move
+            # of the same reach, so this favors slow without a giant coeff.
+            reward -= self.icfg.vel_penalty_coeff * float(
+                np.sum(self.env.world.data.qvel[6:] ** 2))
 
         terminated = False
         outcome = ""
@@ -1187,6 +1225,17 @@ def main() -> None:
     ap.add_argument("--inner-max-steps", type=int, default=200,
                     help="inner-env episode cap. Raise for --sequential-chain with "
                          "many moves (needs > n_moves x milestone-budget).")
+    ap.add_argument("--lean-penalty-coeff", type=float, default=0.0,
+                    help="penalize TORSO TILT from upright (1-upz). Cleans up the "
+                         "lean-back jank (a ~15-26deg pelvis pitch). 26deg≈0.10, so "
+                         "try ~8-20. 0 disables.")
+    ap.add_argument("--com-rise-coeff", type=float, default=0.0,
+                    help="reward upward pelvis/com motion (potential-based). Makes the "
+                         "body pull UP over holds (naturalness + net ascent). Try ~5-15.")
+    ap.add_argument("--vel-penalty-coeff", type=float, default=0.0,
+                    help="penalize SUM of joint-speed² — slows the ~2-frame snap moves "
+                         "toward realistic controlled moves (smoother, cleaner landings, "
+                         "better chaining). Try ~2-5 (sum, not mean). 0 disables.")
     ap.add_argument("--sequential-chain", action="store_true",
                     help="true multi-move climb: start at the bottom stance and "
                          "advance the target on each grip WITHOUT reset, so each move "
@@ -1243,7 +1292,10 @@ def main() -> None:
                            stance_milestone=args.stance_milestone,
                            sequential_chain=args.sequential_chain,
                            milestone_budget=args.milestone_budget,
-                           inner_max_steps=args.inner_max_steps)
+                           inner_max_steps=args.inner_max_steps,
+                           lean_penalty_coeff=args.lean_penalty_coeff,
+                           com_rise_coeff=args.com_rise_coeff,
+                           vel_penalty_coeff=args.vel_penalty_coeff)
 
     if args.author:
         from sim3d.probe_transitions import build_wall_and_moves

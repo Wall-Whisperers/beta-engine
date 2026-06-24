@@ -680,6 +680,17 @@ how the body works, not memorising hold sequences.
 
 ## Running Locally
 
+> **macOS long runs — prevent sleep.** Background training gets suspended/killed
+> when the Mac sleeps. Wrap every long-running launch in `caffeinate` so it
+> survives idle/system/disk sleep:
+> ```bash
+> caffeinate -i -s python -m sim3d.imitation --train ... &
+> ```
+> Or attach it to an already-running job: `caffeinate -i -s -m -w <pid> &`
+> (`-w` releases when that pid exits). Caveat: `-s` is only guaranteed on **AC
+> power** — on battery with the lid **closed** macOS can still sleep, so keep
+> long runs plugged in (lid open). Lid-closed runs need a `pmset` change.
+
 ```bash
 python -m venv .venv
 .venv\Scripts\Activate.ps1          # Windows
