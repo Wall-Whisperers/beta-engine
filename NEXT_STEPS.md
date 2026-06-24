@@ -64,6 +64,13 @@ PROVEN RECIPE for longer chains: build INCREMENTALLY — warm-start the N-move s
 ### 3-MOVE climb COMPOSES (2026-06-24): 20/20, the composition wall is at depth 4
 chain3_seq = hands-first 3-move sequential (hang→RH:h_012→LH:h_013→LF:f_047), warm-started from handsfirst_ms (per-move 16/16). Full-climb completion rose cleanly 20%→80% over 1.5M; deterministic sequential eval (start=bottom, no reset) = **20/20 full 3-move climbs**, net com rise +0.05 m, real (video chain3_seq/climb3.mp4). So: 2-move=1 composition (20/20), 3-move=2 compositions (20/20), 4-move=3 compositions (stalled ~30%). The wall is the 3rd composition. KEY PATH: build the 4-move INCREMENTALLY — warm-start the 4-move sequential from the working 3-move policy (chain3_seq) so moves 1-3 stay reliable and move 4 (RF) gets consistent gradient (it was starved before, only reached when 1-3 happened to all fire). Net rise stays small (~0.05 m) — still needs the com-rise authoring work.
 
+### OVERNIGHT 2026-06-24 wrap — 4-move climb is the verified ceiling; next steps crisp
+WORKING (pushed): 2/3/4-move sequential climbs all 20/20 deterministic via incremental warm-start. Headline video: data/runs/sim3d/imitation/FINAL_4move_climb.mp4.
+OPEN (research, not quick-wins): 
+- 5-move: incremental warm-start disrupts the working chain past 4 (longer-horizon exploration breaks earlier moves). Try: per-move pretrain ALL N skills then compose with VERY low ent (0.004-0.006), or freeze early policy layers during compose, or DAgger each stance from real landings.
+- NET RISE (~0.06m): w_task=1 ignores authored pose so authoring-side fixes (com_rise_reward, rising balance target) can't work; needs a working TRAINING-side com-rise (the --com-rise-coeff added had no effect — investigate why; may need a pull-up shaping that isn't geometry-bounded).
+- SLOW MOVES: needs a hard action-rate limit in the env wrapper (clamp |action_t-action_{t-1}|); soft velocity penalty proven to fail both warm-start and from-scratch.
+
 ### NEXT (priority order)
 
 1. **STYLE / naturalness — the climbing is JANKY (leans back, barn-doors).** Direct
