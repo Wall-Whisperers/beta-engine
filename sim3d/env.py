@@ -95,6 +95,11 @@ class EnvConfig:
     # negative-EV action rather than a shaping nudge.
     body_intersection_penalty: float = 20.0
     energy_penalty_coeff: float = 0.001          # × Σ(ctrl−seed)² (deviation from seed; was 0.005 — too large vs height signal)
+    # Hard per-step action-rate limit on the joint targets (normalised units). 0
+    # disables. >0 clamps |joint_normₜ − joint_normₜ₋₁| ≤ this, so the policy
+    # CANNOT snap a limb to its hold in ~2 frames (the "janky" 0.03 s moves). At
+    # ~0.1 a full-range joint move takes ~10 steps (0.16 s) → controlled motion.
+    action_rate_limit: float = 0.0
     invalid_action_penalty: float = 0.25
     # Dense finish-approach shaping (potential-based).
     # Per-step reward = finish_approach_coeff × (prev_dist − cur_dist).
@@ -258,6 +263,7 @@ class Climbing3DEnv(gym.Env):
         # Per-episode seed-pose joint targets; residual base for continuous
         # actions (set in reset()). Midpoint until the first reset runs.
         self._seed_ctrl = 0.5 * (self._act_lo + self._act_hi)
+        self._prev_joint_norm = None   # action-rate-limit state (cleared each episode)
 
     # ─── Gym API ──────────────────────────────────────────────────────
     def reset(
@@ -370,6 +376,7 @@ class Climbing3DEnv(gym.Env):
         # _step_continuous), so action≈0 means "hold the hang" rather than
         # "yank every joint to its ctrlrange midpoint".
         self._seed_ctrl = self.world.data.ctrl[: self._n_act].copy()
+        self._prev_joint_norm = None   # reset rate-limit state at episode start
         return self._obs(), self._info()
 
     def _current_max_grip_z(self) -> float:
@@ -748,6 +755,18 @@ class Climbing3DEnv(gym.Env):
         action = np.asarray(action, dtype=np.float64)
         n = self._n_act
         joint_norm = np.clip(action[:n], -1.0, 1.0)
+        # Hard action-rate limit: clamp how far the joint target can move per
+        # control step, so the policy can't yank a limb to its hold in ~2 frames.
+        # Forces gradual, controlled motion (fixes the snap "jank"); also required
+        # for transfer to torque/muscle control, which can't snap.
+        if self.cfg_env.action_rate_limit > 0.0:
+            # First step of the episode clamps relative to the seed (action≈0) so
+            # the policy can't snap off the settled/RSI'd pose on step 1 either.
+            prev = (self._prev_joint_norm if self._prev_joint_norm is not None
+                    else np.zeros(n))
+            d = self.cfg_env.action_rate_limit
+            joint_norm = np.clip(joint_norm, prev - d, prev + d)
+        self._prev_joint_norm = joint_norm.copy()
         # Residual-around-seed mapping. action=0 holds the settled seed pose;
         # action=+1 drives a joint to its upper limit, -1 to its lower limit.
         # This keeps full reach authority while making "do nothing" == "hold

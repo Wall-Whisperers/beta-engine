@@ -213,6 +213,7 @@ class ImitationConfig:
     # than a slow controlled move (the quadratic does the work), so moves stretch
     # toward realistic, smoother, and land cleaner (helps long-chain composition).
     vel_penalty_coeff: float = 0.0    # × mean(qvel[6:]²)
+    action_rate_limit: float = 0.0    # hard per-step |Δaction| cap on joints (env-level); slows the snap moves
 
 
 class ImitationEnv(gym.Env):
@@ -231,7 +232,8 @@ class ImitationEnv(gym.Env):
         self.ref = migrate_reference_spine(reference)
         self.icfg = imitation_config or ImitationConfig()
         base = env_config or EnvConfig()
-        base = replace(base, task_mode="imitate", max_steps=self.icfg.inner_max_steps)
+        base = replace(base, task_mode="imitate", max_steps=self.icfg.inner_max_steps,
+                       action_rate_limit=self.icfg.action_rate_limit)
         self.env = Climbing3DEnv(wall, profile=profile, config=base, render_mode=render_mode)
         self.observation_space = self.env.observation_space
         self.action_space = self.env.action_space
@@ -1236,6 +1238,10 @@ def main() -> None:
                     help="penalize SUM of joint-speed² — slows the ~2-frame snap moves "
                          "toward realistic controlled moves (smoother, cleaner landings, "
                          "better chaining). Try ~2-5 (sum, not mean). 0 disables.")
+    ap.add_argument("--action-rate-limit", type=float, default=0.0,
+                    help="HARD per-step cap on |Δjoint-action| (env-level). Makes 2-frame "
+                         "snaps physically impossible → forces gradual controlled moves. "
+                         "Try ~0.1 (full-range joint move ≈10 steps/0.16s). 0 disables.")
     ap.add_argument("--sequential-chain", action="store_true",
                     help="true multi-move climb: start at the bottom stance and "
                          "advance the target on each grip WITHOUT reset, so each move "
@@ -1295,7 +1301,8 @@ def main() -> None:
                            inner_max_steps=args.inner_max_steps,
                            lean_penalty_coeff=args.lean_penalty_coeff,
                            com_rise_coeff=args.com_rise_coeff,
-                           vel_penalty_coeff=args.vel_penalty_coeff)
+                           vel_penalty_coeff=args.vel_penalty_coeff,
+                           action_rate_limit=args.action_rate_limit)
 
     if args.author:
         from sim3d.probe_transitions import build_wall_and_moves
