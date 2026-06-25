@@ -214,6 +214,12 @@ class ImitationConfig:
     # toward realistic, smoother, and land cleaner (helps long-chain composition).
     vel_penalty_coeff: float = 0.0    # × mean(qvel[6:]²)
     action_rate_limit: float = 0.0    # hard per-step |Δaction| cap on joints (env-level); slows the snap moves
+    # Reward bent arms (mean elbow flexion). The bot climbs on dead-straight arms,
+    # which lets the body hang BACK off the wall (the lean). Bending the arms while
+    # gripping fixed holds physically pulls the body IN toward the wall, over the
+    # feet ⇒ more stable, more upright. The mover arm still extends to reach (the
+    # reach/grip reward dominates for it); the non-mover arms bend to pull in.
+    arm_bend_coeff: float = 0.0       # × mean(elbow angle)/elbow_max
 
 
 class ImitationEnv(gym.Env):
@@ -260,6 +266,10 @@ class ImitationEnv(gym.Env):
         self._milestone_step: int = 0
         self._pelvis_y0: float = 0.0
         self._prev_com_z: float = 0.0
+        # Elbow qpos addresses + max angle, for the arm-bend (anti-lean) reward.
+        _m = self.env.world.model
+        self._elbow_qadr = [int(_m.jnt_qposadr[_m.joint(n).id]) for n in ("l_elbow", "r_elbow")]
+        self._elbow_max = float(_m.jnt_range[_m.joint("l_elbow").id, 1]) or 2.618
 
     def _compute_stance_frames(self) -> list[int]:
         """The settled (last-dwell) frame index of each stance, from
@@ -739,6 +749,13 @@ class ImitationEnv(gym.Env):
             # of the same reach, so this favors slow without a giant coeff.
             reward -= self.icfg.vel_penalty_coeff * float(
                 np.sum(self.env.world.data.qvel[6:] ** 2))
+        if self.icfg.arm_bend_coeff > 0:
+            # Reward bent arms → pulls the body in toward the wall (anti-lean).
+            # The mover arm still extends to reach (reach/grip dominates); the
+            # other arms bend to bring the body over the feet.
+            qp = self.env.world.data.qpos
+            elbow = 0.5 * (float(qp[self._elbow_qadr[0]]) + float(qp[self._elbow_qadr[1]]))
+            reward += self.icfg.arm_bend_coeff * max(0.0, elbow) / self._elbow_max
 
         terminated = False
         outcome = ""
@@ -1242,6 +1259,9 @@ def main() -> None:
                     help="HARD per-step cap on |Δjoint-action| (env-level). Makes 2-frame "
                          "snaps physically impossible → forces gradual controlled moves. "
                          "Try ~0.1 (full-range joint move ≈10 steps/0.16s). 0 disables.")
+    ap.add_argument("--arm-bend-coeff", type=float, default=0.0,
+                    help="reward bent arms (mean elbow flexion) → pulls the body IN toward "
+                         "the wall, fixing the straight-arm lean-back. Try ~0.2-0.5. 0 off.")
     ap.add_argument("--sequential-chain", action="store_true",
                     help="true multi-move climb: start at the bottom stance and "
                          "advance the target on each grip WITHOUT reset, so each move "
@@ -1302,7 +1322,8 @@ def main() -> None:
                            lean_penalty_coeff=args.lean_penalty_coeff,
                            com_rise_coeff=args.com_rise_coeff,
                            vel_penalty_coeff=args.vel_penalty_coeff,
-                           action_rate_limit=args.action_rate_limit)
+                           action_rate_limit=args.action_rate_limit,
+                           arm_bend_coeff=args.arm_bend_coeff)
 
     if args.author:
         from sim3d.probe_transitions import build_wall_and_moves
