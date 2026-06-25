@@ -220,6 +220,12 @@ class ImitationConfig:
     # feet ⇒ more stable, more upright. The mover arm still extends to reach (the
     # reach/grip reward dominates for it); the non-mover arms bend to pull in.
     arm_bend_coeff: float = 0.0       # × mean(elbow angle)/elbow_max
+    # Pull the body IN to the wall (the real anti-lean fix). The bot hangs ~44 cm
+    # off the wall on straight arms; arms are straight BECAUSE the body is far
+    # (they must span the gap to the holds). Penalize com distance past a wall-hug
+    # target ⇒ body comes over the feet, and the arms then bend on their own.
+    wall_hug_coeff: float = 0.0       # × max(0, com_y − wall_hug_target)
+    wall_hug_target: float = 0.16     # com_y (m) considered "in" (wall plane ≈ 0.065)
 
 
 class ImitationEnv(gym.Env):
@@ -750,12 +756,15 @@ class ImitationEnv(gym.Env):
             reward -= self.icfg.vel_penalty_coeff * float(
                 np.sum(self.env.world.data.qvel[6:] ** 2))
         if self.icfg.arm_bend_coeff > 0:
-            # Reward bent arms → pulls the body in toward the wall (anti-lean).
-            # The mover arm still extends to reach (reach/grip dominates); the
-            # other arms bend to bring the body over the feet.
+            # (proxy — found to game: bends elbows without pulling in; prefer wall_hug)
             qp = self.env.world.data.qpos
             elbow = 0.5 * (float(qp[self._elbow_qadr[0]]) + float(qp[self._elbow_qadr[1]]))
             reward += self.icfg.arm_bend_coeff * max(0.0, elbow) / self._elbow_max
+        if self.icfg.wall_hug_coeff > 0:
+            # Pull the body IN to the wall (the real anti-lean fix). Penalize com
+            # past the wall-hug target → body over the feet, arms bend naturally.
+            reward -= self.icfg.wall_hug_coeff * max(
+                0.0, float(self.env.world.com()[1]) - self.icfg.wall_hug_target)
 
         terminated = False
         outcome = ""
@@ -1260,8 +1269,13 @@ def main() -> None:
                          "snaps physically impossible → forces gradual controlled moves. "
                          "Try ~0.1 (full-range joint move ≈10 steps/0.16s). 0 disables.")
     ap.add_argument("--arm-bend-coeff", type=float, default=0.0,
-                    help="reward bent arms (mean elbow flexion) → pulls the body IN toward "
-                         "the wall, fixing the straight-arm lean-back. Try ~0.2-0.5. 0 off.")
+                    help="(proxy, games easily) reward elbow flexion. Prefer --wall-hug-coeff.")
+    ap.add_argument("--wall-hug-coeff", type=float, default=0.0,
+                    help="penalize com distance past the wall-hug target → pulls the body IN "
+                         "to the wall (fixes the straight-arm lean-back at the source; arms "
+                         "bend on their own once the body is in). Try ~2-5. 0 off.")
+    ap.add_argument("--wall-hug-target", type=float, default=0.16,
+                    help="com_y (m) considered 'in' (wall plane ≈0.065)")
     ap.add_argument("--sequential-chain", action="store_true",
                     help="true multi-move climb: start at the bottom stance and "
                          "advance the target on each grip WITHOUT reset, so each move "
@@ -1323,7 +1337,9 @@ def main() -> None:
                            com_rise_coeff=args.com_rise_coeff,
                            vel_penalty_coeff=args.vel_penalty_coeff,
                            action_rate_limit=args.action_rate_limit,
-                           arm_bend_coeff=args.arm_bend_coeff)
+                           arm_bend_coeff=args.arm_bend_coeff,
+                           wall_hug_coeff=args.wall_hug_coeff,
+                           wall_hug_target=args.wall_hug_target)
 
     if args.author:
         from sim3d.probe_transitions import build_wall_and_moves
