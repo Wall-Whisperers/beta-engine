@@ -129,6 +129,28 @@ class CheckpointMetaTest(unittest.TestCase):
             am.validate_checkpoint(self.zip_path, wall=self.wall, obs_dim=131, action_dim=27,
                                    env_mode="imitate:dense")
 
+    def test_env_mode_mismatch_warns_when_not_strict(self):
+        """Warm-start path: an env_mode mismatch is a warning, not an error, when
+        strict_env_mode=False (transferring a parent from a different obs/reward
+        regime is intentional; e.g. milestone -> milestone+postureobs)."""
+        meta = am.build_meta(artifact_type="checkpoint", wall=self.wall,
+                             obs_dim=131, action_dim=27, env_mode="imitate:milestone")
+        am.write_checkpoint_meta(self.zip_path, meta)
+        # must NOT raise
+        am.validate_checkpoint(self.zip_path, wall=self.wall, obs_dim=131, action_dim=27,
+                               env_mode="imitate:milestone+postureobs", strict_env_mode=False)
+
+    def test_non_env_mode_field_still_hard_errors_when_not_strict(self):
+        """strict_env_mode=False relaxes ONLY env_mode — a dim/wall mismatch still
+        hard-errors (those would silently corrupt a weight load)."""
+        meta = am.build_meta(artifact_type="checkpoint", wall=self.wall,
+                             obs_dim=131, action_dim=27, env_mode="imitate:milestone")
+        am.write_checkpoint_meta(self.zip_path, meta)
+        with self.assertRaises(ValueError) as cm:
+            am.validate_checkpoint(self.zip_path, wall=self.wall, obs_dim=132, action_dim=27,
+                                   env_mode="imitate:milestone+postureobs", strict_env_mode=False)
+        self.assertIn("obs_dim", str(cm.exception))
+
     def test_lineage_chain(self):
         parent_meta = am.build_meta(artifact_type="checkpoint", wall=self.wall,
                                     obs_dim=131, action_dim=27, env_mode="imitate:dense",

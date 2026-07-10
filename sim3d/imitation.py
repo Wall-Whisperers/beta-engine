@@ -244,6 +244,15 @@ class ImitationConfig:
     # automatically (stance m grips == stance m-1 grips) in ImitationEnv.__init__.
     posture_com_tol: float = 0.06      # m, com distance for a posture-stance success
     posture_hold_steps: int = 4        # consecutive in-tol steps required
+    # Wrapper-level obs patch (approved 2026-07-10): in a posture stance every limb
+    # is gripped, so the goal slots obs[118:130] are all zero and the policy cannot
+    # perceive the com target — every probe shows it transiting the tolerance in ~1
+    # step and never parking. When on, ImitationEnv._patch_mover_obs writes
+    # (goal_com − com) into one goal slot for posture stances (same mechanism grip
+    # moves already use; obs.py untouched, shape stays 131). It changes the obs
+    # CONTRACT, so it is recorded in the checkpoint env_mode (imitate:...+postureobs)
+    # and a mismatched eval/record hard-errors (see _imitate_env_mode).
+    posture_goal_obs: bool = False
     # Dense com-rise pull for stand-up posture stances: coeff·max(0,1−dz/band)
     # per step, where dz = max(0, target_com_z − com_z). Gives a directed
     # gradient to raise the body (the sparse pose+com attractor alone stalls the
@@ -408,6 +417,14 @@ class ImitationEnv(gym.Env):
     the env control rate, so phase advances 1 frame/step."""
 
     metadata = Climbing3DEnv.metadata
+
+    # Posture-stance goal obs (posture_goal_obs): the limb-goal slot index that
+    # carries (goal_com − com). Arbitrary but FIXED — in a posture stance all four
+    # limbs are gripped so every obs[118:130] slot is zero, and the policy tells a
+    # posture stance from a grip move by the all-ones grip flags (obs[58:62]), so
+    # WHICH slot holds the com goal is immaterial as long as it is the same slot in
+    # training, eval, and record.
+    _POSTURE_GOAL_SLOT = 0   # LH
 
     def __init__(self, reference: Reference, wall, profile: Optional[ClimberProfile] = None,
                  imitation_config: Optional[ImitationConfig] = None,
@@ -577,6 +594,21 @@ class ImitationEnv(gym.Env):
         (nearest-reachable-hold − tip) there, which is usually the wrong hold and
         gives the policy no signal about WHERE to reach.  Patching here makes the
         obs contract identical to reach-one for the mover limb."""
+        # Posture stances have no mover limb (grips == predecessor), so every
+        # goal slot is zero and the policy is blind to the com target it must park
+        # at. Write (goal_com − com) into a fixed slot — mirrors the reward's
+        # posture goal (self.ref.com[target_frame] vs world com), so the obs the
+        # policy reads matches the gradient it is graded on. Gated by
+        # posture_goal_obs; recorded in env_mode so a mismatched eval/record errors.
+        if (self.icfg.posture_goal_obs
+                and self._target_stance in self._posture_stances):
+            goal_com = np.asarray(
+                self.ref.com[self._stance_frames[self._target_stance]], dtype=np.float32)
+            com = np.asarray(self.env.world.com(), dtype=np.float32)
+            obs = obs.copy()
+            slot = 118 + self._POSTURE_GOAL_SLOT * 3
+            obs[slot:slot + 3] = goal_com - com
+            return obs
         if (self._mover_limb is None or self._mover_hold_pos is None
                 or self.env.world.on_hold(self._mover_limb)):
             return obs
@@ -1498,6 +1530,19 @@ def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None,
     env.close()
 
 
+def _imitate_env_mode(icfg: ImitationConfig) -> str:
+    """Canonical env_mode string recorded in an imitation checkpoint's metadata.
+    The posture_goal_obs patch changes the obs CONTRACT (a nonzero com-goal vector
+    in a goal slot during posture stances) without changing its (131,) shape, so it
+    MUST be encoded here: a checkpoint trained with it, then eval'd/recorded without
+    it (or vice versa), reads that slot with the opposite meaning and silently
+    scores garbage. Encoding it as a suffix makes am.validate_checkpoint hard-error
+    on the mismatch. Warm-start (--load) validates this NON-strictly (warns), since
+    transferring weights into a new obs regime is intentional."""
+    base = "milestone" if icfg.stance_milestone else "dense"
+    return f"imitate:{base}{'+postureobs' if icfg.posture_goal_obs else ''}"
+
+
 def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: ImitationConfig,
           wall_json: Optional[str] = None, load_run: Optional[str] = None,
           ent_coef: float = 0.005) -> None:
@@ -1655,12 +1700,16 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
 
     obs_dim = int(vec.observation_space.shape[0])
     action_dim = int(vec.action_space.shape[0])
-    env_mode = f"imitate:{'milestone' if icfg.stance_milestone else 'dense'}"
+    env_mode = _imitate_env_mode(icfg)
 
     model_path = Path(load_run) / "model.zip" if load_run else None
     if model_path is not None and model_path.exists():
+        # Warm-start: hard-check the dims/wall, but env_mode differences are only a
+        # WARNING here — transferring a non-posture-obs (or different-regime) parent
+        # into this run is intentional and the policy adapts. Eval/record stay strict.
         am.validate_checkpoint(model_path, wall=eval_wall, obs_dim=obs_dim,
-                               action_dim=action_dim, env_mode=env_mode)
+                               action_dim=action_dim, env_mode=env_mode,
+                               strict_env_mode=False)
         model = sb3.PPO.load(str(model_path), env=vec)
         model.ent_coef = ent_coef   # allow tightening exploration on warm-start
         print(f"Warm-started from {model_path}  (ent_coef={ent_coef})")
@@ -1753,7 +1802,8 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
     icfg = _maybe_enable_phase_obs(model, ref, wall, profile, icfg)
     env = ImitationEnv(ref, wall, profile, imitation_config=icfg)
     am.validate_checkpoint(model_path, wall=wall, obs_dim=int(env.observation_space.shape[0]),
-                           action_dim=int(env.action_space.shape[0]))
+                           action_dim=int(env.action_space.shape[0]),
+                           env_mode=_imitate_env_mode(icfg))
     vn = None
     if vecnorm and Path(vecnorm).exists():
         vn = VecNormalize.load(vecnorm, DummyVecEnv([lambda: ImitationEnv(ref, wall, profile, icfg)]))
@@ -2020,6 +2070,12 @@ def main() -> None:
                          "the reference stance com counted as 'holding' it.")
     ap.add_argument("--posture-hold-steps", type=int, default=4,
                     help="posture stance success: consecutive in-tol steps required.")
+    ap.add_argument("--posture-goal-obs", action="store_true",
+                    help="write (goal_com − com) into a goal obs slot for posture "
+                         "stances so the policy can perceive the com target it must "
+                         "park at (obs[118:130] are all zero when every limb is "
+                         "gripped). obs.py untouched, shape stays 131; recorded in "
+                         "env_mode so eval/record MUST pass the same flag.")
     ap.add_argument("--posture-rise-coeff", type=float, default=0.0,
                     help="dense com-RISE pull on stand-up posture stances: "
                          "coeff·max(0,1−dz/band) per step (dz=target_com_z−com_z). "
@@ -2109,6 +2165,7 @@ def main() -> None:
                            rsi_landing_banks=args.landing_banks,
                            posture_com_tol=args.posture_com_tol,
                            posture_hold_steps=args.posture_hold_steps,
+                           posture_goal_obs=args.posture_goal_obs,
                            posture_rise_coeff=args.posture_rise_coeff,
                            posture_rise_band=args.posture_rise_band,
                            goal_k=args.goal_k,
@@ -2163,7 +2220,8 @@ def main() -> None:
         _dims_env = ImitationEnv(ref, wall, profile, icfg)
         am.validate_checkpoint(args.model, wall=wall,
                                obs_dim=int(_dims_env.observation_space.shape[0]),
-                               action_dim=int(_dims_env.action_space.shape[0]))
+                               action_dim=int(_dims_env.action_space.shape[0]),
+                               env_mode=_imitate_env_mode(icfg))
         _dims_env.close()
         vn = None
         if args.vecnorm and Path(args.vecnorm).exists():

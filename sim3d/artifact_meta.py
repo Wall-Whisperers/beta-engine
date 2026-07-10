@@ -99,25 +99,41 @@ def build_meta(*, artifact_type: str, wall: Any = None,
     return meta
 
 
-def validate(loaded_meta: Optional[dict], current: dict, *, name: str, path: Any) -> None:
+def validate(loaded_meta: Optional[dict], current: dict, *, name: str, path: Any,
+             strict_env_mode: bool = True) -> None:
     """Hard-error on a mismatch of any ``VALIDATE_FIELDS`` entry present
     (non-None) in both ``loaded_meta`` and ``current``. Print lineage if
-    present. Warn (don't error) when ``loaded_meta`` is missing/legacy."""
+    present. Warn (don't error) when ``loaded_meta`` is missing/legacy.
+
+    ``strict_env_mode=False`` downgrades an ``env_mode`` mismatch to a warning
+    (the other fields still hard-error). Used at warm-start (--load/--init-from):
+    transferring a parent trained in a different reward/obs regime into this run
+    is intentional and the policy adapts, whereas the same mismatch at eval/record
+    means the policy is being run under the wrong obs contract and must error."""
     if not loaded_meta:
         print(f"[artifact_meta] WARNING: {name} at {path} has no embedded metadata "
               f"(legacy artifact, predates provenance tracking) — skipping validation.")
         return
-    mismatches = []
+    mismatches, soft = [], []
     for field in VALIDATE_FIELDS:
         want = current.get(field)
         got = loaded_meta.get(field)
         if want is None or got is None:
             continue
         if isinstance(want, float) or isinstance(got, float):
-            if abs(float(want) - float(got)) > 1e-6:
-                mismatches.append((field, got, want))
-        elif got != want:
+            differs = abs(float(want) - float(got)) > 1e-6
+        else:
+            differs = got != want
+        if not differs:
+            continue
+        if field == "env_mode" and not strict_env_mode:
+            soft.append((field, got, want))
+        else:
             mismatches.append((field, got, want))
+    if soft:
+        lines = "\n".join(f"    {f}: artifact={g!r}  current={w!r}" for f, g, w in soft)
+        print(f"[artifact_meta] {name} at {path}: env_mode differs from this run "
+              f"(warm-start across regimes — allowed):\n{lines}")
     if mismatches:
         lines = "\n".join(f"    {f}: artifact={g!r}  current={w!r}" for f, g, w in mismatches)
         raise ValueError(
@@ -149,15 +165,17 @@ def validate_landing_bank(bank_meta: Optional[dict], *, wall: Any = None, path: 
 
 def validate_checkpoint(model_path: Any, *, wall: Any = None, obs_dim: Optional[int] = None,
                         action_dim: Optional[int] = None,
-                        env_mode: Optional[str] = None) -> Optional[dict]:
+                        env_mode: Optional[str] = None,
+                        strict_env_mode: bool = True) -> Optional[dict]:
     """Load + validate a checkpoint's sidecar meta against the current run.
     Returns the loaded meta (or ``None`` if legacy) so callers can chain
-    lineage (e.g. read the parent's own recorded eval)."""
+    lineage (e.g. read the parent's own recorded eval). Pass
+    ``strict_env_mode=False`` at warm-start (see ``validate``)."""
     meta = read_checkpoint_meta(model_path)
     current: dict = {"obs_dim": obs_dim, "action_dim": action_dim, "env_mode": env_mode}
     if wall is not None:
         current.update(wall_fingerprint(wall))
-    validate(meta, current, name="checkpoint", path=model_path)
+    validate(meta, current, name="checkpoint", path=model_path, strict_env_mode=strict_env_mode)
     return meta
 
 
