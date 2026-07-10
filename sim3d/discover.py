@@ -77,7 +77,7 @@ def _posture_strain(w: Climb3DWorld, margin_rad: float = 0.15) -> float:
     return strain
 
 
-def _search_dofs(w, mover: str) -> list[int]:
+def _search_dofs(w, mover: str, whole_body: bool = False) -> list[int]:
     """The ctrl indices CMA-ES searches for a move.
     For arm movers: the mover's arm + spine + both hips + BOTH KNEES.
     Knees added 2026-06-11: after a foot move the body is crouched on high
@@ -85,14 +85,30 @@ def _search_dofs(w, mover: str) -> list[int]:
     up. Without the knees the optimizer literally could not stand, which is
     why every 4-limb chain stalled right after its foot steps (hands "out
     of reach" 0.7–1.0 m that leg extension closes).
-    For foot movers: the mover's leg + spine + opposing hip (weight-shift)."""
+    For foot movers: the mover's leg + spine + opposing hip (weight-shift).
+
+    ``whole_body`` (foot movers) — ALSO search BOTH arms + the standing leg's
+    knee/ankle + the standing hip's rot. A real climber places a high foot by
+    pulling in on the hands and pressing through the standing leg — a whole-body
+    action. The narrow default froze the arms and standing knee/ankle, so the
+    authored foot move could only reach with the swinging leg and landed at the
+    grip-radius edge (RF gap 0.080, no margin). Recruiting the whole body lets
+    discovery pull the hips in/up and close the last cm with margin. Added
+    2026-07-07 on the observation that each move should move the WHOLE body."""
     if mover in _ARM:
         names = _ARM[mover] + _SPINE + _HIPS["LF"] + _HIPS["RF"] + _KNEES
     elif mover in _LEG:
         other = "RF" if mover == "LF" else "LF"
         names = _LEG[mover] + _SPINE + _HIPS[other]
+        if whole_body:
+            stand = "l" if mover == "RF" else "r"     # the planted leg
+            names = (names + _ARM["LH"] + _ARM["RH"]
+                     + [f"{stand}_hip_rot", f"{stand}_knee", f"{stand}_ankle"])
     else:
         raise ValueError(f"unknown mover: {mover!r}")
+    # De-dup while preserving order (opposing hip flex/abduct may recur).
+    seen: set[str] = set()
+    names = [n for n in names if not (n in seen or seen.add(n))]
     return [w.actuator_id_by_joint[n] for n in names]
 
 
@@ -172,6 +188,8 @@ def discover_move(
     balance_cap_n: float = 0.0, balance_kp: float = 500.0,
     com_drop_max: float = 0.10, max_gap_m: float | None = None,
     com_rise_reward: float = 0.0,
+    stance_center_coeff: float = 0.0, stance_center_com_y: float = 0.16,
+    whole_body: bool = False,
 ) -> tuple[list[dict], dict]:
     """CMA-ES-discover a single move from ``start_frame``. Returns
     ``(recorded_frames, info)``. ``w`` is a scratch world reused across the
@@ -189,10 +207,20 @@ def discover_move(
     policy could supply by weight-shifting). Open-loop discover_move otherwise
     sags when a limb releases on a steep wall; a small capped nudge closes that
     gap while keeping the recorded motion trackable (uncapped assist is what made
-    reach-controller refs untrackable). The pelvis is held at its start position."""
+    reach-controller refs untrackable). The pelvis is held at its start position.
+
+    ``stance_center_coeff`` — if > 0, penalize the LANDED stance for leaving the
+    body off-balance: com_y above ``stance_center_com_y`` (leaning off the wall)
+    plus the lateral (x) offset of the CoM from the centroid of the gripped-limb
+    tips (the base of support). This steers a move to END centered over its
+    stance, so the NEXT move launches from balance — the fix for the barn-door
+    trap where a foot lands tight but leaves the body committed to one side
+    (RF then unreachable from a post-LF stance). Applied to the move itself so no
+    separate weight-shift keyframe is needed (those stall as imitation targets —
+    a static posture with no reach goal to guide the policy in)."""
     lo = np.array([w.model.jnt_range[int(w.model.actuator_trnid[i, 0]), 0] for i in range(w.model.nu)])
     hi = np.array([w.model.jnt_range[int(w.model.actuator_trnid[i, 0]), 1] for i in range(w.model.nu)])
-    dofs = _search_dofs(w, mover)
+    dofs = _search_dofs(w, mover, whole_body=whole_body)
     target_pos = np.array(w._hold_meta_by_id[target]["world_pos"])
     grips0 = _grips_dict(start_frame["grips"])
     n_anchor0 = sum(1 for l in LIMBS if l != mover and grips0.get(l))
@@ -275,12 +303,25 @@ def discover_move(
         # UP, so a chain accumulates real height. (Pair with a raised balance
         # target if the assist caps the rise.)
         com_rise = max(0.0, float(w.com()[2]) - com_z0)
+        # Stance-center: penalize ending off-balance so the NEXT move launches
+        # from a centered stance (com in toward the wall + laterally over the
+        # base of support). Only when landed — an unlanded attempt's balance is
+        # moot and shouldn't compete with closing the gap.
+        stance_center = 0.0
+        if stance_center_coeff > 0.0 and w.on_hold(mover) == target:
+            com = w.com()
+            com_y_pen = max(0.0, float(com[1]) - stance_center_com_y)
+            tips = [w.limb_tip_pos(l) for l in LIMBS if w.on_hold(l) is not None]
+            lateral = (abs(float(com[0]) - float(np.mean([t[0] for t in tips])))
+                       if tips else 0.0)
+            stance_center = com_y_pen + 0.5 * lateral
         cost = (10.0 * gap + 8.0 * max(0, n_anchor0 - n_anchor)
                 + (25.0 if fell else 0.0)
                 + 2.0 * lean_back + 1.5 * com_trough + 2.0 * com_drop
                 + 1.5 * posture
                 + 0.4 * vel_sq
                 + 0.08 * float(np.linalg.norm(residual))
+                + stance_center_coeff * stance_center
                 - com_rise_reward * com_rise)
         if record:
             return cost, frames, {"gap": round(gap, 3), "landed": bool(landed),
@@ -288,7 +329,9 @@ def discover_move(
                                   "lean_back": round(lean_back, 3),
                                   "com_trough": round(com_trough, 3),
                                   "com_drop": round(com_drop, 3),
-                                  "posture": round(posture, 2)}
+                                  "posture": round(posture, 2),
+                                  "stance_center": round(stance_center, 3),
+                                  "com_y": round(float(w.com()[1]), 3)}
         return cost
 
     # Enable the capped balance assist for the duration of this move's search.
@@ -430,6 +473,88 @@ def discover_stand(
     return frames, info
 
 
+def discover_shift(
+    w: Climb3DWorld, start_frame: dict, *,
+    com_y_target: float = 0.16, horizon: int = 32, max_evals: int = 200,
+    sigma0: float = 0.4, restarts: int = 1,
+) -> tuple[list[dict], dict]:
+    """CMA-ES 'weight shift': no mover, no target — pull the CoM IN toward the
+    wall (reduce com_y) over the current grips with all four limbs kept. This is
+    the posture correction a launch needs when the body is left leaning off the
+    wall after a foot move (e.g. com_y ≈ 0.5 m) and the next reach is physically
+    out of range from there. Same search space and machinery as ``discover_stand``
+    (which pulls com_z UP instead of com_y IN) — only the cost changes. Searched
+    DOFs: spine + both hips + knees + ankles."""
+    names = (_SPINE + _HIPS["LF"] + _HIPS["RF"] + _KNEES + ["l_ankle", "r_ankle"])
+    dofs = [w.actuator_id_by_joint[n] for n in names]
+    lo = np.array([w.model.jnt_range[int(w.model.actuator_trnid[i, 0]), 0] for i in range(w.model.nu)])
+    hi = np.array([w.model.jnt_range[int(w.model.actuator_trnid[i, 0]), 1] for i in range(w.model.nu)])
+    grips0 = _grips_dict(start_frame["grips"])
+    n_anchor0 = sum(1 for l in LIMBS if grips0.get(l))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        w.rsi(start_frame["qpos"], np.zeros(w.model.nv), grips0)
+    ctrl0 = w.data.ctrl.copy()
+    blo = [float(lo[i] - ctrl0[i]) - 0.05 for i in dofs]
+    bhi = [float(hi[i] - ctrl0[i]) + 0.05 for i in dofs]
+    com_z0 = float(start_frame["com"][2])
+
+    def rollout(residual: np.ndarray, record: bool = False):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            w.rsi(start_frame["qpos"], np.zeros(w.model.nv), grips0)
+        ctrl = w.data.ctrl.copy()
+        for k, i in enumerate(dofs):
+            ctrl[i] = float(np.clip(ctrl[i] + residual[k], lo[i], hi[i]))
+        w.data.ctrl[:] = ctrl
+        frames: list[dict] = []
+        vel_sq = 0.0
+        for _ in range(horizon):
+            if record:
+                frames.append(_snapshot(w))
+            w.step(ENV_SUBSTEPS, check_slip=True)
+            vel_sq += float(np.mean(w.data.qvel[6:] ** 2))
+        if record:
+            frames.append(_snapshot(w))
+        vel_sq /= max(1, horizon)
+        com_y = float(w.com()[1])
+        com_z_drop = max(0.0, com_z0 - float(w.com()[2]))
+        n_anchor = sum(1 for l in LIMBS if w.on_hold(l) is not None)
+        fell = float(w.pelvis_pos()[2]) < FALL_Z
+        posture = _posture_strain(w)
+        cost = (10.0 * max(0.0, com_y - com_y_target)
+                + 8.0 * max(0, n_anchor0 - n_anchor)
+                + (25.0 if fell else 0.0)
+                + 2.0 * com_z_drop         # don't sag while shifting
+                + 1.5 * posture
+                + 0.4 * vel_sq
+                + 0.05 * float(np.linalg.norm(residual)))
+        if record:
+            return cost, frames, {"com_y_end": round(com_y, 3),
+                                  "com_z_drop": round(com_z_drop, 3),
+                                  "n_anchor": n_anchor, "fell": bool(fell),
+                                  "posture": round(posture, 2)}
+        return cost
+
+    best = None
+    for attempt in range(restarts + 1):
+        x_init = np.clip(np.zeros(len(dofs)), np.asarray(blo) + 1e-3,
+                         np.asarray(bhi) - 1e-3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            xbest, _es = cma.fmin2(
+                rollout, x_init, sigma0 * (1.6 ** attempt),
+                {"maxfevals": max_evals, "bounds": [blo, bhi], "verbose": -9},
+            )
+        cost, frames, info = rollout(np.asarray(xbest), record=True)
+        if best is None or cost < best[0]:
+            best = (cost, frames, info)
+        if info["com_y_end"] < com_y_target + 0.02 and info["n_anchor"] == n_anchor0:
+            break
+    _, frames, info = best
+    return frames, info
+
+
 def stance_route_from_reference(ref: Reference) -> list[dict[str, str]]:
     """Extract the sequence of STABLE 4-grip stances (hold-sets) from a dense
     reference — the route skeleton, with the untrackable transition frames
@@ -521,6 +646,8 @@ def author_dense_from_stances(
     posture_settle: int = 20, horizon: int = 30, max_evals: int = 250,
     restarts: int = 1,
     balance_cap_n: float = 0.0, wall_gen_seed: int = 7,
+    shift_com_y_target: float = 0.16, insert_foot_shift: bool = False,
+    foot_stance_center_coeff: float = 0.0,
 ) -> tuple[Reference, list[dict]]:
     """Synthesis (2026-06-15): a DENSE reference built from a stance route by
     connecting each consecutive *posture-corrected* stance with a ``discover_move``
@@ -587,15 +714,20 @@ def author_dense_from_stances(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             is_foot = mover in ("LF", "RF")
-            move_frames, info = discover_move(w, start, mover, target,
-                                              horizon=horizon, max_evals=max_evals,
-                                              restarts=restarts, balance_cap_n=balance_cap_n,
-                                              com_drop_max=(0.30 if is_foot else 0.10))
+            move_frames, info = discover_move(
+                w, start, mover, target,
+                horizon=horizon, max_evals=max_evals,
+                restarts=restarts, balance_cap_n=balance_cap_n,
+                com_drop_max=(0.30 if is_foot else 0.10),
+                stance_center_coeff=(foot_stance_center_coeff if is_foot else 0.0),
+                stance_center_com_y=shift_com_y_target)
         frames.extend(move_frames)
         diag.append({"transition": f"{k-1}->{k}", "mover": mover, "target": target,
-                     "landed": bool(info["landed"]), "gap": round(info["gap"], 3)})
+                     "landed": bool(info["landed"]), "gap": round(info["gap"], 3),
+                     "com_y": info.get("com_y"),
+                     "stance_center": info.get("stance_center")})
         print(f"  transition {k-1}->{k}: {mover}->{target}  gap={info['gap']:.3f}m  "
-              f"landed={info['landed']}", flush=True)
+              f"landed={info['landed']}  com_y={info.get('com_y')}", flush=True)
         if not info["landed"]:
             diag.append({"status": f"aborted: transition {k-1}->{k} not feasible "
                                    f"(gap {info['gap']:.3f} m)"})
@@ -631,6 +763,33 @@ def author_dense_from_stances(
             frames.extend(stand_frames)
             print(f"    com_gain={stand_info['com_gain']:.3f}m  "
                   f"n_anchor={stand_info['n_anchor']}", flush=True)
+            for _ in range(settle_dwell):
+                frames.append(_snapshot(w))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    w.step(ENV_SUBSTEPS, check_slip=False)
+            start = _snapshot(w)
+
+        # Weight-shift: after a foot move followed by ANOTHER foot move (the
+        # free leg is still in the air, weight left on the other side after
+        # the previous step), pull the CoM back toward the wall over the
+        # planted limbs before authoring the next foot's reach. Mirrors the
+        # stand-up block above (which raises com_z before a HAND move); this
+        # one reduces com_y before a FOOT move. Without it the next foot
+        # launches from a lopsided, leaning-out stance it can't reach from
+        # (the barn-door trap — RF unreachable at 0.12-0.19 m from a
+        # committed post-LF stance, never fixed by RL-side reward shaping;
+        # baking the shift into the reference is the fix).
+        if insert_foot_shift and is_foot and next_is_foot and k + 1 < len(route):
+            print(f"  weight-shift after foot move {k-1}->{k}…", flush=True)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                shift_frames, shift_info = discover_shift(
+                    w, start, com_y_target=shift_com_y_target,
+                    horizon=horizon, max_evals=max_evals, restarts=restarts)
+            frames.extend(shift_frames)
+            print(f"    com_y_end={shift_info['com_y_end']:.3f}m  "
+                  f"n_anchor={shift_info['n_anchor']}", flush=True)
             for _ in range(settle_dwell):
                 frames.append(_snapshot(w))
                 with warnings.catch_warnings():
@@ -1037,6 +1196,20 @@ def main() -> None:
     ap.add_argument("--restarts", type=int, default=1,
                     help="--dense: CMA restarts per transition (default 1; raise to 2-3 "
                          "for marginal transitions near the grip radius).")
+    ap.add_argument("--shift-com-y", type=float, default=0.16,
+                    help="--dense: target com_y (m from wall) for both the "
+                         "stance-center landing term and the (opt-in) auto-inserted "
+                         "weight-shift. Lower = hug the wall harder.")
+    ap.add_argument("--foot-stance-center", type=float, default=0.0,
+                    help="--dense: penalty coeff steering FOOT moves to LAND "
+                         "centered (com in toward wall + over the base of support) "
+                         "so the next move launches from balance — no separate "
+                         "weight-shift keyframe needed. 0 = off. Try 3.0.")
+    ap.add_argument("--insert-foot-shift", action="store_true",
+                    help="--dense: auto-insert a discover_shift weight-shift stance "
+                         "between two consecutive foot moves (the separate-keyframe "
+                         "approach). Prefer --foot-stance-center instead — shift "
+                         "keyframes stall as static imitation targets.")
     ap.add_argument("--adaptive", action="store_true",
                     help="use adaptive discovery (probe reachable holds from each "
                          "end-of-move stance instead of a fixed move list)")
@@ -1289,7 +1462,10 @@ def main() -> None:
             ref, diag = author_dense_from_stances(
                 wall, profile, route, wall_gen_seed=prior.wall_gen_seed,
                 max_evals=args.max_evals, restarts=args.restarts,
-                balance_cap_n=args.balance_assist)
+                balance_cap_n=args.balance_assist,
+                shift_com_y_target=args.shift_com_y,
+                insert_foot_shift=args.insert_foot_shift,
+                foot_stance_center_coeff=args.foot_stance_center)
         else:
             with contextlib.redirect_stderr(io.StringIO()):
                 ref, diag = author_stance_reference(wall, profile, route,
