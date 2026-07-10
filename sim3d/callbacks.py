@@ -15,6 +15,8 @@ from typing import Optional
 
 import numpy as np
 
+from sim3d import artifact_meta as am
+
 try:
     from stable_baselines3.common.callbacks import BaseCallback
 except ImportError as e:  # pragma: no cover
@@ -42,6 +44,7 @@ class FirstMidLastCheckpointCallback(BaseCallback):
         total_timesteps: int,
         first_at: int = 1024,
         verbose: int = 0,
+        checkpoint_meta: Optional[dict] = None,
     ) -> None:
         super().__init__(verbose)
         self._out_dir = out_dir
@@ -49,6 +52,7 @@ class FirstMidLastCheckpointCallback(BaseCallback):
         self._mid_at = int(total_timesteps // 2)
         self._saved_first = False
         self._saved_mid = False
+        self._checkpoint_meta = checkpoint_meta
         os.makedirs(self._out_dir, exist_ok=True)
 
     def _on_step(self) -> bool:
@@ -68,6 +72,9 @@ class FirstMidLastCheckpointCallback(BaseCallback):
     def _save(self, name: str) -> None:
         path = os.path.join(self._out_dir, name)
         self.model.save(path)
+        if self._checkpoint_meta is not None:
+            am.write_checkpoint_meta(path, {**self._checkpoint_meta,
+                                            "num_timesteps": self.num_timesteps})
         if self.verbose:
             print(f"[FirstMidLastCheckpointCallback] saved {path} at step {self.num_timesteps}")
 
@@ -103,6 +110,7 @@ class RollingBestCheckpointCallback(BaseCallback):
         window: int = 100,
         min_episodes_for_best: int = 25,
         verbose: int = 0,
+        checkpoint_meta: Optional[dict] = None,
     ) -> None:
         super().__init__(verbose)
         self._out_dir = out_dir
@@ -113,6 +121,7 @@ class RollingBestCheckpointCallback(BaseCallback):
         self._rewards: collections.deque[float] = collections.deque(maxlen=window)
         self._best_rolling_rew = -float("inf")
         self._best_com_z = -float("inf")
+        self._checkpoint_meta = checkpoint_meta
         os.makedirs(out_dir, exist_ok=True)
 
     def _on_step(self) -> bool:
@@ -187,6 +196,9 @@ class RollingBestCheckpointCallback(BaseCallback):
                 self.model.save(final_path)
                 return
             os.replace(tmp_path, final_path)
+            if self._checkpoint_meta is not None:
+                am.write_checkpoint_meta(final_path, {**self._checkpoint_meta,
+                                                       "num_timesteps": self.num_timesteps})
             # Also keep VecNormalize stats up-to-date so --resume can reload them.
             try:
                 from stable_baselines3.common.vec_env import VecNormalize as _VN

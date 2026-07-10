@@ -29,6 +29,7 @@ from typing import Optional
 import numpy as np
 
 from solver.wall import load_wall
+from sim3d import artifact_meta as am
 from sim3d.body import ClimberProfile
 from sim3d.env import Climbing3DEnv, EnvConfig
 
@@ -450,6 +451,45 @@ def _make_env_factory(cfg: TrainConfig, moonboard_splits=None):
     return _factory
 
 
+def _env_mode_for_cfg(cfg: TrainConfig) -> str:
+    if cfg.climb_curriculum:
+        return "climb-curriculum"
+    if cfg.staged_curriculum:
+        return "staged-curriculum"
+    if cfg.curriculum:
+        return "curriculum"
+    if cfg.moonboard_file:
+        return "moonboard"
+    return "climb"
+
+
+def _wall_for_meta(cfg: TrainConfig):
+    """Best-effort single `Wall` for artifact-metadata purposes. Curriculum
+    and moonboard-split modes sample a new wall every episode — there's no
+    single wall to fingerprint, so this returns None and checkpoint
+    validation falls back to obs/action-dim-only checks."""
+    if cfg.climb_curriculum or cfg.staged_curriculum or cfg.curriculum:
+        return None
+    if cfg.moonboard_file:
+        if cfg.moonboard_problem_id is None:
+            return None  # samples from a split each episode
+        try:
+            from sim3d.moonboard import (find_problem, load_moonboard_problems,
+                                         moonboard_problem_to_wall)
+            problems = load_moonboard_problems(cfg.moonboard_file)
+            problem = find_problem(problems, id=cfg.moonboard_problem_id)
+            if problem is None:
+                return None
+            return moonboard_problem_to_wall(
+                problem, vertical_projection=cfg.moonboard_vertical_projection)
+        except Exception:  # noqa: BLE001 — metadata is best-effort, never fatal
+            return None
+    try:
+        return load_wall(cfg.wall)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _warn_if_unhangable(factory, seed: int, steps: int = 20) -> None:
     """One-time startup sanity check: if the seed pose can't even hang (the body
     falls under a zero action), print a loud warning.
@@ -545,6 +585,13 @@ def train(cfg: TrainConfig) -> Path:
         else:
             vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
 
+    # Artifact-metadata context for this run — embedded in the checkpoint
+    # sidecar at save time, validated against any --resume/--init-from parent.
+    meta_wall = _wall_for_meta(cfg)
+    meta_env_mode = _env_mode_for_cfg(cfg)
+    meta_obs_dim = int(vec_env.observation_space.shape[0])
+    meta_action_dim = int(vec_env.action_space.shape[0])
+
     # TensorBoard is an optional sub-dep. Enable logging only if it's
     # importable; otherwise SB3 errors out at .learn() time.
     tb_log = None
@@ -573,6 +620,8 @@ def train(cfg: TrainConfig) -> Path:
         resume_path = _P(cfg.resume)
         if not resume_path.exists():
             raise SystemExit(f"--resume path does not exist: {resume_path}")
+        am.validate_checkpoint(resume_path, wall=meta_wall, obs_dim=meta_obs_dim,
+                               action_dim=meta_action_dim, env_mode=meta_env_mode)
         print(f"Resuming training from {resume_path}")
         # PPO.load restores policy weights, optimizer moments, and the
         # num_timesteps counter. We pass custom_objects to override any
@@ -625,6 +674,8 @@ def train(cfg: TrainConfig) -> Path:
             init_path = _P(cfg.init_from)
             if not init_path.exists():
                 raise SystemExit(f"--init-from path does not exist: {init_path}")
+            am.validate_checkpoint(init_path, wall=meta_wall, obs_dim=meta_obs_dim,
+                                   action_dim=meta_action_dim, env_mode=meta_env_mode)
             print(f"Warm-starting policy from {init_path}")
             loaded = sb3.PPO.load(str(init_path), device=cfg.device)
             # Copy weights only — keep the new model's hyperparameters and env.
@@ -643,6 +694,13 @@ def train(cfg: TrainConfig) -> Path:
         RollingBestCheckpointCallback,
         VideoRolloutCallback,
     )
+    _parent_ckpt = cfg.resume or cfg.init_from or None
+    checkpoint_meta = am.build_meta(
+        artifact_type="checkpoint", wall=meta_wall, obs_dim=meta_obs_dim,
+        action_dim=meta_action_dim, env_mode=meta_env_mode,
+        parent=_parent_ckpt, parent_eval=am.parent_eval_of(_parent_ckpt),
+        extra={"run_id": cfg.run_id},
+    )
     callbacks = [
         csv_cb,
         FirstMidLastCheckpointCallback(
@@ -650,12 +708,14 @@ def train(cfg: TrainConfig) -> Path:
             total_timesteps=cfg.total_timesteps,
             first_at=cfg.checkpoint_first_at,
             verbose=1,
+            checkpoint_meta=checkpoint_meta,
         ),
         RollingBestCheckpointCallback(
             out_dir=str(out_dir),
             save_freq=cfg.save_freq,
             window=100,
             verbose=1,
+            checkpoint_meta=checkpoint_meta,
         ),
     ]
     if cfg.video_freq > 0:
@@ -678,6 +738,7 @@ def train(cfg: TrainConfig) -> Path:
         reset_num_timesteps=reset_num_timesteps,
     )
     model.save(out_dir / "model.zip")
+    am.write_checkpoint_meta(out_dir / "model.zip", checkpoint_meta)
     from stable_baselines3.common.vec_env import VecNormalize as _VN
     if isinstance(vec_env, _VN):
         vec_env.save(str(out_dir / "vec_normalize.pkl"))

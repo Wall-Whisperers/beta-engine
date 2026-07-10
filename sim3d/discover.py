@@ -27,6 +27,7 @@ try:
 except ImportError as e:  # pragma: no cover
     raise ImportError("sim3d.discover requires pycma:  pip install cma") from e
 
+from sim3d import artifact_meta as am
 from sim3d import config as cfg
 from sim3d.body import LIMBS, ClimberProfile
 from sim3d.reference import ENV_SUBSTEPS, FALL_Z, Reference
@@ -1089,7 +1090,9 @@ def main() -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             wd = json.loads(wall_path.read_text())
-            wall = load_wall(wd, cell_size_cm=DEFAULT_CELL_SIZE_CM)
+            cell = wd.get("grid", {}).get("cell_size_cm")
+            wall = load_wall(wd, cell_size_cm=cell or DEFAULT_CELL_SIZE_CM)
+        am.validate_reference(prior_ref, wall, path=ref_path)
         profile = ClimberProfile()
         w = Climb3DWorld(wall, profile)
         # Build start_frame from the last STABLE frame (all 4 limbs gripped).
@@ -1247,7 +1250,8 @@ def main() -> None:
         print(f"continued {n_moves} moves | {len(ref)} frames | holdable {frac*100:.0f}% | "
               f"net pelvis rise {net_z:+.2f} m{'  << NOT A CLIMB' if net_z < 0.10 else ''}")
         if n_moves >= 1:
-            ref.save(args.out)
+            ref.save(args.out, wall=wall, env_mode="discover-continue",
+                     parent=ref_path)
             out_wall = Path(args.out).with_suffix(".wall.json")
             out_wall.write_text(json.dumps(wd))
             print(f"saved {args.out}  +  {out_wall}")
@@ -1271,7 +1275,12 @@ def main() -> None:
         profile = ClimberProfile()
         with contextlib.redirect_stderr(io.StringIO()), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            wall = load_wall(wd, cell_size_cm=DEFAULT_CELL_SIZE_CM)
+            # Respect the wall's own cell_size_cm (fine-grid walls use 5 cm, not
+            # the 20 cm default) — forcing DEFAULT rescaled every hold 4× and put
+            # foot targets at z≈6 m, so no move could land.
+            cell = wd.get("grid", {}).get("cell_size_cm")
+            wall = load_wall(wd, cell_size_cm=cell or DEFAULT_CELL_SIZE_CM)
+        am.validate_reference(prior, wall, path=ref_path)
         route = stance_route_from_reference(prior)
         mode = "DENSE (discover_move transitions)" if args.dense else "stance-keyframe"
         print(f"{mode} authoring: {len(route)} stances from "
@@ -1312,7 +1321,8 @@ def main() -> None:
             worst_posture = max((d["posture"] for d in diag), default=0.0)
             print(f"authored {len(route)} stances | {len(ref)} frames | "
                   f"net pelvis rise {net_z:+.2f} m | worst posture {worst_posture}")
-        ref.save(args.out)
+        env_mode = "discover-stances-dense" if args.dense else "discover-stances"
+        ref.save(args.out, wall=wall, env_mode=env_mode, parent=ref_path)
         Path(args.out).with_suffix(".wall.json").write_text(json.dumps(wd))
         print(f"saved {args.out}  +  {Path(args.out).with_suffix('.wall.json')}")
         return
@@ -1385,7 +1395,8 @@ def main() -> None:
     print(f"discovered {landed} moves | {len(ref)} frames | holdable {frac*100:.0f}% | "
           f"net pelvis rise {net_z:+.2f} m{'  << NOT A CLIMB' if net_z < 0.10 else ''}")
     if landed >= 1:
-        ref.save(args.out)
+        env_mode = "discover-adaptive" if args.adaptive else "discover"
+        ref.save(args.out, wall=wall, env_mode=env_mode)
         wall_path = Path(args.out).with_suffix(".wall.json")
         wall_path.write_text(json.dumps(wd))
         print(f"saved {args.out}  +  {wall_path}")

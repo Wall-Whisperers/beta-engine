@@ -32,6 +32,7 @@ from typing import Optional
 
 import numpy as np
 
+from sim3d import artifact_meta as _am
 from sim3d import config as _cfg
 from sim3d.body import HAND_LIMBS, LIMBS, ClimberProfile
 from sim3d.env import EnvConfig
@@ -123,6 +124,9 @@ class Reference:
     grips: np.ndarray           # (T, 4) hold-id strings, "" = released
     wall_gen_seed: int = 7      # the gen seed that rebuilds the matching wall
     meta: dict = field(default_factory=dict)
+    # Provenance (wall id/hash, cell size, git commit, lineage) embedded by
+    # `save(wall=...)`. `None` on a legacy artifact saved before this existed.
+    artifact_meta: Optional[dict] = None
 
     def __len__(self) -> int:
         return int(self.qpos.shape[0])
@@ -130,26 +134,38 @@ class Reference:
     def frame_grips(self, t: int) -> dict[str, Optional[str]]:
         return {LIMBS[i]: (g if g else None) for i, g in enumerate(self.grips[t])}
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path, *, wall: object = None, env_mode: Optional[str] = None,
+             parent: Optional[str | Path] = None, parent_eval: Optional[float] = None) -> None:
+        """Save the trajectory. Pass ``wall`` (the ``solver.wall.Wall`` this
+        reference was authored/discovered/continued on) to embed provenance
+        metadata — without it the saved file carries no wall/cell-size record
+        and downstream loads can't be validated. ``parent`` is the source
+        reference path for a ``--continue-from``/``--stances``/``--stitch``
+        derivation, for lineage."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if wall is not None:
+            artifact_meta = _am.build_meta(
+                artifact_type="reference", wall=wall, env_mode=env_mode,
+                extra={"nq": int(self.qpos.shape[1]), "nv": int(self.qvel.shape[1])},
+                parent=str(parent) if parent else None, parent_eval=parent_eval,
+            )
+        else:
+            artifact_meta = self.artifact_meta  # re-save (e.g. --migrate): keep what's there
         np.savez(
             path, qpos=self.qpos, qvel=self.qvel, eef=self.eef, com=self.com,
             grips=self.grips, wall_gen_seed=self.wall_gen_seed,
-            meta=np.array(repr(self.meta), dtype=object),
+            meta=_am.npz_meta_value(artifact_meta, self.meta),
         )
 
     @classmethod
     def load(cls, path: str | Path) -> "Reference":
         d = np.load(Path(path), allow_pickle=True)
-        meta = {}
-        try:
-            meta = eval(str(d["meta"]))  # noqa: S307 — our own repr, trusted
-        except Exception:  # noqa: BLE001
-            pass
+        artifact_meta, meta = _am.parse_npz_meta(d["meta"] if "meta" in d else None)
         return cls(
             qpos=d["qpos"], qvel=d["qvel"], eef=d["eef"], com=d["com"],
             grips=d["grips"], wall_gen_seed=int(d["wall_gen_seed"]), meta=meta,
+            artifact_meta=artifact_meta,
         )
 
 
@@ -397,7 +413,8 @@ def migrate_reference_spine(ref: "Reference") -> "Reference":
     meta = dict(ref.meta)
     meta["migrated"] = meta.get("migrated", []) + ["spine_lat+spine_twist 2026-06-11"]
     return Reference(qpos=qpos, qvel=qvel, eef=ref.eef, com=ref.com,
-                     grips=ref.grips, wall_gen_seed=ref.wall_gen_seed, meta=meta)
+                     grips=ref.grips, wall_gen_seed=ref.wall_gen_seed, meta=meta,
+                     artifact_meta=ref.artifact_meta)
 
 
 def stitch_references(refs: list["Reference"]) -> "Reference":
@@ -529,7 +546,7 @@ def main() -> None:
     if args.calibrate:
         _calibrate(ref, wall, profile, ImitationCoeffs())
 
-    ref.save(args.out)
+    ref.save(args.out, wall=wall, env_mode="author")
     print(f"Wrote {args.out}")
 
 
