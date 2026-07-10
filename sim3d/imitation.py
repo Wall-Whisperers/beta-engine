@@ -39,6 +39,7 @@ try:
 except ImportError as e:  # pragma: no cover
     raise ImportError("sim3d.imitation requires gymnasium (pip install -r requirements.txt)") from e
 
+from sim3d import artifact_meta as am
 from sim3d import config as cfg
 from sim3d.body import LIMBS, ClimberProfile
 from sim3d.env import Climbing3DEnv, EnvConfig
@@ -170,6 +171,13 @@ class ImitationConfig:
     # step inside the radius so the optimization landscape has a gradient toward
     # commitment. 0.0 disables. Try coeff ≈ 0.2–0.5 (same scale as r_imit).
     mover_capture_coeff: float = 0.0
+    # Radius (m) of the capture sphere. 0.0 → use GRIP_PROXIMITY_M (0.08), the
+    # original behavior. Set larger (e.g. 0.15) when a trained mover plateaus
+    # JUST outside the grip radius: the deterministic RF reach parks at ~0.126 m
+    # (measured 2026-07-07), which is OUTSIDE 0.08 so the capture gradient never
+    # fires — a dead zone exactly where the toe gets stuck. A wider capture
+    # radius extends the strong final pull into that band to break the plateau.
+    mover_capture_radius: float = 0.0
 
     # Dense ABSOLUTE reach pull over the full mover_reach_radius (NOT potential-
     # based): `coeff·max(0, 1 − gap/radius)` every step the mover is ungripped.
@@ -195,11 +203,145 @@ class ImitationConfig:
     # termination is fall / success / budget instead.
     stance_milestone: bool = False
     milestone_budget: int = 40        # max env steps to complete one transition
+    # Focus milestone RSI on ONE transition (stance c → c+1) instead of uniform over
+    # all stances — puts 100% of the gradient on a single move. Used to crack a lone
+    # weak move (e.g. the final RF foot move from the most-committed stance, which
+    # uniform milestone under-trained to 0%) while warm-starting a foundation that
+    # already knows the others. Preserves the fixed-denom phase (target_stance = c+1),
+    # so the move keeps its identity and the other moves aren't overwritten. None =
+    # uniform over all transitions.
+    milestone_focus_stance: Optional[int] = None
+    # Probability of picking the focus stance each episode (the rest sample uniformly
+    # over ALL stances). 1.0 = exclusive focus, but that holds the phase input CONSTANT
+    # → VecNormalize zeroes it → the policy learns to IGNORE phase and overwrites the
+    # other moves (observed: RF focus cracked RF 0→100% but wiped RH/LH/LF 100→0). Use
+    # <1 (e.g. 0.6) to OVERSAMPLE the hard move while keeping the others in-distribution
+    # so phase stays informative and the learned moves are protected. Only used when
+    # milestone_focus_stance is set.
+    milestone_focus_frac: float = 1.0
+    # DAgger: path to a .npz "landing bank" of the policy's OWN real states at the
+    # focus stance (collected via --collect-landings). When set, milestone RSI for the
+    # focus stance draws from these real landings instead of the authored stance
+    # keyframe — the fix for the composition distribution-shift where a move trained
+    # from its authored stance parks short when launched from the policy's real landing
+    # (measured: LF reached 0.117 m, 3.7 cm short of the 0.08 grip). Only the focus
+    # stance uses the bank; other stances stay on authored frames.
+    rsi_landing_bank: Optional[str] = None
+    # Multi-bank DAgger: "c1:path1,c2:path2" — a landing bank PER stance, so multiple
+    # foot moves train from their real composition landings SIMULTANEOUSLY. Single-focus
+    # DAgger specializes one foot move and degrades the other (whack-a-mole: LF-focus
+    # kills RF; RF-focus decays LF). Banked stances are oversampled (milestone_focus_frac);
+    # non-banked (hand) moves sample authored frames. Supersedes rsi_landing_bank when set.
+    rsi_landing_banks: Optional[str] = None
     # Sequential chain (true multi-move climb): start at the bottom stance and,
     # on each grip-match, advance the target to the next stance WITHOUT reset, so
     # move k+1 trains from move k's real on-policy landing (fixes composition).
     # Success = reaching the FINAL stance. Per-transition budget still applies.
     sequential_chain: bool = False
+    # Same-grip "posture" stances (weight-shift / stand-up keyframes): success
+    # requires holding the com near the reference stance com, since grips alone
+    # match trivially the instant such a stance becomes the target. Detected
+    # automatically (stance m grips == stance m-1 grips) in ImitationEnv.__init__.
+    posture_com_tol: float = 0.06      # m, com distance for a posture-stance success
+    posture_hold_steps: int = 4        # consecutive in-tol steps required
+    # Dense com-rise pull for stand-up posture stances: coeff·max(0,1−dz/band)
+    # per step, where dz = max(0, target_com_z − com_z). Gives a directed
+    # gradient to raise the body (the sparse pose+com attractor alone stalls the
+    # stand-up partway — the net-height fix, analog of mover_capture_radius). 0 off.
+    # LEGACY: superseded by the goal potential below (active only when goal_k=0).
+    posture_rise_coeff: float = 0.0
+    posture_rise_band: float = 0.15    # m; height gap over which the pull ramps
+
+    # ── Goal-potential milestone reward (2026-07-09 redesign) ───────────────
+    # DESIGN NOTE — the dead-zone fix, generalized (see memory note
+    # dead-zone-pattern-general-fix). Every recurring milestone failure — RF toe
+    # plateauing at 0.126 m just outside the 0.08 m capture sphere, weight-shift
+    # posture stances never training (0/12), the stand-up stalling at +0.054 m of
+    # +0.141 m — shared one root: the bounded pose attractor SATURATES near the
+    # goal (exp(-k·err²) has vanishing gradient at small err — flattest exactly
+    # where the steepest is needed), while the actual goal was only a sparse
+    # bonus or a weak bolt-on pull (capture sphere, posture_rise). Each symptom
+    # got its own ad-hoc patch; this replaces them with one mechanism:
+    #
+    # 1. GOAL POINT per stance transition: the target hold center for grip moves
+    #    (tracked point = the mover tip); the reference stance com (3D) for
+    #    posture/stand-up stances (tracked point = the body com) — converting
+    #    "hold this pose" into a reach in com-space. The 3D com goal also covers
+    #    reward-side stance centering (com_y toward the wall is part of the
+    #    target), so no separate centering term is stacked on.
+    # 2. DENSE SIGNED POTENTIAL: r += goal_k · (d_prev − d_cur) every step of the
+    #    transition, from spawn distance all the way to the success tolerance —
+    #    no capture-sphere gating, no inner dead zone. It telescopes to
+    #    goal_k·(d_spawn − d_final): oscillation nets zero, the episode total is
+    #    bounded by goal_k·d_spawn, and — unlike the absolute capture/reach-abs
+    #    pulls it replaces — hovering near the goal without gripping earns
+    #    NOTHING per step, removing that farming mode outright. Per-step
+    #    magnitude is physically bounded by limb/com speed (no clip: an
+    #    asymmetric clip on a signed potential is farmable by slow-approach/
+    #    fast-retreat cycles).
+    # 3. ATTRACTOR FLOOR inside the final band (d < goal_band): the pose-
+    #    attractor income is floored at its band-entry value — att =
+    #    max(entry, live) — so a SATURATED attractor contributes zero gradient
+    #    where the potential must own the landscape (it degenerates to a
+    #    constant freeze), while an UNSATURATED one still pays for settling
+    #    into the reference posture (the com potential says WHERE, the
+    #    attractor says WHICH pose can hold there — a hard freeze removed that
+    #    and produced swing-through-and-drift on the stand-up). Flooring fixes
+    #    the near-goal RATIO without a global potential crank that would
+    #    distort early transit, and without the perverse outward pull a
+    #    multiplicative down-weight w(d)=d/band would create (income stays
+    #    continuous at the band boundary and can never drop on entry; re-entry
+    #    re-latches at the live boundary value, so band-bouncing gains
+    #    nothing; pose oscillation inside the band nets zero).
+    #
+    # Success criteria are unchanged: grip-match for grip stances,
+    # posture_com_tol/posture_hold_steps for posture stances. Wrapper-level
+    # only — obs shapes and the inner-env reward are untouched.
+    #
+    # SUPERSEDES (ignored with a startup warning while goal_k > 0):
+    # mover_reach_coeff, mover_reach_abs_coeff, mover_capture_coeff/_radius,
+    # posture_rise_coeff/_band. Pass --goal-k 0 to run the legacy terms.
+    # goal_k=100 is the documented reach-potential scale (a 0.26 m reach earns
+    # ~26 total, below completion_bonus=40 so the verified landing still
+    # dominates); goal_band=0.15 covers both observed plateau zones (RF parked
+    # at 0.126 m; the stand-up stalled ~0.09 m short in com-space).
+    goal_k: float = 100.0
+    goal_band: float = 0.15
+    # Velocity term in the POSTURE-stance goal metric: d_aug = ‖com−g‖ +
+    # goal_vel_lambda·‖v_com‖ (v by finite difference; λ in seconds). The
+    # position-only potential is provably NEUTRAL to in-band orbiting
+    # (telescopes to zero per cycle), so a policy that swings THROUGH the
+    # tolerance in 1 step pays nothing for never parking (observed: rise7/8
+    # det min_d 0.061 in-tol for exactly 1 step, success stuck at ~4%
+    # stochastic). With the velocity term, the potential's minimum coincides
+    # exactly with the success criterion's fixed point — at the goal, AT REST —
+    # so decelerating into the goal is what pays. Still telescoping ⇒ still
+    # un-farmable. Grip stances keep the pure position metric (arriving fast
+    # at a weld is fine; the weld does the stopping). 0 disables.
+    goal_vel_lambda: float = 0.15
+
+    # ── Phase conditioning (multi-move composition-collapse fix) ────────────
+    # When True, append a single normalized move-phase scalar ∈ [0,1] to the
+    # observation (obs grows 131→132). The scalar tells the policy WHICH move
+    # it is on (target_stance / n_stances in milestone/sequential, chain_stage /
+    # n_stages in chain mode; constant 0 for single-move dense). Without it one
+    # shared MLP must handle every move from a similar-looking body state, so a
+    # gradient update for a late move overwrites the representation early moves
+    # depend on — the documented collapse where continued training on a working
+    # 4-move chain drops it 20/20→0/40, and 5-move incremental warm-start breaks
+    # moves 3-4. Phase conditioning (standard DeepMimic) lets the policy allocate
+    # distinct behavior per move. OPT-IN: default False keeps the (131,) obs
+    # invariant byte-identical, so existing checkpoints are untouched. A phase
+    # model can only warm-start from another phase model (obs dims must match).
+    phase_obs: bool = False
+    # Phase is (move_index - 1) / phase_denom with a FIXED denom (not per-ref
+    # n_stances), so the SAME physical move gets the SAME phase value across refs
+    # of different lengths. This is what makes the incremental ladder work: warm-
+    # starting a 3-move policy → 4-move ref → 5-move ref must not shift the shared
+    # moves' phase (per-ref normalization did: move 3 read 0.67 on the 3-move ref
+    # but 0.5 on the 4-move, undermining the warm-start). Denom 10 supports chains
+    # up to 11 moves in [0,1] (clipped beyond). MoonBoard problems are ~6-12 moves.
+    phase_denom: float = 10.0
 
     # Naturalness shaping (fixes the lean-back/barn-door jank that w_task=1 leaves
     # unpenalized). Both are gentle so they don't recreate the stillness valley:
@@ -224,8 +366,40 @@ class ImitationConfig:
     # off the wall on straight arms; arms are straight BECAUSE the body is far
     # (they must span the gap to the holds). Penalize com distance past a wall-hug
     # target ⇒ body comes over the feet, and the arms then bend on their own.
-    wall_hug_coeff: float = 0.0       # × max(0, com_y − wall_hug_target)
+    wall_hug_coeff: float = 0.0       # × max(0, com_y − wall_hug_target) per step
     wall_hug_target: float = 0.16     # com_y (m) considered "in" (wall plane ≈ 0.065)
+    # Apply wall_hug ONLY when this limb is the current mover (e.g. "RF"). Global
+    # wall_hug helps the committed-stance foot move reach but fights the reach the
+    # hand/LF moves need → degrades composition. Gating it to the RF move gives the
+    # weight-shift where it's needed without disrupting the others. None = always.
+    wall_hug_mover: Optional[str] = None
+    # Terminal-only posture bonus: signed reward at completion = coeff*(target−mean_com_y).
+    # Positive when body stayed close; negative (small) when it hung far.
+    # Never applied on falls/timeouts → no incentive to fail fast.
+    wall_hug_terminal_coeff: float = 0.0
+
+    # AMP style reward: path to a trained discriminator checkpoint (.pt).
+    # Empty string disables. When set, each step adds
+    #   amp_coeff × disc.reward(s_t, s_{t+stride})  ∈ [0, 0.75 × amp_coeff]
+    # The discriminator runs CPU-only in the env (forward pass only, no grad).
+    amp_disc_path: str = ""
+    amp_coeff: float = 0.5  # scale relative to completion_bonus=40; try 0.3–1.0
+    # ONLINE AMP (the real adversarial loop — Peng et al. 2021). When True, the
+    # trainer loads the motion library, updates the discriminator on
+    # real-vs-POLICY pairs after every PPO rollout (AMPOnlineCallback), and
+    # broadcasts fresh weights to the env workers; amp_disc_path is ignored.
+    # The frozen-checkpoint path (amp_disc_path alone) is a PLACEBO: its
+    # checkpoint was trained against Gaussian-noise fakes, so any coherent
+    # motion scores ~1 and the reward is a constant offset with no gradient.
+    amp_online: bool = False
+    amp_library_path: str = "data/amp/motion_library.npz"
+    # Control steps per AMP state pair. The library pairs are consecutive
+    # 10 fps clip frames (Δt = 0.100 s); the env control step is
+    # PHYS_DT 0.002 × 8 substeps = 0.016 s, so stride 6 gives Δt = 0.096 s.
+    # Without matching, the discriminator separates real from fake on frame
+    # spacing alone (policy pairs 6× closer in time ⇒ tiny per-pair motion)
+    # and the style reward collapses to 0 everywhere — no gradient.
+    amp_pair_stride: int = 6
 
 
 class ImitationEnv(gym.Env):
@@ -249,6 +423,16 @@ class ImitationEnv(gym.Env):
         self.env = Climbing3DEnv(wall, profile=profile, config=base, render_mode=render_mode)
         self.observation_space = self.env.observation_space
         self.action_space = self.env.action_space
+        # Phase conditioning: grow the wrapper's obs by one [0,1] scalar. The
+        # INNER env stays (131,) — phase is a wrapper-only concern, so obs.py
+        # and the wall-agnostic invariant are untouched.
+        if self.icfg.phase_obs:
+            _b = self.env.observation_space
+            self.observation_space = gym.spaces.Box(
+                low=np.concatenate([_b.low, np.array([0.0], dtype=_b.dtype)]),
+                high=np.concatenate([_b.high, np.array([1.0], dtype=_b.dtype)]),
+                dtype=_b.dtype,
+            )
         self._total_steps = 0
         self._phase = 0
         # Chain-curriculum state: stage k means "execute moves 0..k-1 from
@@ -268,14 +452,100 @@ class ImitationEnv(gym.Env):
         # Stance-milestone state: settled-frame index per stance, the stance
         # we're reaching toward, and a per-transition step budget.
         self._stance_frames = self._compute_stance_frames()
+        # Stances whose grip-set equals the previous stance's are POSTURE stances
+        # (weight-shift / stand-up): grip-match success is trivial for them, so
+        # _step_stance additionally requires the com to hold near the reference
+        # (see _stance_reached).
+        self._posture_stances = {
+            m for m in range(1, len(self._stance_frames))
+            if self.ref.frame_grips(self._stance_frames[m])
+            == self.ref.frame_grips(self._stance_frames[m - 1])
+        }
+        self._posture_hold = 0
+        # DAgger landing bank(s): stance -> real-landing states. Multi-bank trains
+        # multiple foot moves from real landings at once (avoids the single-focus
+        # specialization whack-a-mole). Empty = authored-stance RSI everywhere.
+        self._landing_banks: dict = {}
+
+        def _load_bank(path):
+            _d = np.load(path, allow_pickle=True)
+            bank_meta, _ = am.parse_npz_meta(_d["meta"] if "meta" in _d else None)
+            am.validate_landing_bank(bank_meta, wall=wall, path=path)
+            return {"qpos": _d["qpos"], "qvel": _d["qvel"],
+                    "grips": _d["grips"], "n": int(len(_d["qpos"]))}
+
+        if self.icfg.rsi_landing_banks:
+            for pair in self.icfg.rsi_landing_banks.split(","):
+                cs, path = pair.split(":")
+                self._landing_banks[int(cs)] = _load_bank(path)
+                print(f"[dagger] bank stance {int(cs)}: "
+                      f"{self._landing_banks[int(cs)]['n']} landings from {path}")
+        elif self.icfg.rsi_landing_bank and self.icfg.milestone_focus_stance is not None:
+            fs = int(self.icfg.milestone_focus_stance)
+            self._landing_banks[fs] = _load_bank(self.icfg.rsi_landing_bank)
+            print(f"[dagger] bank stance {fs}: {self._landing_banks[fs]['n']} "
+                  f"landings from {self.icfg.rsi_landing_bank}")
         self._target_stance: int = 1
         self._milestone_step: int = 0
         self._pelvis_y0: float = 0.0
         self._prev_com_z: float = 0.0
+        # Goal-potential state: previous (possibly velocity-augmented) distance
+        # to the current stance goal (None = no baseline yet), previous com for
+        # the finite-difference velocity, and the latched attractor value inside
+        # the final band (None = outside the band).
+        self._prev_goal_d: Optional[float] = None
+        self._prev_goal_com: Optional[np.ndarray] = None
+        self._goal_att_latch: Optional[float] = None
+        if self.icfg.stance_milestone and self.icfg.goal_k > 0:
+            _legacy = {k: getattr(self.icfg, k) for k in
+                       ("mover_reach_coeff", "mover_reach_abs_coeff",
+                        "mover_capture_coeff", "posture_rise_coeff")
+                       if getattr(self.icfg, k)}
+            if _legacy:
+                print(f"[goal-potential] goal_k={self.icfg.goal_k} supersedes "
+                      f"legacy milestone terms {sorted(_legacy)} — they are "
+                      f"IGNORED. Pass --goal-k 0 to use them instead.")
         # Elbow qpos addresses + max angle, for the arm-bend (anti-lean) reward.
         _m = self.env.world.model
         self._elbow_qadr = [int(_m.jnt_qposadr[_m.joint(n).id]) for n in ("l_elbow", "r_elbow")]
         self._elbow_max = float(_m.jnt_range[_m.joint("l_elbow").id, 1]) or 2.618
+        # AMP discriminator (CPU, forward-only in the env). Two modes:
+        #  - amp_online: a fresh container whose weights the trainer broadcasts
+        #    via set_amp_disc() at training start and after every PPO rollout
+        #    (the real adversarial loop). Until the first broadcast it returns
+        #    the neutral ~0.75 reward — harmless for a few steps.
+        #  - amp_disc_path (legacy): a frozen checkpoint. Kept for replay of
+        #    old runs; known-placebo as a training signal (see ImitationConfig).
+        self._amp_disc = None
+        if self.icfg.amp_online:
+            from sim3d.amp import AMPDiscriminator
+            self._amp_disc = AMPDiscriminator()
+            self._amp_disc.eval()
+        elif self.icfg.amp_disc_path:
+            try:
+                import torch
+                from sim3d.amp import AMPDiscriminator
+                ckpt = torch.load(self.icfg.amp_disc_path, map_location="cpu")
+                disc = AMPDiscriminator(ckpt["input_dim"], ckpt["hidden"])
+                # strict=False: pre-normalisation checkpoints lack in_mean/in_std.
+                disc.load_state_dict(ckpt["state_dict"], strict=False)
+                disc.eval()
+                self._amp_disc = disc
+                print(f"[AMP] discriminator loaded from {self.icfg.amp_disc_path}")
+            except Exception as e:
+                print(f"[AMP] WARNING: could not load discriminator: {e}")
+        # Rolling window of encoded states; a pair spans amp_pair_stride control
+        # steps so its Δt matches the 10 fps clip pairs (see ImitationConfig).
+        from collections import deque
+        self._amp_states: deque = deque(
+            maxlen=max(1, int(self.icfg.amp_pair_stride)) + 1)
+
+    def set_amp_disc(self, state: dict) -> None:
+        """Load broadcast discriminator weights (numpy state dict from
+        AMPDiscriminator.state_numpy()). Called by the trainer through
+        VecEnv.env_method after each discriminator update."""
+        if self._amp_disc is not None:
+            self._amp_disc.load_state_numpy(state)
 
     def _compute_stance_frames(self) -> list[int]:
         """The settled (last-dwell) frame index of each stance, from
@@ -316,6 +586,31 @@ class ImitationEnv(gym.Env):
         obs = obs.copy()
         obs[slot:slot + 3] = self._mover_hold_pos - tip
         return obs
+
+    def _phase_value(self) -> float:
+        """Normalized progress through the reference's move sequence, in [0,1].
+        This is the phase-conditioning signal: which move the policy is on, so a
+        gradient update for a late move doesn't overwrite the shared
+        representation the early moves depend on (the composition-collapse fix).
+        Constant 0 for single-move dense imitation (harmless). Uses a FIXED
+        denominator (icfg.phase_denom) so the same move keeps the same phase
+        across ref lengths — required for clean incremental-ladder warm-starts."""
+        denom = max(1.0, float(self.icfg.phase_denom))
+        if self.icfg.stance_milestone or self.icfg.sequential_chain:
+            return float(np.clip((self._target_stance - 1) / denom, 0.0, 1.0))
+        if self.icfg.chain_stages:
+            return float(np.clip((self._chain_stage - 1) / denom, 0.0, 1.0))
+        return 0.0
+
+    def _append_phase(self, obs: np.ndarray) -> np.ndarray:
+        """Append the move-phase scalar (phase_obs mode only). No-op otherwise,
+        so the default (131,) obs is byte-identical. Called exactly once at each
+        reset/step return so the appended dim is never doubled."""
+        if not self.icfg.phase_obs:
+            return obs
+        return np.concatenate(
+            [obs, np.array([self._phase_value()], dtype=np.float32)]
+        ).astype(np.float32)
 
     def _compute_mover_target(self) -> tuple[Optional[str], Optional[np.ndarray]]:
         """Return (limb, hold_world_pos) for the current stage's mover limb, or (None, None).
@@ -359,6 +654,19 @@ class ImitationEnv(gym.Env):
         return all(self.env.world.on_hold(l) == h
                    for l, h in ref_g.items() if h is not None)
 
+    def _stance_reached(self, target_frame: int) -> bool:
+        """Success test for the current target stance. Grip-match everywhere;
+        posture stances (same grips as predecessor) additionally require the com
+        to sit within posture_com_tol of the reference for posture_hold_steps
+        consecutive steps — otherwise they'd complete trivially at step 1."""
+        if not self._grips_match(target_frame):
+            return False
+        if self._target_stance not in self._posture_stances:
+            return True
+        com_gap = float(np.linalg.norm(self.env.world.com() - self.ref.com[target_frame]))
+        self._posture_hold = self._posture_hold + 1 if com_gap < self.icfg.posture_com_tol else 0
+        return self._posture_hold >= self.icfg.posture_hold_steps
+
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
         if self.icfg.stance_milestone:
@@ -372,23 +680,55 @@ class ImitationEnv(gym.Env):
             # This trains move k+1 from move k's ACTUAL landing (the on-policy
             # distribution) — fixing the composition gap where per-move skills
             # trained from fixed authored stances don't chain.
-            c = 0 if self.icfg.sequential_chain else int(self.np_random.integers(0, max(1, n - 1)))
+            if self._landing_banks and self.icfg.milestone_focus_stance is None:
+                # Multi-bank: oversample the banked (foot) stances so both foot moves
+                # train from real landings; otherwise sample uniformly over all moves.
+                if self.np_random.random() < self.icfg.milestone_focus_frac:
+                    c = int(self.np_random.choice(sorted(self._landing_banks.keys())))
+                else:
+                    c = int(self.np_random.integers(0, max(1, n - 1)))
+            elif (self.icfg.milestone_focus_stance is not None
+                    and self.np_random.random() < self.icfg.milestone_focus_frac):
+                c = int(np.clip(self.icfg.milestone_focus_stance, 0, max(0, n - 2)))
+            elif self.icfg.sequential_chain:
+                c = 0
+            else:
+                c = int(self.np_random.integers(0, max(1, n - 1)))
             self._target_stance = c + 1
             self._milestone_step = 0
+            self._posture_hold = 0
             self._prev_mover_gap = float("inf")
+            self._prev_goal_d = None
+            self._prev_goal_com = None
+            self._goal_att_latch = None
             self._mover_grip_awarded = False
             self._mover_limb, self._mover_hold_pos = self._stance_mover(c + 1)
-            t = self._stance_frames[c]
+            # DAgger: for the focus stance, RSI into a COLLECTED real landing (the
+            # policy's own post-move state distribution) instead of the authored
+            # stance keyframe — closes the distribution-shift gap that leaves the
+            # composed foot move parked short of its grip. Every other stance still
+            # RSIs to the authored frame, so those moves stay trained.
+            if c in self._landing_banks:
+                bank = self._landing_banks[c]
+                bi = int(self.np_random.integers(0, bank["n"]))
+                q0, qv0 = bank["qpos"][bi], bank["qvel"][bi]
+                grips0 = {LIMBS[k]: (s if s else None)
+                          for k, s in enumerate(bank["grips"][bi])}
+            else:
+                t = self._stance_frames[c]
+                q0, qv0, grips0 = self.ref.qpos[t], self.ref.qvel[t], self.ref.frame_grips(t)
             obs, info = self.env.reset_to_reference(
-                self.ref.qpos[t], self.ref.qvel[t], self.ref.frame_grips(t),
-                settle_frames=self.icfg.settle_frames,
+                q0, qv0, grips0, settle_frames=self.icfg.settle_frames,
             )
             obs = self._patch_mover_obs(obs)
             self._pelvis_y0 = float(self.env.world.pelvis_pos()[1])
             self._prev_com_z = float(self.env.world.com()[2])
+            self._ep_com_y_sum = 0.0
+            self._ep_com_y_n = 0
+            self._amp_states.clear()
             info.update(self._info(r_imit=1.0))
             info["target_stance"] = self._target_stance
-            return obs, info
+            return self._append_phase(obs), info
         if self.icfg.chain_stages:
             stage_end = self._chain_bounds[min(self._chain_stage - 1,
                                                len(self._chain_bounds) - 1)]
@@ -452,7 +792,7 @@ class ImitationEnv(gym.Env):
             obs = self._patch_mover_obs(obs)
             info.update(self._info(r_imit=1.0))
             info["chain_stage"] = self._chain_stage
-            return obs, info
+            return self._append_phase(obs), info
         T = len(self.ref)
         hi = max(1, T - self.icfg.min_episode_frames)
         cap = self.rsi_cap()
@@ -482,7 +822,7 @@ class ImitationEnv(gym.Env):
             settle_frames=self.icfg.settle_frames,
         )
         info.update(self._info(r_imit=1.0))
-        return obs, info
+        return self._append_phase(obs), info
 
     def step(self, action):
         if self.icfg.stance_milestone:
@@ -596,8 +936,9 @@ class ImitationEnv(gym.Env):
                 and not self.env.world.on_hold(self._mover_limb)):
             tip = self.env.world.limb_tip_pos(self._mover_limb)
             gap = float(np.linalg.norm(tip - self._mover_hold_pos))
-            if gap < cfg.GRIP_PROXIMITY_M:
-                reward += self.icfg.mover_capture_coeff * (1.0 - gap / cfg.GRIP_PROXIMITY_M)
+            cap_r = self.icfg.mover_capture_radius or cfg.GRIP_PROXIMITY_M
+            if gap < cap_r:
+                reward += self.icfg.mover_capture_coeff * (1.0 - gap / cap_r)
 
         # Per-step grip-retention penalty for non-mover limbs: fires each step
         # a limb the reference keeps gripped has slipped. Directly addresses the
@@ -659,7 +1000,7 @@ class ImitationEnv(gym.Env):
         if self.icfg.chain_stages:
             info["chain_stage"] = self._chain_stage
         info.update(self._info(r_imit=r_imit, comp=comp, rmin=rmin))
-        return obs, float(reward), terminated, False, info
+        return self._append_phase(obs), float(reward), terminated, False, info
 
     def _step_stance(self, action):
         """One step of stance-milestone mode: pose-attractor toward the next
@@ -698,6 +1039,8 @@ class ImitationEnv(gym.Env):
         obs = self._patch_mover_obs(obs)
         self._milestone_step += 1
         self._total_steps += 1
+        self._ep_com_y_sum += float(self.env.world.com()[1])
+        self._ep_com_y_n += 1
 
         # Pose attractor to the NEXT stance. With --free-mover-imitation the mover
         # is freed from pose/endeff while ungripped (its swing is the policy's to
@@ -709,31 +1052,99 @@ class ImitationEnv(gym.Env):
                                and not self.env.world.on_hold(mover)) else None)
         r_imit, comp = imitation_reward(self.env.world, self.ref, target_frame,
                                         self.icfg.coeffs, free_limb=free_limb)
-        reward = (1.0 - self.icfg.w_task) * r_imit
+        is_posture = self._target_stance in self._posture_stances
+        # Posture stances keep the full pose+com attractor regardless of w_task
+        # (mover is None; the stance itself is the target).
+        base_att = r_imit if is_posture else (1.0 - self.icfg.w_task) * r_imit
+        goal_d: Optional[float] = None
 
-        # Optional dense, potential-based mover-reach shaping (net-zero on retreat).
-        if (self.icfg.mover_reach_coeff > 0 and mover is not None
-                and self._mover_hold_pos is not None
-                and not self.env.world.on_hold(mover)):
-            gap = float(np.linalg.norm(
-                self.env.world.limb_tip_pos(mover) - self._mover_hold_pos))
-            if self._prev_mover_gap < float("inf"):
-                reward += self.icfg.mover_reach_coeff * (self._prev_mover_gap - gap)
-            self._prev_mover_gap = gap
-            if (self.icfg.mover_capture_coeff > 0 and gap < cfg.GRIP_PROXIMITY_M):
-                reward += self.icfg.mover_capture_coeff * (1.0 - gap / cfg.GRIP_PROXIMITY_M)
+        if self.icfg.goal_k > 0:
+            # Goal-potential reward (see the ImitationConfig design note): one
+            # explicit goal point per stance, a signed potential active from
+            # spawn to the success tolerance, and the attractor frozen (latched)
+            # inside the final band so its saturated gradient can't compete.
+            if is_posture:
+                goal = np.asarray(self.ref.com[target_frame], dtype=np.float64)
+                tracked = np.asarray(self.env.world.com(), dtype=np.float64)
+            elif mover is not None and self._mover_hold_pos is not None:
+                goal = np.asarray(self._mover_hold_pos, dtype=np.float64)
+                tracked = np.asarray(self.env.world.limb_tip_pos(mover),
+                                     dtype=np.float64)
+            else:
+                goal = tracked = None
+            att = base_att
+            if goal is not None:
+                goal_d = float(np.linalg.norm(tracked - goal))
+                # Posture stances: velocity-augmented metric so the potential
+                # bottoms out only at the goal AT REST (see goal_vel_lambda).
+                # Band gating and the success criterion stay position-based.
+                if is_posture and self.icfg.goal_vel_lambda > 0:
+                    if self._prev_goal_com is not None:
+                        v = float(np.linalg.norm(tracked - self._prev_goal_com)) / 0.016
+                        goal_pot_d = goal_d + self.icfg.goal_vel_lambda * v
+                    else:
+                        goal_pot_d = None   # no velocity baseline yet
+                    self._prev_goal_com = tracked.copy()
+                else:
+                    goal_pot_d = goal_d
+                if goal_d < self.icfg.goal_band:
+                    # FLOOR, not a hard freeze (refined after goalpot_rise1,
+                    # 2026-07-09): attractor saturation is a function of POSE
+                    # error, not goal distance — a stand-up enters the com band
+                    # with r_imit ~0.22, far from saturated, and a hard freeze
+                    # there removes the very signal that teaches the settled,
+                    # HOLDABLE posture (observed: the policy swung the com
+                    # through the tolerance in a contorted pose and drifted
+                    # back out; det min gap regressed 0.065→0.081 over 200k).
+                    # max(entry, live): income never drops below band entry
+                    # (no perverse outward pull; a genuinely saturated
+                    # attractor degenerates to the constant freeze), while
+                    # settling into the reference pose still pays. Pose
+                    # oscillation inside the band nets zero income change.
+                    if self._goal_att_latch is None:
+                        self._goal_att_latch = base_att
+                    att = max(self._goal_att_latch, base_att)
+                else:
+                    self._goal_att_latch = None
+            reward = att
+            if goal_d is not None and goal_pot_d is not None:
+                if self._prev_goal_d is not None:
+                    reward += self.icfg.goal_k * (self._prev_goal_d - goal_pot_d)
+                self._prev_goal_d = goal_pot_d
+        else:
+            # ── Legacy milestone shaping (pre-goal-potential), via --goal-k 0 ──
+            reward = base_att
+            if is_posture and self.icfg.posture_rise_coeff > 0:
+                # Dense com-RISE pull toward the reference stance height.
+                dz = max(0.0, float(self.ref.com[target_frame][2])
+                         - float(self.env.world.com()[2]))
+                reward += self.icfg.posture_rise_coeff * max(
+                    0.0, 1.0 - dz / self.icfg.posture_rise_band)
 
-        # Dense absolute reach pull (goal-reaching): continuous gradient from rest
-        # over the full radius, so the mover starts moving toward its hold even
-        # when stationary (potential mover_reach gives nothing then). The mover is
-        # freed from pose tracking (free_limb above), so THIS is its main signal.
-        if (self.icfg.mover_reach_abs_coeff > 0 and mover is not None
-                and self._mover_hold_pos is not None
-                and not self.env.world.on_hold(mover)):
-            gap = float(np.linalg.norm(
-                self.env.world.limb_tip_pos(mover) - self._mover_hold_pos))
-            reward += self.icfg.mover_reach_abs_coeff * max(
-                0.0, 1.0 - gap / self.icfg.mover_reach_radius)
+            # Optional dense, potential-based mover-reach shaping (net-zero on retreat).
+            if (self.icfg.mover_reach_coeff > 0 and mover is not None
+                    and self._mover_hold_pos is not None
+                    and not self.env.world.on_hold(mover)):
+                gap = float(np.linalg.norm(
+                    self.env.world.limb_tip_pos(mover) - self._mover_hold_pos))
+                if self._prev_mover_gap < float("inf"):
+                    reward += self.icfg.mover_reach_coeff * (self._prev_mover_gap - gap)
+                self._prev_mover_gap = gap
+                cap_r = self.icfg.mover_capture_radius or cfg.GRIP_PROXIMITY_M
+                if (self.icfg.mover_capture_coeff > 0 and gap < cap_r):
+                    reward += self.icfg.mover_capture_coeff * (1.0 - gap / cap_r)
+
+            # Dense absolute reach pull (goal-reaching): continuous gradient from
+            # rest over the full radius, so the mover starts moving toward its
+            # hold even when stationary. The mover is freed from pose tracking
+            # (free_limb above), so THIS is its main signal.
+            if (self.icfg.mover_reach_abs_coeff > 0 and mover is not None
+                    and self._mover_hold_pos is not None
+                    and not self.env.world.on_hold(mover)):
+                gap = float(np.linalg.norm(
+                    self.env.world.limb_tip_pos(mover) - self._mover_hold_pos))
+                reward += self.icfg.mover_reach_abs_coeff * max(
+                    0.0, 1.0 - gap / self.icfg.mover_reach_radius)
 
         # Naturalness shaping. Anti-lean: penalize TORSO TILT from upright — the
         # visible "leaning back" is a ~15-26 deg pelvis PITCH, not hip sag (the hips
@@ -760,18 +1171,36 @@ class ImitationEnv(gym.Env):
             qp = self.env.world.data.qpos
             elbow = 0.5 * (float(qp[self._elbow_qadr[0]]) + float(qp[self._elbow_qadr[1]]))
             reward += self.icfg.arm_bend_coeff * max(0.0, elbow) / self._elbow_max
-        if self.icfg.wall_hug_coeff > 0:
+        if self.icfg.wall_hug_coeff > 0 and (
+                self.icfg.wall_hug_mover is None
+                or self._mover_limb == self.icfg.wall_hug_mover):
             # Pull the body IN to the wall (the real anti-lean fix). Penalize com
             # past the wall-hug target → body over the feet, arms bend naturally.
+            # Gated to wall_hug_mover (e.g. RF) so it doesn't fight the other moves.
             reward -= self.icfg.wall_hug_coeff * max(
                 0.0, float(self.env.world.com()[1]) - self.icfg.wall_hug_target)
+
+        if self._amp_disc is not None:
+            from sim3d.amp import encode_state
+            self._amp_states.append(encode_state(self.env.world.data.qpos,
+                                                 self.env.world.data.qvel))
+            if len(self._amp_states) == self._amp_states.maxlen:
+                # Pair spans amp_pair_stride control steps ⇒ Δt matches the
+                # 10 fps clip pairs the discriminator's real data comes from.
+                s0, s1 = self._amp_states[0], self._amp_states[-1]
+                r_style = self._amp_disc.reward(s0, s1)
+                reward += self.icfg.amp_coeff * r_style
+                # Expose the pair so AMPOnlineCallback can train the
+                # discriminator against the policy's actual motion.
+                info["amp_pair"] = np.concatenate([s0, s1]).astype(np.float32)
+                info["r_style"] = round(float(r_style), 3)
 
         terminated = False
         outcome = ""
         last_stance = len(self._stance_frames) - 1
         if fell:
             terminated, outcome = True, "fell"
-        elif self._grips_match(target_frame):
+        elif self._stance_reached(target_frame):
             reward += self.icfg.completion_bonus
             if self.icfg.sequential_chain and self._target_stance < last_stance:
                 # Sequential chain: grip reached, but more moves remain. ADVANCE
@@ -780,7 +1209,11 @@ class ImitationEnv(gym.Env):
                 # state + re-point the mover obs at the new target.
                 self._target_stance += 1
                 self._milestone_step = 0
+                self._posture_hold = 0
                 self._prev_mover_gap = float("inf")
+                self._prev_goal_d = None
+                self._prev_goal_com = None
+                self._goal_att_latch = None
                 self._mover_grip_awarded = False
                 self._mover_limb, self._mover_hold_pos = self._stance_mover(self._target_stance)
                 obs = self._patch_mover_obs(obs)
@@ -791,11 +1224,18 @@ class ImitationEnv(gym.Env):
         elif self._milestone_step >= self.icfg.milestone_budget:
             terminated, outcome = True, "timeout"
 
+        if outcome == "completed" and self.icfg.wall_hug_terminal_coeff > 0:
+            mean_com_y = self._ep_com_y_sum / max(1, self._ep_com_y_n)
+            reward += self.icfg.wall_hug_terminal_coeff * (
+                self.icfg.wall_hug_target - mean_com_y)
+
         info["outcome"] = outcome
         info["is_success"] = (outcome == "completed")
         info["target_stance"] = self._target_stance
+        if goal_d is not None:
+            info["goal_d"] = round(goal_d, 3)
         info.update(self._info(r_imit=r_imit, comp=comp))
-        return obs, float(reward), terminated, False, info
+        return self._append_phase(obs), float(reward), terminated, False, info
 
     def chain_stage(self) -> int:
         return self._chain_stage
@@ -826,6 +1266,26 @@ class ImitationEnv(gym.Env):
 # late-reference starts dominate the average). A climb counts when it is
 # executed from the bottom.
 
+def _maybe_enable_phase_obs(model, ref, wall, profile,
+                            icfg: ImitationConfig) -> ImitationConfig:
+    """Auto-enable phase_obs for replay/eval when the loaded model expects one
+    extra obs dim (was trained phase-conditioned) but icfg didn't ask for it.
+    Makes --eval / --record foolproof if the user forgets --phase-obs — without
+    this they'd hit a confusing obs shape mismatch at predict time."""
+    if icfg.phase_obs:
+        return icfg
+    try:
+        probe = ImitationEnv(ref, wall, profile, replace(icfg, phase_obs=False))
+        base_dim = int(probe.observation_space.shape[0])
+        probe.close()
+        if int(model.observation_space.shape[0]) == base_dim + 1:
+            print("[phase-obs] model expects a phase dim — enabling phase_obs for replay")
+            return replace(icfg, phase_obs=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[phase-obs] auto-detect skipped: {e}")
+    return icfg
+
+
 def eval_frame0(model, ref: Reference, wall, profile,
                 icfg: Optional[ImitationConfig] = None, *, vec_normalize=None,
                 n_episodes: int = 20, deterministic: bool = True) -> dict:
@@ -837,25 +1297,103 @@ def eval_frame0(model, ref: Reference, wall, profile,
     # frame 0 with end-grip match — stage windows would silently turn the
     # headline metric into "stage-k success" (observed: a 100% line that
     # meant one move, not the climb).
-    eval_icfg = replace(base, rsi_phase_max=0, rsi_anneal_steps=0,
-                        chain_stages=False,
-                        r_min_start=base.r_min_end, r_min_end=base.r_min_end)
+    overrides = dict(rsi_phase_max=0, rsi_anneal_steps=0, chain_stages=False,
+                     r_min_start=base.r_min_end, r_min_end=base.r_min_end)
+    if base.stance_milestone:
+        # Chain eval: sequential from stance 0, authored frames only. Banks /
+        # focus sampling would silently turn this into a per-move average
+        # (the mb_dagger4_rfhug 50%/75% mislabel — see NEXT_STEPS 2026-07-02).
+        overrides.update(sequential_chain=True, rsi_landing_bank=None,
+                         rsi_landing_banks=None, milestone_focus_stance=None)
+    eval_icfg = replace(base, **overrides)
+    mode = "chain" if base.stance_milestone else "frame0"
     env = ImitationEnv(ref, wall, profile, imitation_config=eval_icfg)
-    n_succ, lengths = 0, []
+    n_succ, lengths, com_ys, furthest_l, rises = 0, [], [], [], []
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=10_000 + ep)
-        done, info, n = False, {}, 0
+        done, info, n, furthest = False, {}, 0, 0
+        ep_com_y = []
+        com_z0 = float(env.env.world.com()[2])
         while not done:
             o = vec_normalize.normalize_obs(obs) if vec_normalize is not None else obs
             action, _ = model.predict(o, deterministic=deterministic)
             obs, _r, term, trunc, info = env.step(action)
             done = term or trunc
+            ep_com_y.append(float(env.env.world.com()[1]))
+            furthest = max(furthest, int(info.get("target_stance", 0)))
             n += 1
         n_succ += int(info.get("is_success", False))
         lengths.append(n)
+        furthest_l.append(furthest)
+        rises.append(float(env.env.world.com()[2]) - com_z0)
+        if ep_com_y:
+            com_ys.append(float(np.mean(ep_com_y)))
     env.close()
     return {"success": n_succ / max(1, n_episodes), "n_succ": n_succ,
-            "n_episodes": n_episodes, "mean_len": float(np.mean(lengths))}
+            "n_episodes": n_episodes, "mean_len": float(np.mean(lengths)),
+            "mean_com_y": float(np.mean(com_ys)) if com_ys else float("nan"),
+            "mode": mode, "mean_furthest_stance": float(np.mean(furthest_l)),
+            "mean_net_rise": float(np.mean(rises))}
+
+
+def collect_landings(model_path: str, ref_path: str, *, focus_stance: int,
+                     out_path: str, n_landings: int = 200,
+                     vecnorm: Optional[str] = None, wall_json: Optional[str] = None,
+                     icfg: Optional[ImitationConfig] = None) -> None:
+    """DAgger collection: roll the composed policy from the bottom and snapshot the
+    world state each time it REACHES ``focus_stance`` (target advances to
+    focus_stance+1) — the policy's OWN landing right before the focus move. Stochastic
+    rollouts give landing variety. Saves qpos/qvel/grips to a .npz bank for training
+    with ``--rsi-landing-bank`` (RSI the focus move from real landings, not the
+    authored stance — fixes the composition distribution-shift)."""
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+    ref = Reference.load(ref_path)
+    wall, profile = _load_wall_for_ref(ref, wall_json, ref_path=ref_path)
+    base = icfg or ImitationConfig()
+    ecfg = replace(base, stance_milestone=True, sequential_chain=True,
+                   rsi_landing_bank=None, rsi_landing_banks=None,
+                   milestone_focus_stance=None)
+    model = PPO.load(model_path)
+    ecfg = _maybe_enable_phase_obs(model, ref, wall, profile, ecfg)
+    env = ImitationEnv(ref, wall, profile, ecfg)
+    am.validate_checkpoint(model_path, wall=wall, obs_dim=int(env.observation_space.shape[0]),
+                           action_dim=int(env.action_space.shape[0]))
+    vn = None
+    if vecnorm and Path(vecnorm).exists():
+        vn = VecNormalize.load(vecnorm,
+                               DummyVecEnv([lambda: ImitationEnv(ref, wall, profile, ecfg)]))
+        vn.training = False
+    W = env.env.world
+    target = focus_stance + 1
+    qpos_l, qvel_l, grip_l = [], [], []
+    ep = 0
+    while len(qpos_l) < n_landings and ep < n_landings * 5:
+        ep += 1
+        obs, _ = env.reset(seed=20000 + ep)
+        done = False
+        while not done:
+            o = vn.normalize_obs(obs) if vn is not None else obs
+            a, _ = model.predict(o, deterministic=False)  # stochastic → varied landings
+            obs, _r, term, trunc, info = env.step(a)
+            if int(info.get("target_stance", env._target_stance)) == target:
+                qpos_l.append(np.array(W.data.qpos).copy())
+                qvel_l.append(np.array(W.data.qvel).copy())
+                grip_l.append([W.on_hold(l) or "" for l in LIMBS])
+                break  # one fresh landing per episode, then re-roll for variety
+            done = term or trunc
+    env.close()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    bank_meta = am.build_meta(
+        artifact_type="landing_bank", wall=wall, env_mode="imitate:milestone",
+        parent=str(model_path), parent_eval=am.parent_eval_of(model_path),
+        extra={"focus_stance": focus_stance, "ref": ref_path},
+    )
+    np.savez(out_path, qpos=np.array(qpos_l), qvel=np.array(qvel_l),
+             grips=np.array(grip_l), focus_stance=focus_stance,
+             meta=am.npz_meta_value(bank_meta))
+    print(f"[dagger] collected {len(qpos_l)} landings at stance {focus_stance} "
+          f"(target {target}) over {ep} episodes → {out_path}")
 
 
 # ─── Training ────────────────────────────────────────────────────────────────
@@ -901,9 +1439,13 @@ def _load_wall_for_ref(ref: Reference, wall_json: Optional[str] = None,
         if Path(cand).exists():
             with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()):
                 warnings.simplefilter("ignore")
-                return load_wall(cand), ClimberProfile()
+                wall = load_wall(cand)
+            am.validate_reference(ref, wall, path=ref_path or cand)
+            return wall, ClimberProfile()
 
-    return _build_wall(ref.wall_gen_seed)
+    wall, profile = _build_wall(ref.wall_gen_seed)
+    am.validate_reference(ref, wall, path=ref_path or "<rebuilt from wall_gen_seed>")
+    return wall, profile
 
 
 def make_env(ref_path: str, icfg: ImitationConfig, rank: int = 0,
@@ -934,7 +1476,15 @@ def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None,
             ep_r, ep_l, done = 0.0, 0, False
             while not done:
                 o, r, term, trunc, info = env.step(policy())
-                assert 0.0 <= r <= 1.0 + env.icfg.completion_bonus + 1e-6, \
+                # The signed goal potential is negative on retreat and its
+                # per-step magnitude is bounded by physical tip/com speed —
+                # a released limb whipping/catapulting under random actions
+                # reaches >1 m per control step (constraint-snap pathology),
+                # so this is a loose 2 m/step scale-bug check, not a physics
+                # bound.
+                _pot = env.icfg.goal_k * 2.0
+                assert np.isfinite(r), f"non-finite reward: {r}"
+                assert -_pot - 1e-6 <= r <= 1.0 + env.icfg.completion_bonus + _pot + 1e-6, \
                     f"reward out of range: {r}"
                 ep_r += r
                 ep_l += 1
@@ -958,6 +1508,19 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
     out = Path("data/runs/sim3d") / run_id
     out.mkdir(parents=True, exist_ok=True)
 
+    # Reproducibility: persist the FULL run config. Imitation runs previously saved
+    # only model.zip + a train.log that omits the flag set, so recipes were lost to
+    # shell history (the exact chain4_incr command was unrecoverable). config.json
+    # is the one run artifact kept in git per CLAUDE.md.
+    import json
+    import sys as _sys
+    from dataclasses import asdict
+    (out / "config.json").write_text(json.dumps({
+        "ref": ref_path, "steps": steps, "n_envs": n_envs, "run_id": run_id,
+        "wall_json": wall_json, "load_run": load_run, "ent_coef": ent_coef,
+        "icfg": asdict(icfg), "argv": _sys.argv,
+    }, indent=2, default=str))
+
     vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
     vec = vec_cls([make_env(ref_path, icfg, i, wall_json) for i in range(n_envs)])
     # Warm-start: reuse the prior run's VecNormalize stats + policy weights so we
@@ -973,6 +1536,70 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
     # phase-averaged number is diagnostic only; see eval_frame0's docstring).
     eval_ref = Reference.load(ref_path)
     eval_wall, eval_profile = _load_wall_for_ref(eval_ref, wall_json, ref_path=ref_path)
+
+    # Online AMP: the real adversarial loop. The trainer owns the master
+    # discriminator + optimizer; envs hold forward-only replicas refreshed by
+    # broadcast. Rewards for rollout k are scored by the disc trained through
+    # rollout k-1 — the standard AMP schedule (Peng et al. 2021).
+    amp_cb = None
+    if icfg.amp_online:
+        import torch
+        from sim3d.amp import (AMPDiscriminator, MotionLibrary,
+                               train_discriminator)
+        amp_lib = MotionLibrary.load(icfg.amp_library_path)
+        amp_disc = AMPDiscriminator()
+        amp_disc.set_input_stats(amp_lib.pairs)
+        # 3e-4: at 1e-4 the GP-regularised disc separates too slowly for a
+        # ~1000-update budget (4 steps × ~250 rollouts on a 2M-step run).
+        amp_opt = torch.optim.Adam(amp_disc.parameters(), lr=3e-4)
+        print(f"[AMP] online: {len(amp_lib)} real pairs from "
+              f"{icfg.amp_library_path}; pair stride {icfg.amp_pair_stride} "
+              f"(Δt ≈ {icfg.amp_pair_stride * 0.016:.3f}s vs clip 0.100s)")
+
+        class AMPOnlineCallback(BaseCallback):
+            """Collect the policy's (s_t, s_t+stride) pairs from env infos
+            during each rollout; after the rollout, update the discriminator
+            real-vs-policy (LSGAN + gradient penalty) and broadcast fresh
+            weights to every env worker via env_method."""
+            def __init__(self):
+                super().__init__()
+                self._fake: list[np.ndarray] = []
+
+            def _broadcast(self) -> None:
+                self.training_env.env_method("set_amp_disc",
+                                             amp_disc.state_numpy())
+
+            def _on_training_start(self) -> None:
+                self._broadcast()   # replace the envs' random-init replicas
+
+            def _on_step(self) -> bool:
+                for info in self.locals["infos"]:
+                    p = info.get("amp_pair")
+                    if p is not None:
+                        self._fake.append(p)
+                return True
+
+            def _on_rollout_end(self) -> None:
+                if len(self._fake) < 256:
+                    return          # not enough policy pairs yet; keep collecting
+                fake = np.stack(self._fake)
+                self._fake.clear()
+                stats = train_discriminator(amp_disc, amp_lib, fake,
+                                            optimizer=amp_opt,
+                                            n_steps=4, batch_size=256)
+                self._broadcast()
+                r_pol = float(np.mean(amp_disc.reward_batch(fake[:1024])))
+                # Healthy adversarial training: d_real → ~0.7-0.9, d_fake →
+                # ~0.1-0.3, r_style(policy) strictly between 0 and 0.75 and
+                # NOT pinned at either end (pinned ⇒ no gradient either way).
+                print(f"  [AMP] d_real {stats['d_real']:.2f}  "
+                      f"d_fake {stats['d_fake']:.2f}  "
+                      f"r_style(policy) {r_pol:.2f}  ({len(fake)} pairs)")
+                torch.save({"state_dict": amp_disc.state_dict(),
+                            "input_dim": int(amp_disc.in_mean.numel()),
+                            "hidden": 256}, out / "amp_disc.pt")
+
+        amp_cb = AMPOnlineCallback()
 
     class ProgressCallback(BaseCallback):
         """Log phase-averaged success + tracking quality per rollout, and the
@@ -1019,12 +1646,21 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
                 res = eval_frame0(self.model, eval_ref, eval_wall, eval_profile,
                                   icfg, vec_normalize=self.model.get_vec_normalize_env(),
                                   n_episodes=self.eval_episodes)
-                print(f"  [{self.num_timesteps:>7}] ★ FRAME-0 success "
+                label = "CHAIN(bottom→top)" if res.get("mode") == "chain" else "FRAME-0"
+                print(f"  [{self.num_timesteps:>7}] ★ {label} success "
                       f"{res['success']*100:5.1f}%  ({res['n_succ']}/{res['n_episodes']} "
-                      f"eps, mean len {res['mean_len']:.0f})")
+                      f"eps, mean len {res['mean_len']:.0f}, "
+                      f"mean furthest stance {res['mean_furthest_stance']:.1f}, "
+                      f"net rise {res['mean_net_rise']:+.3f} m)")
+
+    obs_dim = int(vec.observation_space.shape[0])
+    action_dim = int(vec.action_space.shape[0])
+    env_mode = f"imitate:{'milestone' if icfg.stance_milestone else 'dense'}"
 
     model_path = Path(load_run) / "model.zip" if load_run else None
     if model_path is not None and model_path.exists():
+        am.validate_checkpoint(model_path, wall=eval_wall, obs_dim=obs_dim,
+                               action_dim=action_dim, env_mode=env_mode)
         model = sb3.PPO.load(str(model_path), env=vec)
         model.ent_coef = ent_coef   # allow tightening exploration on warm-start
         print(f"Warm-started from {model_path}  (ent_coef={ent_coef})")
@@ -1043,7 +1679,10 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
         save_vecnormalize=True,
         verbose=0,
     )
-    callbacks = CallbackList([ProgressCallback(), ckpt_cb])
+    cb_list = [ProgressCallback(), ckpt_cb]
+    if amp_cb is not None:
+        cb_list.append(amp_cb)
+    callbacks = CallbackList(cb_list)
 
     print(f"Training imitation: {steps} steps, {n_envs} envs → {out}")
     model.learn(total_timesteps=steps, callback=callbacks, progress_bar=False)
@@ -1052,8 +1691,20 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
     print(f"Saved {out/'model.zip'}")
     res = eval_frame0(model, eval_ref, eval_wall, eval_profile, icfg,
                       vec_normalize=model.get_vec_normalize_env(), n_episodes=40)
-    print(f"★ FINAL FRAME-0 success: {res['success']*100:.1f}%  "
-          f"({res['n_succ']}/{res['n_episodes']} eps)")
+    label = "CHAIN(bottom→top)" if res.get("mode") == "chain" else "FRAME-0"
+    print(f"★ FINAL {label} success: {res['success']*100:.1f}%  "
+          f"({res['n_succ']}/{res['n_episodes']} eps, "
+          f"mean furthest stance {res['mean_furthest_stance']:.1f}, "
+          f"net rise {res['mean_net_rise']:+.3f} m)")
+
+    ckpt_meta = am.build_meta(
+        artifact_type="checkpoint", wall=eval_wall, obs_dim=obs_dim, action_dim=action_dim,
+        env_mode=env_mode, parent=str(model_path) if model_path else None,
+        parent_eval=am.parent_eval_of(model_path),
+        extra={"run_id": run_id, "ref": ref_path,
+               "eval": {"frame0_success": res["success"], "n_episodes": res["n_episodes"]}},
+    )
+    am.write_checkpoint_meta(out / "model.zip", ckpt_meta)
 
 
 def record_video(model_path: str, ref_path: str, out_path: str, *,
@@ -1061,14 +1712,22 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
                  fps: int = 10, size: int = 480, wall_json: Optional[str] = None,
                  rsi_phase_max: Optional[int] = 0, r_min: float = 0.5,
                  cam_azimuth: float = 270.0, cam_elevation: float = -10.0,
-                 cam_distance: float = 3.6) -> None:
+                 cam_distance: float = 3.6,
+                 base_icfg: Optional[ImitationConfig] = None) -> None:
     """Roll out the trained policy in its ImitationEnv and render to mp4.
 
     Critically applies the saved VecNormalize obs stats — without them the
     policy gets unnormalised observations and flails (which is why the standard
     browser viewer can't replay an imitation model). Starts every episode at
     phase 0 (RSI cap 0) so the clip shows the full release→reach→regrip, with a
-    body-tracking camera."""
+    body-tracking camera.
+
+    ``base_icfg`` — the training/eval config. For a stance-milestone/sequential
+    policy this MUST be passed (with stance_milestone=True etc.) or the rollout
+    runs in the wrong mode and each episode terminates in one frame (the "4
+    frames" bug). When given a milestone config, we render the FULL chain from
+    the bottom stance with the same eval-style overrides as ``eval_frame0``
+    (sequential_chain on, banks/focus off) so the clip is the real climb."""
     import mujoco
     import imageio
     from stable_baselines3 import PPO
@@ -1080,9 +1739,21 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
     # threshold than the policy was trained/verified at cuts episodes it
     # would have finished, which looks like total failure (e.g. an R_min-0.3
     # policy rendered at 0.5 lost all 4 episodes mid-climb).
-    icfg = ImitationConfig(rsi_phase_max=rsi_phase_max, r_min_start=r_min, r_min_end=r_min)
-    env = ImitationEnv(ref, wall, profile, imitation_config=icfg)
+    if base_icfg is not None and base_icfg.stance_milestone:
+        # Full-chain render: mirror eval_frame0's overrides so the clip shows the
+        # real bottom→top climb, not a per-move fragment.
+        icfg = replace(base_icfg, rsi_phase_max=0, rsi_anneal_steps=0,
+                       chain_stages=False, r_min_start=r_min, r_min_end=r_min,
+                       sequential_chain=True, rsi_landing_bank=None,
+                       rsi_landing_banks=None, milestone_focus_stance=None)
+    else:
+        icfg = ImitationConfig(rsi_phase_max=rsi_phase_max,
+                               r_min_start=r_min, r_min_end=r_min)
     model = PPO.load(model_path)
+    icfg = _maybe_enable_phase_obs(model, ref, wall, profile, icfg)
+    env = ImitationEnv(ref, wall, profile, imitation_config=icfg)
+    am.validate_checkpoint(model_path, wall=wall, obs_dim=int(env.observation_space.shape[0]),
+                           action_dim=int(env.action_space.shape[0]))
     vn = None
     if vecnorm and Path(vecnorm).exists():
         vn = VecNormalize.load(vecnorm, DummyVecEnv([lambda: ImitationEnv(ref, wall, profile, icfg)]))
@@ -1107,9 +1778,12 @@ def record_video(model_path: str, ref_path: str, out_path: str, *,
     cam.azimuth, cam.elevation, cam.distance = cam_azimuth, cam_elevation, cam_distance
 
     frames, n_done, n_succ = [], 0, 0
+    # Chain episodes run up to inner_max_steps (not len(ref)); cap generously.
+    step_cap = max(len(ref) + 2, icfg.inner_max_steps + 2) if icfg.stance_milestone \
+        else len(ref) + 2
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=ep)
-        for _ in range(len(ref) + 2):
+        for _ in range(step_cap):
             o = vn.normalize_obs(obs) if vn is not None else obs
             action, _ = model.predict(o, deterministic=True)
             obs, _r, term, trunc, info = env.step(action)
@@ -1238,6 +1912,11 @@ def main() -> None:
                          "small vs --completion-bonus. Try 0.1.")
     ap.add_argument("--mover-reach-radius", type=float, default=0.25,
                     help="radius (m) for --mover-reach-abs-coeff")
+    ap.add_argument("--mover-capture-radius", type=float, default=0.0,
+                    help="radius (m) of the capture sphere (--mover-capture-coeff). "
+                         "0 → GRIP_PROXIMITY_M (0.08). Widen (e.g. 0.15) when a "
+                         "trained mover plateaus just outside 0.08 (RF parks at "
+                         "~0.126 m, outside the default sphere → no capture pull).")
     ap.add_argument("--w-task", type=float, default=0.0,
                     help="weight on task vs imitation reward (0=pure pose imitation). "
                          "In stance-milestone, w_task=1 drops the pose attractor "
@@ -1250,6 +1929,31 @@ def main() -> None:
                          "`sim3d.discover --stances`.")
     ap.add_argument("--milestone-budget", type=int, default=40,
                     help="max env steps per stance transition (stance-milestone mode)")
+    ap.add_argument("--milestone-focus-stance", type=int, default=None,
+                    help="focus milestone RSI on ONE transition (stance c→c+1); 100%% "
+                         "of gradient on a single move to crack a lone weak one (e.g. "
+                         "the final RF foot move). Warm-start a foundation that knows "
+                         "the others; phase preserved. None = uniform.")
+    ap.add_argument("--milestone-focus-frac", type=float, default=1.0,
+                    help="prob of sampling the focus stance (rest uniform over all). "
+                         "1.0=exclusive (holds phase constant → wipes other moves); use "
+                         "~0.6 to OVERSAMPLE the hard move while keeping the others in "
+                         "the mix so phase stays informative and learned moves survive.")
+    ap.add_argument("--collect-landings", action="store_true",
+                    help="DAgger collect: roll the --model policy from the bottom and "
+                         "snapshot its real states at --milestone-focus-stance into "
+                         "--landing-bank (.npz). Then train with --rsi via --landing-bank.")
+    ap.add_argument("--landing-bank", type=str, default=None,
+                    help="DAgger landing bank .npz. OUTPUT of --collect-landings; INPUT to "
+                         "--train (RSI the focus move from these real landings instead of "
+                         "the authored stance — fixes the composition distribution-shift).")
+    ap.add_argument("--n-landings", type=int, default=200,
+                    help="how many real landings to collect (--collect-landings)")
+    ap.add_argument("--landing-banks", type=str, default=None,
+                    help="multi-bank DAgger: 'c1:path1,c2:path2' — a bank per stance so "
+                         "BOTH foot moves train from real landings at once (avoids the "
+                         "single-focus whack-a-mole). Banked stances oversampled by "
+                         "--milestone-focus-frac; hand moves use authored frames.")
     ap.add_argument("--inner-max-steps", type=int, default=200,
                     help="inner-env episode cap. Raise for --sequential-chain with "
                          "many moves (needs > n_moves x milestone-budget).")
@@ -1276,11 +1980,71 @@ def main() -> None:
                          "bend on their own once the body is in). Try ~2-5. 0 off.")
     ap.add_argument("--wall-hug-target", type=float, default=0.16,
                     help="com_y (m) considered 'in' (wall plane ≈0.065)")
+    ap.add_argument("--wall-hug-mover", type=str, default=None,
+                    help="apply wall-hug ONLY when this limb is the mover (e.g. RF) — the "
+                         "weight-shift for the committed-stance foot move, without disrupting "
+                         "the hand/LF reaches. None = always.")
+    ap.add_argument("--wall-hug-terminal-coeff", type=float, default=0.0,
+                    help="signed terminal posture reward at COMPLETION only: "
+                         "coeff*(target−mean_com_y). Positive when body stayed close; "
+                         "small negative when it hung far. Never fires on falls/timeouts "
+                         "→ no incentive to fail fast. Try ~5-15.")
+    ap.add_argument("--amp-disc", type=str, default="",
+                    help="path to a FROZEN AMP discriminator .pt (legacy replay "
+                         "only — a frozen disc trained offline vs noise is a "
+                         "constant reward offset, not a style signal; use "
+                         "--amp-online for real adversarial training).")
+    ap.add_argument("--amp-coeff", type=float, default=0.5,
+                    help="scale for the AMP style reward (default 0.5). "
+                         "Start small — style reward is in [0, 0.75], so 0.5 adds "
+                         "up to 0.375/step, similar to one r_imit unit.")
+    ap.add_argument("--amp-online", action="store_true",
+                    help="ONLINE AMP: update the discriminator on real-vs-POLICY "
+                         "pairs after every PPO rollout and broadcast weights to "
+                         "the env workers. Needs --amp-library. Ignores --amp-disc.")
+    ap.add_argument("--amp-library", type=str,
+                    default="data/amp/motion_library.npz",
+                    help="motion library .npz of real (s,s') pairs "
+                         "(build with: python -m sim3d.amp build-library ...)")
+    ap.add_argument("--amp-stride", type=int, default=6,
+                    help="control steps per AMP pair. 6 × 0.016s ≈ the 10 fps "
+                         "clip Δt (0.1s); mismatched Δt lets the discriminator "
+                         "win on frame spacing alone and kills the gradient.")
     ap.add_argument("--sequential-chain", action="store_true",
                     help="true multi-move climb: start at the bottom stance and "
                          "advance the target on each grip WITHOUT reset, so each move "
                          "trains from the previous move's real landing. Success = "
                          "reaching the final stance. Use with --stance-milestone.")
+    ap.add_argument("--posture-com-tol", type=float, default=0.06,
+                    help="posture (same-grip) stance success: com distance (m) from "
+                         "the reference stance com counted as 'holding' it.")
+    ap.add_argument("--posture-hold-steps", type=int, default=4,
+                    help="posture stance success: consecutive in-tol steps required.")
+    ap.add_argument("--posture-rise-coeff", type=float, default=0.0,
+                    help="dense com-RISE pull on stand-up posture stances: "
+                         "coeff·max(0,1−dz/band) per step (dz=target_com_z−com_z). "
+                         "Directed gradient to raise the body — the net-height fix "
+                         "(the pose+com attractor alone stalls the stand-up partway). "
+                         "Try ~0.5 (scale of r_imit). 0 off.")
+    ap.add_argument("--posture-rise-band", type=float, default=0.15,
+                    help="height gap (m) over which --posture-rise-coeff ramps. (legacy)")
+    ap.add_argument("--goal-k", type=float, default=100.0,
+                    help="goal-potential coefficient (milestone mode): k·Δdist to the "
+                         "stance GOAL POINT every step (hold center for grip moves, "
+                         "reference com for posture/stand-up stances), active from spawn "
+                         "to the success tolerance with no dead zone; the pose attractor "
+                         "is frozen inside --goal-band. DEFAULT milestone reward; "
+                         "supersedes --mover-reach*/--mover-capture*/--posture-rise*. "
+                         "Set 0 to use those legacy terms instead.")
+    ap.add_argument("--goal-band", type=float, default=0.15,
+                    help="final band (m) around the goal inside which the pose-attractor "
+                         "income is latched constant, so its saturated gradient can't "
+                         "fight the goal potential (default 0.15).")
+    ap.add_argument("--goal-vel-lambda", type=float, default=0.15,
+                    help="velocity weight (s) in the POSTURE-stance goal metric "
+                         "d_aug = |com-g| + λ|v_com|: makes the potential bottom out "
+                         "only at the goal AT REST, so decelerating into the goal pays "
+                         "(a fast swing-through reads as 'not there'). 0 = position only.")
     ap.add_argument("--free-mover-imitation", action="store_true",
                     help="Exclude the current stage's mover limb from pose/endeff "
                          "tracking while it is ungripped (mid-reach). Lets PPO find "
@@ -1292,6 +2056,12 @@ def main() -> None:
                          "policy's action noise so stochastic rollout success catches "
                          "up to deterministic — needed when high exploration keeps the "
                          "chain advance gate from being met despite a good policy.")
+    ap.add_argument("--phase-obs", action="store_true",
+                    help="append a normalized move-phase scalar to the obs (131→132) "
+                         "so the policy can tell which move it's on. Fixes multi-move "
+                         "composition collapse (a late-move update no longer overwrites "
+                         "early moves). Phase models only warm-start (--load) from other "
+                         "phase models. --eval/--record auto-detect it from the model.")
     args = ap.parse_args()
 
     coeffs = ImitationCoeffs()
@@ -1326,12 +2096,24 @@ def main() -> None:
                            free_mover_imitation=args.free_mover_imitation,
                            mover_grip_bonus=args.mover_grip_bonus,
                            mover_capture_coeff=args.mover_capture_coeff,
+                           mover_capture_radius=args.mover_capture_radius,
                            mover_reach_abs_coeff=args.mover_reach_abs_coeff,
                            mover_reach_radius=args.mover_reach_radius,
                            w_task=args.w_task,
                            stance_milestone=args.stance_milestone,
                            sequential_chain=args.sequential_chain,
                            milestone_budget=args.milestone_budget,
+                           milestone_focus_stance=args.milestone_focus_stance,
+                           milestone_focus_frac=args.milestone_focus_frac,
+                           rsi_landing_bank=(args.landing_bank if not args.collect_landings else None),
+                           rsi_landing_banks=args.landing_banks,
+                           posture_com_tol=args.posture_com_tol,
+                           posture_hold_steps=args.posture_hold_steps,
+                           posture_rise_coeff=args.posture_rise_coeff,
+                           posture_rise_band=args.posture_rise_band,
+                           goal_k=args.goal_k,
+                           goal_band=args.goal_band,
+                           goal_vel_lambda=args.goal_vel_lambda,
                            inner_max_steps=args.inner_max_steps,
                            lean_penalty_coeff=args.lean_penalty_coeff,
                            com_rise_coeff=args.com_rise_coeff,
@@ -1339,7 +2121,15 @@ def main() -> None:
                            action_rate_limit=args.action_rate_limit,
                            arm_bend_coeff=args.arm_bend_coeff,
                            wall_hug_coeff=args.wall_hug_coeff,
-                           wall_hug_target=args.wall_hug_target)
+                           wall_hug_target=args.wall_hug_target,
+                           wall_hug_mover=args.wall_hug_mover,
+                           wall_hug_terminal_coeff=args.wall_hug_terminal_coeff,
+                           amp_disc_path=args.amp_disc,
+                           amp_coeff=args.amp_coeff,
+                           amp_online=args.amp_online,
+                           amp_library_path=args.amp_library,
+                           amp_pair_stride=args.amp_stride,
+                           phase_obs=args.phase_obs)
 
     if args.author:
         from sim3d.probe_transitions import build_wall_and_moves
@@ -1347,7 +2137,7 @@ def main() -> None:
         move = feas[args.move_index]
         ref, diag = author_weight_shift_move(wall, profile, move, balance_kp=250.0,
                                              wall_gen_seed=args.seed)
-        ref.save(args.ref)
+        ref.save(args.ref, wall=wall, env_mode="author")
         print(f"Authored move {move['move_k']} → {args.ref}  {diag}")
 
     # Auto-detect the sibling wall JSON a CMA-ES reference saves next to itself.
@@ -1357,12 +2147,24 @@ def main() -> None:
         if sib.exists():
             wall_json = str(sib)
 
+    if args.collect_landings:
+        if args.milestone_focus_stance is None or not args.landing_bank:
+            ap.error("--collect-landings needs --milestone-focus-stance and --landing-bank")
+        collect_landings(args.model, args.ref, focus_stance=args.milestone_focus_stance,
+                         out_path=args.landing_bank, n_landings=args.n_landings,
+                         vecnorm=args.vecnorm, wall_json=wall_json, icfg=icfg)
     if args.eval:
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
         ref = Reference.load(args.ref)
         wall, profile = _load_wall_for_ref(ref, wall_json, ref_path=args.ref)
         model = PPO.load(args.model)
+        icfg = _maybe_enable_phase_obs(model, ref, wall, profile, icfg)
+        _dims_env = ImitationEnv(ref, wall, profile, icfg)
+        am.validate_checkpoint(args.model, wall=wall,
+                               obs_dim=int(_dims_env.observation_space.shape[0]),
+                               action_dim=int(_dims_env.action_space.shape[0]))
+        _dims_env.close()
         vn = None
         if args.vecnorm and Path(args.vecnorm).exists():
             vn = VecNormalize.load(
@@ -1371,13 +2173,17 @@ def main() -> None:
             vn.training = False
         res = eval_frame0(model, ref, wall, profile, icfg, vec_normalize=vn,
                           n_episodes=args.eval_episodes)
-        print(f"★ FRAME-0 success: {res['success']*100:.1f}%  "
-              f"({res['n_succ']}/{res['n_episodes']} eps, mean len {res['mean_len']:.0f})")
+        label = "CHAIN(bottom→top)" if res.get("mode") == "chain" else "FRAME-0"
+        print(f"★ {label} success: {res['success']*100:.1f}%  "
+              f"({res['n_succ']}/{res['n_episodes']} eps, mean len {res['mean_len']:.0f}, "
+              f"mean furthest stance {res['mean_furthest_stance']:.1f}, "
+              f"com_y {res['mean_com_y']:.3f} m, "
+              f"net com rise {res['mean_net_rise']:+.3f} m)")
     if args.record:
         record_video(args.model, args.ref, args.record, vecnorm=args.vecnorm,
                      wall_json=wall_json, r_min=args.r_min_end,
                      cam_azimuth=args.cam_azimuth, cam_elevation=args.cam_elevation,
-                     cam_distance=args.cam_distance)
+                     cam_distance=args.cam_distance, base_icfg=icfg)
     if args.smoke:
         smoke(args.ref, icfg, wall_json)
     if args.train:
