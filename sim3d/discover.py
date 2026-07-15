@@ -467,7 +467,10 @@ def discover_stand(
         cost, frames, info = rollout(np.asarray(xbest), record=True)
         if best is None or cost < best[0]:
             best = (cost, frames, info)
-        if info["com_gain"] > 0.10 and info["n_anchor"] == n_anchor0:
+        # Stop reseeding once a real rise is achieved; below that, keep trying
+        # (the caller commits the best partial rise regardless — a small stand-up
+        # is strictly better than none). 0.05 is the retry TRIGGER, not a discard.
+        if info["com_gain"] >= 0.05 and info["n_anchor"] == n_anchor0:
             break
     _, frames, info = best
     return frames, info
@@ -1158,6 +1161,853 @@ def discover_climb_adaptive(
     return ref, diag
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Batch authoring pipeline (Path A) — unattended multi-wall reference authoring.
+#
+# The one-off tools above (discover_climb_adaptive, the scratch re-author scripts)
+# author ONE reference per babysat run. The batch pipeline runs the same proven
+# recipe — whole-body foot search, stance-center foot landings, sequential RSI
+# chaining, the anti-wiggle guards (held-hold exclusion, per-move gain floor,
+# net-rise report) — but adds the machinery an unattended run needs: per-move
+# FEASIBILITY GATES with bounded CMA reseeding, a zero-action holdability probe
+# on every authored stance (standard practice per the dead-zone note), a per-wall
+# timeout, skip-and-continue on failure, and a summary manifest.
+#
+# Posture/stand-up STANCES are out of scope as authored imitation targets (they
+# park at an honest ceiling — see the standup memory notes). The stand-up *move*
+# (discover_stand: raise the com over the feet before a hand reach) is kept — it
+# is a transition the policy tracks, not a static keyframe target — but it is not
+# gated as a "move" (no grip to gate on); it either raises the com or is dropped.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Gate defaults. Hands and feet differ because a foot step on a dense foothold
+# ladder is legitimately SHORTER than a hand reach: the 0.08 m "gain floor" in
+# the recipe is the HAND anti-wiggle threshold (a hand that gains <8 cm is a
+# timid micro-move / re-grip); feet step 4-7 cm and that is real progress, not
+# wiggle (the footstep-fine5 design). Net wiggle is caught at the chain level by
+# the net-pelvis-rise report, not per foot move.
+GATE_HAND_GAP_M = 0.05
+GATE_FOOT_GAP_M = 0.06
+GATE_HAND_GAIN_M = 0.07   # anti-wiggle floor, NOT physics; lowered 0.08→0.07
+                          # 2026-07-12. It is an upward-progress heuristic, and the
+                          # wiggle it guards is now independently blocked by three
+                          # other gates (held-hold exclusion in _reachable_holds, the
+                          # net-rise chain gate, and the four-limb chain gate). An
+                          # otherwise-clean s4288 hand reach stalled the whole chain
+                          # on a 2 mm miss against 0.08 (gain 0.078); 0.07 keeps the
+                          # anti-wiggle intent with margin off that boundary.
+GATE_FOOT_GAIN_M = 0.04
+
+# Hand-foot separation (m) above which the move-ordering walk flips to FEET-FIRST
+# so a trailing foot is brought up before the feet are stranded (see
+# `_next_move_limb_order`). Below it, hands lead as in normal ladder climbing.
+# Calibrated 2026-07-12 against the hand-foot lag profile — min(hand tip_z) −
+# min(foot tip_z) at each committed move — of the three references known to
+# alternate all four limbs: footstep-fine5 brought feet up at lag 0.62-0.68
+# (hands led up to 0.65), s4288 at 0.69-0.77 (hands up to 0.74/0.78). 0.68 sits
+# just above footstep-fine5's sustained hand-climb and inside s4288's foot-trigger
+# band, so the flip fires right where the good walls alternated. This only sets
+# PREFERENCE order — `_find_next_gated_move` still falls through to the other
+# limb class if the preferred one has no gate-passing move, so the exact value
+# degrades gracefully (it changes which limb is tried first, never feasibility).
+FOOT_FIRST_LAG_M = 0.68
+HOLDABILITY_STEPS = 12
+
+
+def _stance_holdable(w_probe: Climb3DWorld, qpos: np.ndarray, grips: dict, *,
+                     k_steps: int = HOLDABILITY_STEPS,
+                     require_grips: int | None = None) -> tuple[bool, int]:
+    """Zero-action holdability probe (dead-zone note, standard practice): RSI the
+    stance, take zero action for ``k_steps``, and confirm it neither falls nor
+    sheds a grip. Returns ``(ok, n_grips_at_end)``. ``w_probe`` is a scratch
+    world that MUST be separate from the discovery world (RSI mutates it)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        w_probe.rsi(qpos, np.zeros(w_probe.model.nv), grips)
+    n0 = sum(1 for l in LIMBS if w_probe.on_hold(l) is not None)
+    for _ in range(k_steps):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            w_probe.step(ENV_SUBSTEPS, check_slip=True)
+        if float(w_probe.pelvis_pos()[2]) < FALL_Z:
+            return False, 0
+    n1 = sum(1 for l in LIMBS if w_probe.on_hold(l) is not None)
+    need = require_grips if require_grips is not None else n0
+    return (n1 >= need), n1
+
+
+def _gate_move(mover: str, target: str, info: dict, landed_frame: dict,
+               launch_tip_z: float, w_probe: Climb3DWorld, *,
+               gap_m: float, gain_m: float) -> dict:
+    """Evaluate all feasibility gates for one authored move. Returns a report
+    dict with a boolean ``passed`` and every measured quantity (for the manifest
+    and for ranking reseeds). Gates: (1) the mover GRIPPED the target; (2) grip
+    gap ≤ ``gap_m``; (3) tip z-gain ≥ ``gain_m`` (anti-wiggle upward progress);
+    (4) the landed 4-grip stance is zero-action holdable."""
+    landed = bool(info["landed"])   # mover gripped the target (weld active)
+    gap = float(info["gap"])
+    tip_z = float(landed_frame["eef"][LIMBS.index(mover)][2])
+    gain = tip_z - launch_tip_z
+    holdable, n_hold = (False, 0)
+    if landed:
+        holdable, n_hold = _stance_holdable(
+            w_probe, landed_frame["qpos"], _grips_dict(landed_frame["grips"]))
+    reasons = []
+    if not landed:
+        reasons.append(f"no grip (gap {gap:.3f})")
+    else:
+        if gap > gap_m:
+            reasons.append(f"gap {gap:.3f} > {gap_m:.2f}")
+        if gain < gain_m:
+            reasons.append(f"gain {gain:+.3f} < {gain_m:.2f}")
+        if not holdable:
+            reasons.append("stance not zero-action holdable")
+    passed = landed and gap <= gap_m and gain >= gain_m and holdable
+    return {"passed": passed, "landed": landed, "gap": round(gap, 3),
+            "gain": round(gain, 3), "holdable": holdable, "n_hold": n_hold,
+            "reason": "ok" if passed else "; ".join(reasons)}
+
+
+def _author_move_gated(
+    w: Climb3DWorld, w_probe: Climb3DWorld, start: dict, mover: str, target: str, *,
+    launch_tip_z: float, retries: int, horizon: int, max_evals: int,
+    sigma0: float, x0: np.ndarray | None = None, deadline: float | None = None,
+) -> tuple[list[dict], dict, dict]:
+    """Author one move and run it through the gates, RESEEDING CMA up to
+    ``retries`` extra times to beat run-to-run variance (the proven pattern from
+    the centered re-author: a single CMA run stalls in a loose basin; a reseed
+    lands tight — reseeding beats variance). Returns ``(frames, info, report)``
+    for the best attempt: a gate-passing attempt if any, else the closest one
+    (ranked landed-then-gap, or com_y-centered for feet).
+
+    Feet get the stance-center landing (land centered over the base of support)
+    with a capped balance assist. The whole-body search (arms + standing leg
+    recruited) is ESCALATED to only on later retries: measured, it lands close
+    footholds LOOSER and ~1.5x slower than the narrow leg-swing search, and only
+    pays off on the marginal high reaches (the solved wall's RF) — so try narrow
+    first, recruit the whole body only if narrow can't close the gap."""
+    import time
+    is_foot = mover in _LEG
+    gap_m = GATE_FOOT_GAP_M if is_foot else GATE_HAND_GAP_M
+    gain_m = GATE_FOOT_GAIN_M if is_foot else GATE_HAND_GAIN_M
+    best = None    # (rank_key, frames, info, report)
+    n_attempts = 0
+    for attempt in range(retries + 1):
+        # Stop reseeding once the wall-clock budget is spent — the caller stops
+        # gracefully with whatever it has (never blows past into the SIGALRM kill).
+        if attempt > 0 and deadline is not None and time.time() >= deadline:
+            break
+        n_attempts += 1
+        move_x0 = x0 if attempt == 0 else None
+        base = dict(horizon=horizon, max_evals=max_evals, restarts=1, max_gap_m=gap_m)
+        if is_foot:
+            # Escalate to the whole-body search on the last two retries only.
+            whole = attempt >= max(1, retries - 1)
+            base.update(whole_body=whole, stance_center_coeff=2.0,
+                        stance_center_com_y=0.16, balance_cap_n=250.0,
+                        com_drop_max=0.30,
+                        max_evals=(int(max_evals * 1.4) if whole else max_evals))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            frames, info = discover_move(w, start, mover, target, sigma0=sigma0,
+                                         x0=move_x0, **base)
+        report = _gate_move(mover, target, info, frames[-1], launch_tip_z,
+                            w_probe, gap_m=gap_m, gain_m=gain_m)
+        report["try"] = attempt + 1
+        # Rank: a passing attempt beats a non-passing one; among non-passing,
+        # prefer landed, then (feet) most-centered / (hands) tightest gap.
+        secondary = (info.get("com_y", 9.9) if is_foot else info["gap"])
+        key = (0 if report["passed"] else 1,
+               0 if report["landed"] else 1, secondary)
+        if best is None or key < best[0]:
+            best = (key, frames, info, report)
+        if report["passed"]:
+            break
+    _, frames, info, report = best
+    report["tries"] = n_attempts     # actual reseeds run (best may be an earlier one)
+    return frames, info, report
+
+
+def _next_move_limb_order(start: dict, after_mover: str, *,
+                          foot_first_lag_m: float = FOOT_FIRST_LAG_M) -> list[str]:
+    """Preference order for which limb to move next, LOWER limb (smaller tip z)
+    first within the leading class, just-moved limb deprioritized to last.
+
+    Which class leads is SEPARATION-GATED (fix 2026-07-12). Normally hands lead
+    and a foot comes up only when a hand reach stalls — real ladder climbing.
+    But with closely-spaced hand holds every hand step keeps passing its gate, so
+    the walk returned a hand every time and the feet were never brought up: v2's
+    chains climbed on the arms and stranded the feet (RF never moved), the mirror
+    of v1's stranded-hand failure. So once the hands climb more than
+    ``foot_first_lag_m`` above the feet (min hand tip_z − min foot tip_z), flip to
+    FEET-FIRST for that step to bring the trailing foot up; below it, hands lead.
+    Symmetric in spirit: neither class can be starved indefinitely — hands
+    outrunning the feet forces a foot, and a fresh foot drops the lag back so the
+    hands resume. This only orders the candidates; ``_find_next_gated_move`` still
+    tries the other class if the preferred one has no gate-passing move, so a foot
+    is never forced onto a hand hold the way the old rigid LH→RH→LF→RF cycle did."""
+    tip_z = {l: float(start["eef"][LIMBS.index(l)][2]) for l in LIMBS}
+    lag = min(tip_z["LH"], tip_z["RH"]) - min(tip_z["LF"], tip_z["RF"])
+    feet_first = lag > foot_first_lag_m
+    # Primary sort key prefers the LAGGING class (feet when hands have run ahead,
+    # else hands); secondary key brings the lower limb of that class up first.
+    order = sorted(LIMBS, key=lambda l: (
+        (l not in _LEG) if feet_first else (l in _LEG), tip_z[l]))
+    # Move the just-moved limb to the end (prefer alternating).
+    return [l for l in order if l != after_mover] + [after_mover]
+
+
+def _find_next_gated_move(
+    w: Climb3DWorld, w_probe: Climb3DWorld, start: dict, after_mover: str,
+    visited: set, *, move_retries: int, horizon: int, max_evals: int,
+    foot_max_evals: int, sigma0: float, probe_evals: int,
+    deadline: float | None = None, max_candidates: int = 3,
+) -> dict | None:
+    """Try each limb (in ``_next_move_limb_order`` preference — hands before feet,
+    lower first) and return the first gate-PASSING move as a ``pending`` dict
+    (carrying its authored frames so the caller never re-authors it), or ``None``
+    if no limb has one. Candidates come from ``_reachable_holds`` (held-hold
+    exclusion + per-limb upward-gain floor — the anti-wiggle guards).
+
+    Two-phase to stay cheap: EXPLORE every candidate with a SINGLE attempt
+    (``retries=0``, warm-started from the probe) and return the first that passes;
+    this is the common case on a ladder and costs one CMA run per candidate. Only
+    if nothing passes on one attempt do we REseed the single most-promising
+    candidate (tightest probe gap) up to ``move_retries`` — reserving the
+    expensive reseeds for the one move most likely to land. Deadline-checked
+    between every authoring so it can never blow past the graceful budget into the
+    SIGALRM backstop (the bug that lost 4/5 walls' progress in the first run)."""
+    import time
+    best_cand = None    # (probe_gap, mover, hid, probe_x, is_foot, launch_z)
+    for next_mover in _next_move_limb_order(start, after_mover):
+        if deadline is not None and time.time() >= deadline:
+            return None
+        next_is_foot = next_mover in _LEG
+        max_dist = 0.55 if next_is_foot else 0.80
+        min_gain = GATE_FOOT_GAIN_M if next_is_foot else GATE_HAND_GAIN_M
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            candidates = _reachable_holds(w, start, next_mover, max_dist_m=max_dist,
+                                          max_probe_evals=probe_evals,
+                                          visited=visited, min_z_gain_m=min_gain)
+        if not candidates:
+            continue
+        cand_launch_z = float(start["eef"][LIMBS.index(next_mover)][2])
+        for probe_gap, hid, probe_x in candidates[:max_candidates]:
+            if deadline is not None and time.time() >= deadline:
+                return None
+            cand_frames, cand_info, cand_report = _author_move_gated(
+                w, w_probe, start, next_mover, hid, launch_tip_z=cand_launch_z,
+                retries=0, horizon=horizon,
+                max_evals=(foot_max_evals if next_is_foot else max_evals),
+                sigma0=sigma0 * 0.6, x0=probe_x, deadline=deadline)
+            print(f"    probe {next_mover}->{hid}: gap={cand_report['gap']:.3f} "
+                  f"gain={cand_report['gain']:+.3f} hold={cand_report['holdable']} "
+                  f"pass={cand_report['passed']}", flush=True)
+            if cand_report["passed"]:
+                return {"mover": next_mover, "target": hid, "x0": None,
+                        "frames": cand_frames, "info": cand_info,
+                        "report": cand_report, "launch_z": cand_launch_z}
+            if best_cand is None or probe_gap < best_cand[0]:
+                best_cand = (probe_gap, next_mover, hid, probe_x, next_is_foot,
+                             cand_launch_z)
+    # Nothing passed on a single attempt: reseed the most-promising candidate.
+    if best_cand is not None and move_retries > 0 and (
+            deadline is None or time.time() < deadline):
+        _pg, mv, hid, px, isf, lz = best_cand
+        cand_frames, cand_info, cand_report = _author_move_gated(
+            w, w_probe, start, mv, hid, launch_tip_z=lz, retries=move_retries,
+            horizon=horizon, max_evals=(foot_max_evals if isf else max_evals),
+            sigma0=sigma0 * 0.6, x0=px, deadline=deadline)
+        print(f"    reseed best {mv}->{hid}: gap={cand_report['gap']:.3f} "
+              f"pass={cand_report['passed']} tries={cand_report['tries']}", flush=True)
+        if cand_report["passed"]:
+            return {"mover": mv, "target": hid, "x0": None, "frames": cand_frames,
+                    "info": cand_info, "report": cand_report, "launch_z": lz}
+    return None
+
+
+def discover_climb_batch(
+    wall: Wall, profile: ClimberProfile, seed_move: dict, *,
+    max_moves: int = 10, horizon: int = 36, max_evals: int = 320,
+    foot_max_evals: int = 460, sigma0: float = 0.45, settle_pre: int = 2,
+    wall_gen_seed: int = 7, move_retries: int = 4, probe_evals: int = 80,
+    seed_x0: np.ndarray | None = None, deadline: float | None = None,
+) -> tuple[Reference, list[dict]]:
+    """Batch-oriented adaptive discovery: like ``discover_climb_adaptive`` but
+    every authored move passes the feasibility gates with bounded CMA reseeding
+    (``move_retries``), the recipe (whole-body + stance-center) is on for feet,
+    and each stance is holdability-probed. Returns ``(Reference, per_move_diag)``
+    where ``per_move_diag`` is the manifest's per-move detail. Stops cleanly at
+    the first move that can't be made to pass its gates within the retry budget
+    (a genuine infeasibility) — the partial chain up to there is still returned."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        w = Climb3DWorld(wall, profile)
+        w.seed_pose(**seed_move["seed_kwargs"])
+        w_probe = Climb3DWorld(wall, profile)   # separate world for holdability
+
+    frames: list[dict] = [_snapshot(w) for _ in range(settle_pre)]
+    start = _snapshot(w)
+    move_starts: list[int] = []
+    per_move: list[dict] = []
+    visited: set[str] = {g for g in start["grips"] if g}
+
+    # Gate the seed stance itself (a wall whose start won't hang is unusable).
+    seed_ok, _ = _stance_holdable(w_probe, start["qpos"], _grips_dict(start["grips"]))
+    if not seed_ok:
+        per_move.append({"status": "seed stance not holdable — unclimbable start"})
+        ref = _frames_to_reference(frames, wall_gen_seed,
+                                   {"method": "cma-es-batch", "move_starts": []})
+        return ref, per_move
+
+    # Resolve the FIRST move: try the selected seed move; if it fails its gates,
+    # fall back to a gain-respecting cycle-walk from the seed stance. The selector
+    # (feasible_reach_moves) only vets reach distance, NOT the 0.08 m upward-gain
+    # floor, so it can hand back a tight-but-timid micro-move (measured: RH→h_040
+    # landed 0.02 m tight but gained only 0.05 m) that the gate rightly rejects —
+    # without this fallback the whole chain aborted at step 0.
+    seed_mover, seed_target = seed_move["mover"], seed_move["target"]
+    seed_launch_z = float(start["eef"][LIMBS.index(seed_mover)][2])
+    sframes, sinfo, sreport = _author_move_gated(
+        w, w_probe, start, seed_mover, seed_target, launch_tip_z=seed_launch_z,
+        retries=move_retries, horizon=horizon,
+        max_evals=(foot_max_evals if seed_mover in _LEG else max_evals),
+        sigma0=sigma0, x0=seed_x0, deadline=deadline)
+    if sreport["passed"]:
+        pending = {"mover": seed_mover, "target": seed_target, "x0": None,
+                   "frames": sframes, "info": sinfo, "report": sreport,
+                   "launch_z": seed_launch_z}
+    else:
+        print(f"  seed move {seed_mover}->{seed_target} rejected "
+              f"({sreport['reason']}); cycle-walking from seed stance", flush=True)
+        per_move.append({"seed_move_rejected": f"{seed_mover}->{seed_target}",
+                         "reason": sreport["reason"]})
+        pending = _find_next_gated_move(
+            w, w_probe, start, seed_mover, visited, move_retries=move_retries,
+            horizon=horizon, max_evals=max_evals, foot_max_evals=foot_max_evals,
+            sigma0=sigma0, probe_evals=probe_evals, deadline=deadline)
+    if pending is None:
+        per_move.append({"status": "no gate-passing first move from seed stance"})
+        return _frames_to_reference(
+            frames, wall_gen_seed,
+            {"method": "cma-es-batch", "move_starts": []}), per_move
+
+    import time
+    for step in range(max_moves):
+        # Graceful wall-clock stop BETWEEN moves: return the partial chain (all
+        # committed moves are already gated + saved-worthy) instead of being
+        # hard-killed mid-move by the SIGALRM backstop, which would lose them.
+        if deadline is not None and time.time() >= deadline:
+            per_move.append({"status": f"stopped at step {step}: wall-clock budget "
+                                       f"reached (partial chain kept)"})
+            break
+        mover, target = pending["mover"], pending["target"]
+        if target not in w._hold_meta_by_id:
+            per_move.append({"step": step, "status": f"unknown target {target}"})
+            break
+        is_foot = mover in _LEG
+        # `pending` always carries frames pre-authored (seed resolved above; each
+        # subsequent move authored during the prior step's cycle-walk) — never
+        # re-authored here.
+        mframes, info, report = pending["frames"], pending["info"], pending["report"]
+        entry = {"step": step, "mover": mover, "target": target,
+                 "gap": report["gap"], "gain": report["gain"],
+                 "holdable": report["holdable"], "tries": report["tries"],
+                 "passed": report["passed"], "reason": report["reason"]}
+        per_move.append(entry)
+        print(f"  step {step}: {mover}->{target}  gap={report['gap']:.3f}m  "
+              f"gain={report['gain']:+.3f}m  hold={report['holdable']}  "
+              f"tries={report['tries']}  passed={report['passed']}"
+              f"{'' if report['passed'] else '  << ' + report['reason']}", flush=True)
+        if not report["passed"]:
+            # Don't include a non-gripping reach in the saved reference (it would
+            # train the policy to reach-and-not-grip at the top). Record + stop.
+            per_move.append({"status": f"aborted at step {step}: {report['reason']} "
+                                       f"on {mover}->{target}"})
+            break
+        move_starts.append(len(frames))
+        frames.extend(mframes)
+        visited.add(target)
+        start = mframes[-1]
+
+        # Stand up on a freshly placed foot before probing the next reach (the
+        # foot only buys the hands height once the body rises over it). Give the
+        # stand-up the same bounded-reseed budget the moves get (was a single
+        # shot) and COMMIT any positive rise: the old 0.05 discard turned a small
+        # win into zero, leaving the body slumped so the feet re-stranded and the
+        # next hand reach missed its gate — the s4288 3-move stall (2026-07-12).
+        if is_foot:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                stand_frames, stand_info = discover_stand(w, start, restarts=3)
+            print(f"    stand after {target}: com_gain={stand_info['com_gain']:+.3f}m "
+                  f"anchors={stand_info['n_anchor']} fell={stand_info['fell']}", flush=True)
+            if stand_info["com_gain"] > 0.01 and not stand_info["fell"]:
+                frames.extend(stand_frames)
+                start = stand_frames[-1]
+                per_move.append({"stand_after": target,
+                                 "com_gain": stand_info["com_gain"]})
+
+        # Walk the 4-limb cycle to the next limb with a gate-passing move.
+        pending = _find_next_gated_move(
+            w, w_probe, start, mover, visited, move_retries=move_retries,
+            horizon=horizon, max_evals=max_evals, foot_max_evals=foot_max_evals,
+            sigma0=sigma0, probe_evals=probe_evals, deadline=deadline)
+        if pending is None:
+            per_move.append({"status": f"no gate-passing move from step {step}; "
+                                       f"chain complete or stuck"})
+            break
+
+    ref = _frames_to_reference(
+        frames, wall_gen_seed,
+        {"method": "cma-es-batch", "move_starts": move_starts,
+         "discovered": [d.get("target") for d in per_move if d.get("passed")]})
+    return ref, per_move
+
+
+def _frames_to_reference(frames: list[dict], wall_gen_seed: int, meta: dict) -> Reference:
+    return Reference(
+        qpos=np.array([f["qpos"] for f in frames]),
+        qvel=np.array([f["qvel"] for f in frames]),
+        eef=np.array([f["eef"] for f in frames]),
+        com=np.array([f["com"] for f in frames]),
+        grips=np.array([f["grips"] for f in frames], dtype="<U24"),
+        wall_gen_seed=wall_gen_seed, meta=meta,
+    )
+
+
+# ─── Wall-set generation (the batch's input) ────────────────────────────────
+
+def _overlay_dense_footholds(wd: dict, *, band_offset: int = 2,
+                             row_step: int = 1) -> dict:
+    """Overlay two foothold columns (cx ± ``band_offset``, one foothold every
+    ``row_step`` rows across the climb span) onto a generated wall — the
+    footstep-fine5 design that made the SOLVED wall's foot moves tractable: a
+    foot always has a target a short reach up, so it closes cheaply and lands
+    tight. The generator's own sparse foothold bands leave feet stranded on
+    steep walls. Existing (hand/start) cells are never overwritten.
+
+    ``row_step`` controls foothold VERTICAL density. Keep it 1 (every row = 5 cm
+    on the 5 cm grid): a 2026-07-12 smoke tried 10 cm spacing to force bigger
+    stand-ups, but feet then could not close on the sparse holds (foot probes
+    stalled at gap ~0.08 > the 0.06 gate), the body never rose, and the chain
+    stalled at 2 hand moves. Dense footholds let a forced foot move actually grip
+    tight. The 5 cm-shuffle / feet-lead worry is handled by the lag-gated move
+    ordering (``FOOT_FIRST_LAG_M``), not by thinning the foothold ladder."""
+    occupied = {(h["grid_x"], h["grid_y"]) for h in wd["holds"]}
+    cx = wd["grid"]["cols"] // 2
+    hand_rows = [h["grid_y"] for h in wd["holds"]
+                 if h["hold_type"] != "foothold"]
+    lo = max(1, min(hand_rows) - 6)
+    hi = max(hand_rows) - 1
+    n = 0
+    for gy in range(lo, hi + 1, row_step):
+        for gx in (cx - band_offset, cx + band_offset):
+            if (gx, gy) in occupied or not (0 <= gx < wd["grid"]["cols"]):
+                continue
+            n += 1
+            wd["holds"].append({
+                "hold_id": f"fd_{n:03d}", "grid_x": gx, "grid_y": gy,
+                "hold_type": "foothold", "orientation_deg": 0.0, "size": "medium",
+                "color": "#a855f7", "is_start": False, "is_finish": False})
+            occupied.add((gx, gy))
+    return wd
+
+
+def build_batch_walls(
+    out_dir, n: int, *, base_seed: int = 300, cols: int = 21, rows: int = 52,
+    cell_size_cm: float = 5.0, reach_frac: float = 0.5, min_step_dy: int = 3,
+    max_step_dy: int = 3, foot_lag: int = 3, n_scatter: int = 6,
+    foot_row_step: int = 1, max_seed_scan: int = 200,
+) -> list:
+    """Generate ``n`` climb walls comparable to the solved 4-move wall: a jug
+    ladder on a 5 cm grid with central foothold columns, produced by
+    ``solver.generate`` and A*-verified. Each wall's bottom stance is checked
+    hangable before it is accepted (an over-braced start is unclimbable for this
+    body). Returns the list of written Paths.
+
+    The hand route comes from ``solver.generate`` (monkeypatched difficulty
+    params for the ladder spacing, the same pattern ``build_tight_wall`` uses);
+    the footholds are overlaid on top.
+
+    Geometry tuned 2026-07-12 against the diagnosed feet-lead root cause. Hand
+    steps are UNIFORM 15 cm (``max_step_dy`` 4→3): v1's 15-20 cm steps let the
+    20 cm reaches land just outside the 0.05 gap / 0.08 gain hand gate from a low
+    stance, so the search always took the cheaper foot move. 15 cm matches the
+    upper hand-step of the two walls known to produce alternating climbs
+    (footstep-fine5's clean 20 cm ladder solves, and s4288's scattered 5-15 cm
+    hands alternate cleanly), and keeps a comfortable margin over the 8 cm gain
+    gate (a fully-closed 15 cm reach gains 15 cm; even a 5 cm-short one gains
+    10 cm).
+
+    ``foot_row_step`` stays 1 (footholds every row = 5 cm). A one-wall smoke on
+    2026-07-12 tried sparser 10 cm footholds to force bigger stand-ups, but the
+    feet then could not CLOSE on the sparse holds (every foot probe stalled at
+    gap ~0.08 > the 0.06 gate) → the body never rose → the chain stalled at 2
+    hand moves. Dense footholds are what let a forced foot move actually grip
+    (s4288 alternates all four WITH 5 cm footholds). Feet-lead is prevented by
+    the lag-gated move ORDERING (``FOOT_FIRST_LAG_M`` / ``_next_move_limb_order``),
+    not by starving the feet of holds — a single forced foot move drops the lag
+    back below threshold, so hands resume and no double-shuffle occurs."""
+    import json
+    from pathlib import Path
+    import solver.generate as gen
+    from solver.generate import GeneratorConfig, generate_wall
+    from solver.wall import load_wall
+    from sim3d.staged_curriculum import feasible_reach_moves
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    profile = ClimberProfile()
+    orig = gen._difficulty_params
+    written: list = []
+    try:
+        gen._difficulty_params = lambda d, _o=orig: {
+            **_o(0.0), "min_step_dy": min_step_dy, "max_step_dy": max_step_dy,
+            "reach_frac": reach_frac, "foot_lag": foot_lag, "n_scatter": n_scatter}
+        for off in range(max_seed_scan):
+            if len(written) >= n:
+                break
+            # Stride the seeds by 997 (as generate_batch does): generate_wall
+            # retries base_seed+attempt on A* failure, so consecutive base seeds
+            # hit OVERLAPPING retry ranges and collapse to the SAME wall. A wide
+            # stride keeps every wall structurally distinct.
+            seed = base_seed + off * 997
+            gc = GeneratorConfig(cols=cols, rows=rows, cell_size_cm=cell_size_cm,
+                                 difficulty=0.0, seed=seed)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                wd = generate_wall(gc, wall_id=f"batch-s{seed}")
+            if wd is None:
+                continue
+            wd = _overlay_dense_footholds(wd, row_step=foot_row_step)
+            with warnings.catch_warnings(), contextlib_redirect_stderr():
+                warnings.simplefilter("ignore")
+                wall = load_wall(wd, cell_size_cm=cell_size_cm)
+                feas = feasible_reach_moves(wall, profile)
+                if len(feas) < 3:
+                    continue
+                # Bottom-stance hangability: the first feasible move's stance.
+                w_probe = Climb3DWorld(wall, profile)
+                w_probe.seed_pose(**feas[0]["seed_kwargs"])
+                start_qpos = w_probe.data.qpos.copy()
+                start_grips = {l: (w_probe.on_hold(l) or None) for l in LIMBS}
+            ok, _ = _stance_holdable(Climb3DWorld(wall, profile), start_qpos, start_grips)
+            if not ok:
+                continue
+            path = out_dir / f"{wd['wall_id']}.json"
+            path.write_text(json.dumps(wd))
+            written.append(path)
+            print(f"  wrote {path.name}: {len(wd['holds'])} holds, "
+                  f"{len(feas)} feasible first-moves (seed {seed})", flush=True)
+    finally:
+        gen._difficulty_params = orig
+    return written
+
+
+def contextlib_redirect_stderr():
+    import contextlib
+    import io
+    return contextlib.redirect_stderr(io.StringIO())
+
+
+# ─── Batch driver: per-wall timeout, skip-on-failure, manifest ──────────────
+
+class _WallTimeout(Exception):
+    pass
+
+
+class _timeout:
+    """SIGALRM-based per-wall wall-clock cap. MuJoCo/CMA return to Python between
+    physics steps, so the alarm fires promptly. ``seconds<=0`` disables it."""
+    def __init__(self, seconds: float):
+        self.seconds = int(seconds)
+
+    def __enter__(self):
+        import signal
+        if self.seconds > 0:
+            self._old = signal.signal(signal.SIGALRM, self._fire)
+            signal.alarm(self.seconds)
+        return self
+
+    def __exit__(self, *exc):
+        import signal
+        if self.seconds > 0:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self._old)
+        return False
+
+    def _fire(self, *a):
+        raise _WallTimeout(f"per-wall timeout ({self.seconds}s) exceeded")
+
+
+# Fields carried per authoring attempt (constant top-level wall fields are added
+# separately). Kept as a named tuple of keys so incumbent-from-manifest and a
+# fresh attempt build the same shape for _chain_quality_key ranking.
+_ATTEMPT_FIELDS = ("n_moves", "moves", "net_pelvis_rise", "holdable_fraction",
+                   "abort_reason", "limbs_moved", "all_gates_pass", "success")
+
+
+def _chain_quality_key(fields: dict) -> tuple:
+    """Rank chain-authoring attempts and harvest the best per wall. A gate-passing
+    chain beats any non-passing one; then more committed moves; then higher net
+    pelvis rise. Used by BOTH the chain-level reseed loop (keep the best of N
+    CMA seeds) and best-per-wall harvesting (a worse re-authoring must never
+    overwrite a better — esp. gate-passing — prior reference)."""
+    return (1 if fields.get("all_gates_pass") else 0,
+            int(fields.get("n_moves") or 0),
+            float(fields.get("net_pelvis_rise") or 0.0))
+
+
+def _author_one_wall(wall_path, out_dir, *, max_moves: int, move_retries: int,
+                     max_evals: int, foot_max_evals: int,
+                     wall_deadline: float | None = None,
+                     attempt_timeout: float = 0.0, chain_reseeds: int = 1,
+                     prior: dict | None = None) -> dict:
+    """Author a reference for one wall. Returns a manifest row. Never raises for
+    an authoring failure — records it in the row instead (except a timeout, which
+    the caller catches so it can annotate the row).
+
+    ``wall_deadline`` is a wall-clock time the wall stops at (total budget across
+    all reseeds). ``attempt_timeout`` (>0) caps each individual chain attempt so
+    that when a wall's budget is larger than one chain, the wall is re-authored
+    from scratch with a fresh CMA seed (``chain_reseeds`` attempts max), keeping
+    the best by ``_chain_quality_key``. With ``attempt_timeout=0`` and
+    ``chain_reseeds=1`` (the defaults) this is exactly the old single-attempt
+    behavior.
+
+    Best-per-wall harvesting: a ``prior`` manifest row whose ref still exists on
+    disk seeds the incumbent, so a worse re-authoring can never overwrite a
+    better (or gate-passing) reference — the chain-level CMA variance that flipped
+    a passing s4288 smoke to a 2-limb failing run costs nothing now."""
+    import contextlib
+    import io
+    import json
+    import time
+    from pathlib import Path
+    from sim3d.reference import holdable_fraction
+    from solver.wall import DEFAULT_CELL_SIZE_CM, load_wall
+    from sim3d.staged_curriculum import feasible_reach_moves
+
+    wall_path = Path(wall_path)
+    wd = json.loads(wall_path.read_text())
+    cell = wd.get("grid", {}).get("cell_size_cm") or DEFAULT_CELL_SIZE_CM
+    profile = ClimberProfile()
+    with contextlib.redirect_stderr(io.StringIO()), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wall = load_wall(wd, cell_size_cm=cell)
+        feas = feasible_reach_moves(wall, profile)
+    base_row: dict = {"wall": str(wall_path), "wall_id": wd.get("wall_id"),
+                      "cell_size_cm": cell, "n_holds": len(wd["holds"])}
+    out_path = Path(out_dir) / f"ref_{wd['wall_id']}.npz"
+    if not feas:
+        base_row.update(success=False, reason="no feasible first move", moves=[],
+                        all_gates_pass=False)
+        return base_row
+    with contextlib.redirect_stderr(io.StringIO()):
+        # Cheap ranker (few candidates, light evals): only picks WHICH first move
+        # to commit; discover_climb_batch re-authors it at full budget with retries.
+        seed_move, seed_info = select_first_move(
+            wall, profile, feas, max_gap_m=GATE_HAND_GAP_M, restarts=1,
+            max_candidates=4, probe_evals=120)
+
+    def _one_attempt(deadline: float | None) -> tuple[dict, "Reference | None"]:
+        """Author one full chain with a fresh CMA seed (cma defaults to a
+        time-based seed, so back-to-back attempts search independent basins) and
+        distill it into the manifest fields + (ref if it committed ≥1 move)."""
+        ref, per_move = discover_climb_batch(
+            wall, profile, seed_move, max_moves=max_moves,
+            move_retries=move_retries, max_evals=max_evals,
+            foot_max_evals=foot_max_evals, seed_x0=seed_info.get("x_best"),
+            wall_gen_seed=0, deadline=deadline)
+        passed = [d for d in per_move if d.get("passed")]
+        net_z = float(ref.qpos[-1, 2] - ref.qpos[0, 2]) if len(ref) else 0.0
+        with contextlib.redirect_stderr(io.StringIO()):
+            frac = holdable_fraction(ref, wall, profile) if len(ref) > 1 else 0.0
+        abort = next((d["status"] for d in per_move
+                      if isinstance(d, dict) and "status" in d), None)
+        # Every move COMMITTED to the reference passed its gates by construction
+        # (a failed move ends the chain and is never appended). CHAIN-LEVEL
+        # train-worthiness gate (2026-07-12): every limb must move ≥1× AND both
+        # hands must move — the separator between s4288's real climb and the
+        # stranded-hand / stranded-foot rejects, on top of the per-move gates and
+        # the net-rise (>= -0.01) anti-wiggle floor.
+        movers = {d.get("mover") for d in passed}
+        fields = dict(
+            n_moves=len(passed),
+            moves=[{k: d[k] for k in ("step", "mover", "target", "gap", "gain",
+                                       "holdable", "tries", "passed", "reason")
+                    if k in d} for d in per_move if "mover" in d],
+            net_pelvis_rise=round(net_z, 3),
+            holdable_fraction=round(frac, 3),
+            abort_reason=abort,
+            limbs_moved=sorted(m for m in movers if m),
+            all_gates_pass=(len(passed) >= 2 and net_z >= -0.01
+                            and {"LH", "RH", "LF", "RF"} <= movers
+                            and {"LH", "RH"} <= movers),
+            success=len(passed) >= 1,
+        )
+        return fields, (ref if fields["success"] else None)
+
+    # Best-per-wall harvesting: seed the incumbent from a prior ref still on disk
+    # (this wall's canonical out_path). best_ref=None means "already on disk, keep
+    # the file"; a fresh attempt only overwrites it if it strictly wins.
+    best_fields: dict | None = None
+    best_ref = None
+    best_from_disk = False
+    if prior and prior.get("ref") and Path(prior["ref"]) == out_path \
+            and out_path.exists():
+        best_fields = {k: prior.get(k) for k in _ATTEMPT_FIELDS if k in prior}
+        best_from_disk = True
+        if best_fields.get("all_gates_pass"):
+            # Nothing to beat a gate-passer here (resume skips these before we're
+            # called; this guards --no-resume / a partial-manifest edge).
+            return {**base_row, **best_fields, "ref": str(out_path),
+                    "n_chain_attempts": 0,
+                    "harvested": "kept prior all-gates-pass ref"}
+
+    n_attempts = 0
+    while True:
+        n_attempts += 1
+        if attempt_timeout and attempt_timeout > 0:
+            att_deadline = time.time() + attempt_timeout
+            if wall_deadline is not None:
+                att_deadline = min(att_deadline, wall_deadline)
+        else:
+            att_deadline = wall_deadline
+        fields, ref = _one_attempt(att_deadline)
+        if best_fields is None or \
+                _chain_quality_key(fields) > _chain_quality_key(best_fields):
+            best_fields, best_ref, best_from_disk = fields, ref, False
+        if best_fields.get("all_gates_pass"):
+            break                              # four-limb gate met — done
+        if n_attempts >= chain_reseeds:
+            break                              # reseed budget spent
+        if wall_deadline is not None and time.time() >= wall_deadline:
+            break                              # per-wall wall-clock budget spent
+
+    row = {**base_row, **best_fields, "n_chain_attempts": n_attempts}
+    if best_fields.get("success"):
+        # Only (re)write the ref when a fresh attempt actually won; if the on-disk
+        # incumbent is still best, leave its file untouched (never overwrite a
+        # better ref with a worse re-authoring).
+        if best_ref is not None and not best_from_disk:
+            best_ref.save(out_path, wall=wall, env_mode="discover-batch")
+            out_path.with_suffix(".wall.json").write_text(json.dumps(wd))
+        row["ref"] = str(out_path)
+    return row
+
+
+def run_batch(wall_dir, out_dir=None, *, per_wall_timeout: float = 1800.0,
+              max_moves: int = 10, move_retries: int = 4, max_evals: int = 320,
+              foot_max_evals: int = 460, manifest_name: str = "batch_manifest.json",
+              resume: bool = True, chain_attempt_timeout: float = 0.0,
+              chain_reseeds: int = 1) -> dict:
+    """Author a reference for every wall JSON in ``wall_dir`` and write a manifest.
+    Each wall runs under a wall-clock ``per_wall_timeout``; a timeout or an
+    unexpected exception is caught and recorded so one bad wall never kills the
+    batch.
+
+    ``resume`` (default on) makes the batch RESTARTABLE: a wall whose prior
+    manifest row already passed all gates AND whose saved reference still exists
+    is skipped and its row carried forward. So re-running after a crash/interrupt
+    only re-attempts the walls that haven't succeeded yet — an overnight run that
+    dies at wall 3 costs nothing on restart.
+
+    ``chain_attempt_timeout`` (>0) + ``chain_reseeds`` enable CHAIN-LEVEL reseeds:
+    each wall re-authors its whole chain from a fresh CMA seed (up to
+    ``chain_reseeds`` attempts, each capped at ``chain_attempt_timeout``) within
+    the ``per_wall_timeout`` total budget, keeping the best. This beats the
+    run-to-run CMA variance that flipped a passing s4288 smoke into a 2-limb
+    failing run — one attempt going down a bad basin no longer wastes the wall.
+    Defaults (0 / 1) preserve the single-attempt behavior. The prior manifest is
+    always consulted for best-per-wall harvesting (a worse re-authoring never
+    overwrites a better prior ref), independently of ``resume``'s skip."""
+    import json
+    import time
+    import traceback
+    from pathlib import Path
+
+    wall_dir = Path(wall_dir)
+    out_dir = Path(out_dir) if out_dir else wall_dir / "refs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wall_paths = sorted(p for p in wall_dir.glob("*.json")
+                        if not p.name.endswith(".wall.json"))
+    # Load a prior manifest (if any). Used BOTH for --resume skips and — always —
+    # for best-per-wall harvesting inside _author_one_wall.
+    prior_by_wall: dict = {}
+    prior_path = out_dir / manifest_name
+    if prior_path.exists():
+        try:
+            for r in json.loads(prior_path.read_text()).get("walls", []):
+                prior_by_wall[r.get("wall_id")] = r
+        except Exception:  # noqa: BLE001 — a corrupt prior manifest just disables it
+            prior_by_wall = {}
+    manifest = {"generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "wall_dir": str(wall_dir), "out_dir": str(out_dir),
+                "config": {"per_wall_timeout": per_wall_timeout,
+                           "max_moves": max_moves, "move_retries": move_retries,
+                           "max_evals": max_evals, "foot_max_evals": foot_max_evals,
+                           "resume": resume,
+                           "chain_attempt_timeout": chain_attempt_timeout,
+                           "chain_reseeds": chain_reseeds},
+                "walls": []}
+    for i, wp in enumerate(wall_paths):
+        print(f"\n=== wall {i+1}/{len(wall_paths)}: {wp.name} ===", flush=True)
+        # Resume: skip a wall already authored to all-gates-pass with its ref on disk.
+        prior = prior_by_wall.get(wp.stem)
+        if (resume and prior and prior.get("all_gates_pass")
+                and prior.get("ref") and Path(prior["ref"]).exists()):
+            prior = {**prior, "skipped": "reused prior all-gates-pass reference"}
+            manifest["walls"].append(prior)
+            print(f"  → SKIP (already passed all gates: {prior.get('n_moves')} moves, "
+                  f"net_rise={prior.get('net_pelvis_rise')})", flush=True)
+            (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2, default=str))
+            continue
+        t0 = time.time()
+        # Two-tier timeout: the chain stops GRACEFULLY at ``per_wall_timeout``
+        # (checked between moves, returning its partial gated reference), and
+        # SIGALRM is a generous backstop (+600 s, enough to let one in-flight foot
+        # move with its reseeds finish) that only fires if a single CMA move truly
+        # hangs — the common "chain is just long" case keeps all its progress.
+        deadline = t0 + per_wall_timeout
+        try:
+            with _timeout(per_wall_timeout + 600):
+                row = _author_one_wall(wp, out_dir, max_moves=max_moves,
+                                       move_retries=move_retries, max_evals=max_evals,
+                                       foot_max_evals=foot_max_evals,
+                                       wall_deadline=deadline,
+                                       attempt_timeout=chain_attempt_timeout,
+                                       chain_reseeds=chain_reseeds, prior=prior)
+        except _WallTimeout as e:
+            row = {"wall": str(wp), "wall_id": wp.stem, "success": False,
+                   "all_gates_pass": False, "reason": str(e), "moves": []}
+        except Exception as e:  # noqa: BLE001 — one bad wall must not kill the batch
+            row = {"wall": str(wp), "wall_id": wp.stem, "success": False,
+                   "all_gates_pass": False,
+                   "reason": f"{type(e).__name__}: {e}",
+                   "traceback": traceback.format_exc(), "moves": []}
+        row["seconds"] = round(time.time() - t0, 1)
+        manifest["walls"].append(row)
+        print(f"  → {'OK' if row.get('success') else 'FAIL'} "
+              f"({row.get('n_moves', 0)} moves, gates_pass={row.get('all_gates_pass')}, "
+              f"net_rise={row.get('net_pelvis_rise')}, "
+              f"attempts={row.get('n_chain_attempts', 1)}, {row['seconds']}s)", flush=True)
+        # Persist the manifest after every wall so a crash keeps partial results.
+        (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2, default=str))
+
+    n_ok = sum(1 for r in manifest["walls"] if r.get("success"))
+    n_gates = sum(1 for r in manifest["walls"] if r.get("all_gates_pass"))
+    manifest["summary"] = {"n_walls": len(wall_paths), "n_success": n_ok,
+                           "n_all_gates_pass": n_gates}
+    (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2, default=str))
+    print(f"\n=== BATCH DONE: {n_gates}/{len(wall_paths)} refs pass ALL gates "
+          f"({n_ok}/{len(wall_paths)} authored ≥1 move) ===")
+    print(f"manifest: {out_dir / manifest_name}")
+    return manifest
+
+
 def main() -> None:
     import argparse
     import contextlib
@@ -1167,6 +2017,39 @@ def main() -> None:
     from sim3d.reference import holdable_fraction
 
     ap = argparse.ArgumentParser(description=__doc__)
+    # ── Batch pipeline (Path A) ──────────────────────────────────────────────
+    ap.add_argument("--batch", type=str, default=None, metavar="WALL_DIR",
+                    help="UNATTENDED batch mode: author one gated multi-move "
+                         "reference per wall JSON in WALL_DIR and write a manifest. "
+                         "Per-wall timeout + skip-on-failure. See --batch-out etc.")
+    ap.add_argument("--batch-out", type=str, default=None,
+                    help="--batch: output dir for refs + manifest (default: "
+                         "<WALL_DIR>/refs)")
+    ap.add_argument("--per-wall-timeout", type=float, default=1800.0,
+                    help="--batch: wall-clock cap per wall in seconds (default 1800)")
+    ap.add_argument("--move-retries", type=int, default=4,
+                    help="--batch: CMA reseeds per move before giving up (default 4)")
+    ap.add_argument("--foot-max-evals", type=int, default=460,
+                    help="--batch: CMA evals per FOOT move (hands use --max-evals)")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="--batch: re-author every wall even if a prior manifest "
+                         "row already passed all gates (default: skip those)")
+    ap.add_argument("--chain-attempt-timeout", type=float, default=0.0,
+                    help="--batch: cap each single chain-authoring attempt (s). "
+                         ">0 enables CHAIN-LEVEL reseeds — re-author the whole "
+                         "chain with a fresh CMA seed within --per-wall-timeout, "
+                         "keeping the best (beats run-to-run CMA variance). "
+                         "0 (default) = one attempt fills the wall budget.")
+    ap.add_argument("--chain-reseeds", type=int, default=1,
+                    help="--batch: max chain-authoring attempts per wall (default "
+                         "1). Reseeds stop early on a four-limb gate pass or when "
+                         "--per-wall-timeout is spent.")
+    ap.add_argument("--gen-walls", type=str, default=None, metavar="OUT_DIR",
+                    help="Generate a batch wall set (jug ladder + dense footholds, "
+                         "5cm grid, A*-verified, hangable start) into OUT_DIR and "
+                         "exit. Use --n-walls and --gen-seed.")
+    ap.add_argument("--n-walls", type=int, default=5, help="--gen-walls: how many")
+    ap.add_argument("--gen-seed", type=int, default=300, help="--gen-walls: base seed")
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--wall", type=str, default=None,
                     help="explicit wall JSON (e.g. data/examples/ladder-v1.json) — "
@@ -1245,6 +2128,30 @@ def main() -> None:
                          "bypasses seed_pose, starting from the real end state of a "
                          "previous discovery run. Use with --adaptive.")
     args = ap.parse_args()
+
+    # --gen-walls: build the batch's input wall set and exit.
+    if args.gen_walls:
+        print(f"Generating {args.n_walls} batch walls into {args.gen_walls} "
+              f"(base seed {args.gen_seed})…")
+        written = build_batch_walls(args.gen_walls, args.n_walls,
+                                    base_seed=args.gen_seed)
+        print(f"wrote {len(written)}/{args.n_walls} walls to {args.gen_walls}")
+        return
+
+    # --batch: unattended multi-wall authoring with a manifest.
+    if args.batch:
+        # --max-evals defaults to 160 (fixed-move mode); batch hand moves need
+        # ~320 to land tight, so treat the untouched default as "use the batch
+        # default" while still honoring an explicit override.
+        hand_evals = 320 if args.max_evals == 160 else args.max_evals
+        run_batch(args.batch, args.batch_out,
+                  per_wall_timeout=args.per_wall_timeout,
+                  max_moves=args.max_moves, move_retries=args.move_retries,
+                  max_evals=hand_evals, foot_max_evals=args.foot_max_evals,
+                  resume=not args.no_resume,
+                  chain_attempt_timeout=args.chain_attempt_timeout,
+                  chain_reseeds=args.chain_reseeds)
+        return
 
     # --continue-from: load an existing reference and continue discovery from its
     # last frame. The wall JSON is expected at <ref>.wall.json next to the ref.
