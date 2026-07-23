@@ -303,6 +303,19 @@ Box(low=-inf, high=inf, shape=(131,), dtype=float32)
 - Hold positions expressed in pelvis-local frame so the representation is
   pose-relative, not world-absolute.
 
+**Phase-conditioning (opt-in, imitation only — `ImitationConfig.phase_obs` /
+`--phase-obs`).** When enabled, `ImitationEnv` appends ONE normalized move-phase
+scalar ∈ [0,1] → obs (132,). It encodes *which move* the policy is on
+(`target_stance / n_stances`), so a gradient update for a late move stops
+overwriting the shared MLP representation the early moves depend on — the fix for
+multi-move composition collapse (continued training dropped a working 4-move chain
+20/20→0/40; 5-move incremental warm-start broke moves 3-4). This is a
+**wrapper-only** change: `obs.py` and the inner env stay (131,), so the invariant
+above and policy portability are untouched on the default path. A (132,) phase
+policy can only warm-start (`--load`) from another (132,) phase policy; `--eval` /
+`--record` auto-detect the phase dim from the loaded model. Single scalar, not a
+one-hot, so obs dim is fixed regardless of move count.
+
 ---
 
 ## Reward Function (per step, `continuous-joint`)

@@ -679,12 +679,35 @@ class ImitationEnv(gym.Env):
         frac = min(1.0, self._total_steps / self.icfg.rsi_anneal_steps)
         return int(round(len(self.ref) + frac * (tgt - len(self.ref))))
 
-    def _grips_match(self, t: int) -> bool:
-        """Every limb the reference grips at frame ``t`` is gripped on the
-        SAME hold in the env."""
+    def _grips_match(self, t: int, *, exact: bool = False) -> bool:
+        """Grip-match test for reference frame ``t``. STANDARD (proximity-
+        equivalent) criterion: every limb the reference grips must be gripped on
+        a hold whose CENTRE is within GRIP_PROXIMITY_M (0.08 m) of the reference
+        hold's centre. This makes two adjacent holds closer than the grip radius
+        interchangeable — a foot on a hold 5 cm from the authored one achieves the
+        same stance, so the climb is scored on physical intent, not hold-id
+        identity (s1297: RF grips fd_042 vs authored fd_044, same column 5 cm
+        apart). ``exact=True`` requires the identical hold id — used only for the
+        logged exact-match DIAGNOSTIC, never as the success criterion."""
         ref_g = self.ref.frame_grips(min(t, len(self.ref) - 1))
-        return all(self.env.world.on_hold(l) == h
-                   for l, h in ref_g.items() if h is not None)
+        holds = self.env.world._hold_meta_by_id
+        for l, h in ref_g.items():
+            if h is None:
+                continue
+            gh = self.env.world.on_hold(l)
+            if gh is None:
+                return False
+            if gh == h:
+                continue
+            if exact:
+                return False
+            if gh not in holds or h not in holds:
+                return False
+            d = float(np.linalg.norm(np.asarray(holds[gh]["world_pos"])
+                                     - np.asarray(holds[h]["world_pos"])))
+            if d > cfg.GRIP_PROXIMITY_M:
+                return False
+        return True
 
     def _stance_reached(self, target_frame: int) -> bool:
         """Success test for the current target stance. Grip-match everywhere;
@@ -1263,6 +1286,10 @@ class ImitationEnv(gym.Env):
 
         info["outcome"] = outcome
         info["is_success"] = (outcome == "completed")
+        # Exact-hold-id match DIAGNOSTIC (not the success criterion): did the
+        # completing stance also land every limb on the reference's EXACT hold?
+        info["is_success_exact"] = (info["is_success"]
+                                    and self._grips_match(target_frame, exact=True))
         info["target_stance"] = self._target_stance
         if goal_d is not None:
             info["goal_d"] = round(goal_d, 3)
@@ -1290,6 +1317,110 @@ class ImitationEnv(gym.Env):
 
     def close(self):
         self.env.close()
+
+
+class MultiRefImitationEnv(gym.Env):
+    """Train ONE policy on several (wall, reference) pairs at once (Phase 3
+    multi-wall imitation). Each pair is its own ``ImitationEnv`` — different walls
+    compile different MuJoCo models, so a sub-env per pair is the only correct way
+    to hold them; the reference cannot be swapped inside one inner env. On each
+    reset a pair is sampled UNIFORMLY and the whole episode runs in that sub-env,
+    so every pair gets on-policy gradient. The obs is wall-agnostic already (K=8
+    nearest holds in pelvis frame), so all sub-envs share the same obs/action
+    space and one policy + one VecNormalize covers them all.
+
+    DAgger banks live inside each sub-env (each ``ImitationEnv`` loads its OWN
+    wall's bank via icfg.rsi_landing_bank(s) at construction), so banks are never
+    mixed across walls. If only one wall has a bank configured, the others simply
+    train without one — the per-wall wall_hash validation in
+    ``am.validate_landing_bank`` hard-errors if a bank is ever pointed at the
+    wrong wall.
+    """
+
+    metadata = Climbing3DEnv.metadata
+
+    def __init__(self, pairs, imitation_config: Optional[ImitationConfig] = None,
+                 render_mode: Optional[str] = None):
+        super().__init__()
+        if not pairs:
+            raise ValueError("MultiRefImitationEnv needs at least one (ref, wall, profile) pair")
+        self.icfg = imitation_config or ImitationConfig()
+        self._subenvs: list[ImitationEnv] = []
+        self._wall_ids: list[str] = []
+        for ref, wall, profile in pairs:
+            # Per-wall DAgger: a landing bank belongs to the wall it was collected
+            # on. Give each sub-env only the banks whose recorded wall_id matches
+            # its wall — a wall with no matching bank trains WITHOUT one (never an
+            # error, never a bank from another wall). ImitationEnv's own
+            # am.validate_landing_bank then passes because the wall now matches.
+            sub_icfg = self._route_banks_for_wall(self.icfg, wall.wall_id)
+            sub = ImitationEnv(ref, wall, profile=profile,
+                               imitation_config=sub_icfg, render_mode=render_mode)
+            self._subenvs.append(sub)
+            self._wall_ids.append(wall.wall_id)
+        self.observation_space = self._subenvs[0].observation_space
+        self.action_space = self._subenvs[0].action_space
+        self._active = 0
+
+    @staticmethod
+    def _bank_wall_id(path: str) -> Optional[str]:
+        """The wall_id recorded in a landing bank's embedded metadata (None for a
+        legacy bank without metadata — which then matches no wall and is dropped)."""
+        d = np.load(path, allow_pickle=True)
+        meta, _ = am.parse_npz_meta(d["meta"] if "meta" in d.files else None)
+        return (meta or {}).get("wall_id")
+
+    @classmethod
+    def _route_banks_for_wall(cls, icfg: ImitationConfig, wall_id: str) -> ImitationConfig:
+        """Restrict icfg's landing bank(s) to those authored on ``wall_id``. Banks
+        for other walls are dropped so this wall trains without them. No-op (returns
+        icfg unchanged) when no banks are configured — the common/from-scratch path."""
+        changed: dict = {}
+        if icfg.rsi_landing_banks:
+            kept = [pair for pair in icfg.rsi_landing_banks.split(",")
+                    if cls._bank_wall_id(pair.split(":", 1)[1]) == wall_id]
+            changed["rsi_landing_banks"] = ",".join(kept) if kept else None
+        if icfg.rsi_landing_bank:
+            changed["rsi_landing_bank"] = (
+                icfg.rsi_landing_bank
+                if cls._bank_wall_id(icfg.rsi_landing_bank) == wall_id else None)
+        return replace(icfg, **changed) if changed else icfg
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        super().reset(seed=seed)
+        # Uniform over pairs — every wall gets equal episode share (and thus
+        # equal on-policy gradient). np_random advances each reset (seed is None
+        # after the first), so the wall varies within a worker.
+        self._active = int(self.np_random.integers(0, len(self._subenvs)))
+        obs, info = self._subenvs[self._active].reset(seed=seed, options=options)
+        info["wall_id"] = self._wall_ids[self._active]
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self._subenvs[self._active].step(action)
+        info["wall_id"] = self._wall_ids[self._active]
+        return obs, reward, terminated, truncated, info
+
+    # ── Delegating hooks the trainer's callbacks call through env_method ──
+    def r_min(self) -> float:
+        return self._subenvs[self._active].r_min()
+
+    def rsi_cap(self) -> Optional[int]:
+        return self._subenvs[self._active].rsi_cap()
+
+    def chain_stage(self) -> int:
+        return self._subenvs[self._active].chain_stage()
+
+    def set_amp_disc(self, state: dict) -> None:
+        for sub in self._subenvs:
+            sub.set_amp_disc(state)
+
+    def render(self):
+        return self._subenvs[self._active].render()
+
+    def close(self):
+        for sub in self._subenvs:
+            sub.close()
 
 
 # ─── Evaluation ──────────────────────────────────────────────────────────────
@@ -1340,7 +1471,7 @@ def eval_frame0(model, ref: Reference, wall, profile,
     eval_icfg = replace(base, **overrides)
     mode = "chain" if base.stance_milestone else "frame0"
     env = ImitationEnv(ref, wall, profile, imitation_config=eval_icfg)
-    n_succ, lengths, com_ys, furthest_l, rises = 0, [], [], [], []
+    n_succ, n_exact, lengths, com_ys, furthest_l, rises = 0, 0, [], [], [], []
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=10_000 + ep)
         done, info, n, furthest = False, {}, 0, 0
@@ -1355,6 +1486,7 @@ def eval_frame0(model, ref: Reference, wall, profile,
             furthest = max(furthest, int(info.get("target_stance", 0)))
             n += 1
         n_succ += int(info.get("is_success", False))
+        n_exact += int(info.get("is_success_exact", False))
         lengths.append(n)
         furthest_l.append(furthest)
         rises.append(float(env.env.world.com()[2]) - com_z0)
@@ -1362,10 +1494,35 @@ def eval_frame0(model, ref: Reference, wall, profile,
             com_ys.append(float(np.mean(ep_com_y)))
     env.close()
     return {"success": n_succ / max(1, n_episodes), "n_succ": n_succ,
+            "success_exact": n_exact / max(1, n_episodes), "n_exact": n_exact,
             "n_episodes": n_episodes, "mean_len": float(np.mean(lengths)),
             "mean_com_y": float(np.mean(com_ys)) if com_ys else float("nan"),
             "mode": mode, "mean_furthest_stance": float(np.mean(furthest_l)),
             "mean_net_rise": float(np.mean(rises))}
+
+
+def eval_frame0_multi(model, pairs, icfg: Optional[ImitationConfig] = None, *,
+                      vec_normalize=None, n_episodes: int = 20,
+                      deterministic: bool = True) -> tuple[dict, dict]:
+    """Per-wall frame-0 eval for a multi-wall policy. Runs the exact single-wall
+    ``eval_frame0`` on each pair (so the same CHAIN(bottom→top) semantics apply
+    per wall) and returns ``(per_wall, aggregate)``.
+
+    A single aggregate number is NOT acceptable output for the pilot: a 100%/0%
+    split (one wall carrying the policy) reads identically to 50%/50% (real
+    shared learning) in the mean. ``per_wall`` is keyed by wall_id so both are
+    always visible; ``aggregate`` is the pooled success over all episodes."""
+    per: dict[str, dict] = {}
+    for ref, wall, profile in pairs:
+        per[wall.wall_id] = eval_frame0(
+            model, ref, wall, profile, icfg, vec_normalize=vec_normalize,
+            n_episodes=n_episodes, deterministic=deterministic)
+    total_succ = sum(r["n_succ"] for r in per.values())
+    total_eps = sum(r["n_episodes"] for r in per.values())
+    agg = {"success": total_succ / max(1, total_eps), "n_succ": total_succ,
+           "n_episodes": total_eps,
+           "mode": next(iter(per.values()))["mode"] if per else "frame0"}
+    return per, agg
 
 
 def collect_landings(model_path: str, ref_path: str, *, focus_stance: int,
@@ -1491,6 +1648,32 @@ def make_env(ref_path: str, icfg: ImitationConfig, rank: int = 0,
     return _init
 
 
+def load_pairs(ref_paths: list[str],
+               wall_jsons: Optional[list[Optional[str]]] = None) -> list[tuple]:
+    """Resolve a list of ref paths into (ref, wall, profile) pairs. Each ref
+    resolves its OWN wall (sibling ``<ref>.wall.json`` or embedded wall_gen_seed
+    via ``_load_wall_for_ref``) — never a shared wall. ``am.validate_reference``
+    inside that resolver hard-errors on a wall/metadata mismatch, so a ref pointed
+    at the wrong wall fails loudly at load, not silently in training."""
+    pairs = []
+    for i, rp in enumerate(ref_paths):
+        wj = wall_jsons[i] if (wall_jsons and i < len(wall_jsons)) else None
+        ref = Reference.load(rp)
+        wall, profile = _load_wall_for_ref(ref, wj, ref_path=rp)
+        pairs.append((ref, wall, profile))
+    return pairs
+
+
+def make_multi_env(ref_paths: list[str], icfg: ImitationConfig, rank: int = 0,
+                   wall_jsons: Optional[list[Optional[str]]] = None):
+    def _init():
+        pairs = load_pairs(ref_paths, wall_jsons)
+        env = MultiRefImitationEnv(pairs, imitation_config=icfg)
+        from stable_baselines3.common.monitor import Monitor
+        return Monitor(env)
+    return _init
+
+
 def smoke(ref_path: str, icfg: Optional[ImitationConfig] = None,
           wall_json: Optional[str] = None) -> None:
     """Single-env sanity: RSI works, reward stays in [0,1], episodes end via the
@@ -1540,12 +1723,19 @@ def _imitate_env_mode(icfg: ImitationConfig) -> str:
     on the mismatch. Warm-start (--load) validates this NON-strictly (warns), since
     transferring weights into a new obs regime is intentional."""
     base = "milestone" if icfg.stance_milestone else "dense"
-    return f"imitate:{base}{'+postureobs' if icfg.posture_goal_obs else ''}"
+    # +proxgrip marks the proximity-equivalent grip-match success criterion (a
+    # limb matches if its gripped hold's centre is within GRIP_PROXIMITY_M of the
+    # reference hold's centre). Stamped so a proximity-scored checkpoint is
+    # distinguishable from a pre-change exact-hold-id one — their success numbers
+    # are NOT comparable, and validate_checkpoint flags a cross-criterion eval.
+    return (f"imitate:{base}{'+postureobs' if icfg.posture_goal_obs else ''}"
+            f"+proxgrip")
 
 
 def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: ImitationConfig,
           wall_json: Optional[str] = None, load_run: Optional[str] = None,
-          ent_coef: float = 0.005) -> None:
+          ent_coef: float = 0.005, stop_flat_after: int = 0,
+          stop_flat_evals: int = 2, stop_flat_min_stance: float = 0.0) -> None:
     import stable_baselines3 as sb3
     from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
@@ -1649,14 +1839,30 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
     class ProgressCallback(BaseCallback):
         """Log phase-averaged success + tracking quality per rollout, and the
         HEADLINE frame-0 success every ``eval_every`` steps. The phase-averaged
-        number shows learning signal; only frame-0 counts as climbing."""
-        def __init__(self, eval_every: int = 100_000, eval_episodes: int = 12):
+        number shows learning signal; only frame-0 counts as climbing.
+
+        AUTOMATED FLAT-0 STOP: if ``stop_flat_after`` > 0, halt the run once the
+        ★ chain eval reads 0% success for ``stop_flat_evals`` CONSECUTIVE evals
+        at/after ``stop_flat_after`` steps — no manual watch needed. To avoid
+        killing a healthy composition run (which sits at 0% success for a long
+        time WHILE furthest-stance climbs 1→2→3→4), an eval only counts as "flat"
+        when its ``mean_furthest_stance`` is ALSO below ``stop_flat_min_stance``
+        (i.e. the chain isn't even composing). Set that to 0 to key on success
+        alone."""
+        def __init__(self, eval_every: int = 100_000, eval_episodes: int = 12,
+                     stop_flat_after: int = 0, stop_flat_evals: int = 2,
+                     stop_flat_min_stance: float = 0.0):
             super().__init__()
             self.ep_succ, self.ep_done = 0, 0
             self.rimit_sum, self.rimit_n = 0.0, 0
             self.eval_every = eval_every
             self.eval_episodes = eval_episodes
             self._next_eval = eval_every
+            self.stop_flat_after = stop_flat_after
+            self.stop_flat_evals = stop_flat_evals
+            self.stop_flat_min_stance = stop_flat_min_stance
+            self._flat_count = 0
+            self._stop = False
 
         def _on_step(self) -> bool:
             for info in self.locals["infos"]:
@@ -1665,7 +1871,7 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
                 if "episode" in info:  # Monitor end-of-episode
                     self.ep_done += 1
                     self.ep_succ += int(info.get("is_success", False))
-            return True
+            return not self._stop        # False halts learning (flat-0 stop)
 
         def _on_rollout_end(self) -> None:
             sr = self.ep_succ / max(1, self.ep_done)
@@ -1696,7 +1902,27 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
                       f"{res['success']*100:5.1f}%  ({res['n_succ']}/{res['n_episodes']} "
                       f"eps, mean len {res['mean_len']:.0f}, "
                       f"mean furthest stance {res['mean_furthest_stance']:.1f}, "
-                      f"net rise {res['mean_net_rise']:+.3f} m)")
+                      f"net rise {res['mean_net_rise']:+.3f} m; exact-id "
+                      f"{res['success_exact']*100:.0f}%)")
+                # Automated flat-0 stop: only counts evals at/after stop_flat_after.
+                # An eval is "flat" only if success is 0 AND (when a stance gate is
+                # set) the chain isn't even composing (furthest stance below the gate)
+                # — so a run climbing 1→2→3→4 toward its first completion is spared.
+                if self.stop_flat_after > 0 and self.num_timesteps >= self.stop_flat_after:
+                    flat = res["success"] <= 0.0 and (
+                        self.stop_flat_min_stance <= 0.0
+                        or res["mean_furthest_stance"] < self.stop_flat_min_stance)
+                    if flat:
+                        self._flat_count += 1
+                        if self._flat_count >= self.stop_flat_evals:
+                            print(f"  ✗ FLAT-0 STOP @ {self.num_timesteps}: chain eval "
+                                  f"0% (furthest stance {res['mean_furthest_stance']:.1f}) "
+                                  f"for {self._flat_count} consecutive evals ≥ "
+                                  f"{self.stop_flat_after} steps — no composition signal; "
+                                  f"halting.")
+                            self._stop = True
+                    else:
+                        self._flat_count = 0
 
     obs_dim = int(vec.observation_space.shape[0])
     action_dim = int(vec.action_space.shape[0])
@@ -1728,7 +1954,9 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
         save_vecnormalize=True,
         verbose=0,
     )
-    cb_list = [ProgressCallback(), ckpt_cb]
+    cb_list = [ProgressCallback(stop_flat_after=stop_flat_after,
+                                stop_flat_evals=stop_flat_evals,
+                                stop_flat_min_stance=stop_flat_min_stance), ckpt_cb]
     if amp_cb is not None:
         cb_list.append(amp_cb)
     callbacks = CallbackList(cb_list)
@@ -1744,7 +1972,8 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
     print(f"★ FINAL {label} success: {res['success']*100:.1f}%  "
           f"({res['n_succ']}/{res['n_episodes']} eps, "
           f"mean furthest stance {res['mean_furthest_stance']:.1f}, "
-          f"net rise {res['mean_net_rise']:+.3f} m)")
+          f"net rise {res['mean_net_rise']:+.3f} m; exact-id "
+          f"{res['success_exact']*100:.0f}%)")
 
     ckpt_meta = am.build_meta(
         artifact_type="checkpoint", wall=eval_wall, obs_dim=obs_dim, action_dim=action_dim,
@@ -1752,6 +1981,203 @@ def train(ref_path: str, *, steps: int, n_envs: int, run_id: str, icfg: Imitatio
         parent_eval=am.parent_eval_of(model_path),
         extra={"run_id": run_id, "ref": ref_path,
                "eval": {"frame0_success": res["success"], "n_episodes": res["n_episodes"]}},
+    )
+    am.write_checkpoint_meta(out / "model.zip", ckpt_meta)
+
+
+def train_multi(ref_paths: list[str], *, steps: int, n_envs: int, run_id: str,
+                icfg: ImitationConfig, wall_jsons: Optional[list[Optional[str]]] = None,
+                load_run: Optional[str] = None, ent_coef: float = 0.005,
+                guard_wall: Optional[str] = None, guard_at: int = 2_000_000,
+                guard_min: float = 0.5) -> None:
+    """Multi-wall imitation training: one policy on several (wall, reference)
+    pairs. Mirrors ``train`` but each worker is a ``MultiRefImitationEnv`` that
+    samples a pair per episode, and the periodic + final eval is PER WALL (plus
+    the pooled aggregate). The checkpoint records ``wall=None`` — a multi-wall
+    policy is not tied to one wall, so no single wall_hash is stamped (which would
+    make eval on the other wall spuriously hard-error); obs/action dims and
+    env_mode are still recorded and validated."""
+    import stable_baselines3 as sb3
+    from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
+    from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+
+    if icfg.amp_online:
+        raise NotImplementedError("online AMP is not wired into multi-wall training")
+
+    out = Path("data/runs/sim3d") / run_id
+    out.mkdir(parents=True, exist_ok=True)
+
+    import json
+    import sys as _sys
+    from dataclasses import asdict
+    (out / "config.json").write_text(json.dumps({
+        "refs": ref_paths, "steps": steps, "n_envs": n_envs, "run_id": run_id,
+        "wall_jsons": wall_jsons, "load_run": load_run, "ent_coef": ent_coef,
+        "icfg": asdict(icfg), "argv": _sys.argv,
+    }, indent=2, default=str))
+
+    vec_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
+    vec = vec_cls([make_multi_env(ref_paths, icfg, i, wall_jsons) for i in range(n_envs)])
+    vn_path = Path(load_run) / "vecnormalize.pkl" if load_run else None
+    if vn_path is not None and vn_path.exists():
+        vec = VecNormalize.load(str(vn_path), vec)
+        vec.training, vec.norm_reward = True, False
+    else:
+        vec = VecNormalize(vec, norm_obs=True, norm_reward=False, clip_obs=10.0)
+
+    # Pairs loaded once in-process for the periodic per-wall eval.
+    eval_pairs = load_pairs(ref_paths, wall_jsons)
+
+    def _print_eval(tag: str, per: dict, agg: dict) -> None:
+        label = "CHAIN(bottom→top)" if agg.get("mode") == "chain" else "FRAME-0"
+        print(f"  {tag} ★ {label} success  AGG {agg['success']*100:5.1f}%  "
+              f"({agg['n_succ']}/{agg['n_episodes']} eps)")
+        for wid, r in per.items():
+            print(f"      {wid:<20s} {r['success']*100:5.1f}%  "
+                  f"({r['n_succ']}/{r['n_episodes']} eps, mean len {r['mean_len']:.0f}, "
+                  f"furthest stance {r['mean_furthest_stance']:.1f}, "
+                  f"net rise {r['mean_net_rise']:+.3f} m)")
+
+    class MultiProgressCallback(BaseCallback):
+        """Per-rollout: phase-avg success + r_imit + PER-WALL episode counts (the
+        'both walls appearing in resets' health check). Every eval_every steps:
+        the headline per-wall frame-0 (chain) eval, the shared VecNormalize
+        pelvis-Z/com-Z running stats, and — once, at/after guard_at steps — the
+        AUTOMATED mechanical stop: if the known-good ``guard_wall`` has fallen
+        below guard_min, multi-wall co-training is harming it (the interference
+        signal the pilot exists to detect), so training halts immediately."""
+        def __init__(self, eval_every: int = 200_000, eval_episodes: int = 12,
+                     guard_wall: Optional[str] = None,
+                     guard_at: int = 2_000_000, guard_min: float = 0.5):
+            super().__init__()
+            self.ep_succ, self.ep_done = 0, 0
+            self.rimit_sum, self.rimit_n = 0.0, 0
+            self.wall_eps: dict[str, int] = {}
+            self.eval_every = eval_every
+            self.eval_episodes = eval_episodes
+            self._next_eval = eval_every
+            self.guard_wall = guard_wall
+            self.guard_at = guard_at
+            self.guard_min = guard_min
+            self._guard_checked = False
+            self._stop = False
+
+        def _on_step(self) -> bool:
+            for info in self.locals["infos"]:
+                self.rimit_sum += float(info.get("r_imit", 0.0))
+                self.rimit_n += 1
+                if "episode" in info:
+                    self.ep_done += 1
+                    self.ep_succ += int(info.get("is_success", False))
+                    wid = info.get("wall_id", "?")
+                    self.wall_eps[wid] = self.wall_eps.get(wid, 0) + 1
+            return not self._stop        # False halts learning (the guard trip)
+
+        def _log_vecnorm_stats(self) -> None:
+            """pelvis-Z (obs[2]) + com-Z (obs[11]) running mean/std of the shared
+            VecNormalize. These are ABSOLUTE-world obs channels; the two walls sit
+            ~0.82 m apart in Z, so if the known-good wall decays we want to see
+            whether it tracks drift/bimodality in these stats (the CONFOUND-2
+            hypothesis — see memory multiwall-obs-world-coords-confound)."""
+            vn = self.model.get_vec_normalize_env()
+            if vn is None or not hasattr(vn, "obs_rms"):
+                return
+            m, v = vn.obs_rms.mean, vn.obs_rms.var
+            print(f"      [vecnorm] pelvisZ mean {float(m[2]):+.3f} std {float(v[2])**0.5:.3f}"
+                  f"   comZ mean {float(m[11]):+.3f} std {float(v[11])**0.5:.3f}")
+
+        def _on_rollout_end(self) -> None:
+            sr = self.ep_succ / max(1, self.ep_done)
+            rimit = self.rimit_sum / max(1, self.rimit_n)
+            walls = "  ".join(f"{k}:{v}" for k, v in sorted(self.wall_eps.items()))
+            print(f"  [{self.num_timesteps:>7}] phase-avg success {sr*100:5.1f}%  "
+                  f"({self.ep_succ}/{self.ep_done} eps)  r_imit {rimit:.3f}  "
+                  f"walls[{walls}]")
+            self.ep_succ, self.ep_done = 0, 0
+            self.rimit_sum, self.rimit_n = 0.0, 0
+            self.wall_eps = {}
+            if self.num_timesteps >= self._next_eval:
+                self._next_eval += self.eval_every
+                per, agg = eval_frame0_multi(
+                    self.model, eval_pairs, icfg,
+                    vec_normalize=self.model.get_vec_normalize_env(),
+                    n_episodes=self.eval_episodes)
+                self._log_vecnorm_stats()
+                _print_eval(f"[{self.num_timesteps:>7}]", per, agg)
+                # Automated mechanical stop, evaluated once at/after guard_at.
+                if (not self._guard_checked and self.guard_wall
+                        and self.num_timesteps >= self.guard_at):
+                    self._guard_checked = True
+                    s = per.get(self.guard_wall, {}).get("success", 0.0)
+                    if s < self.guard_min:
+                        print(f"  ✗ MECHANICAL STOP @ {self.num_timesteps}: known-good "
+                              f"wall {self.guard_wall} at {s*100:.1f}% < "
+                              f"{self.guard_min*100:.0f}% — multi-wall co-training is "
+                              f"HARMING it (interference). Halting the run.")
+                        self._stop = True
+                    else:
+                        print(f"  ✓ guard @ {self.num_timesteps}: {self.guard_wall} "
+                              f"{s*100:.1f}% ≥ {self.guard_min*100:.0f}% — no interference; "
+                              f"continuing.")
+
+    obs_dim = int(vec.observation_space.shape[0])
+    action_dim = int(vec.action_space.shape[0])
+    env_mode = _imitate_env_mode(icfg)
+
+    model_path = Path(load_run) / "model.zip" if load_run else None
+    if model_path is not None and model_path.exists():
+        # Multi-wall warm-start: no single wall_hash to check (parent may be
+        # single- or multi-wall), so validate dims + env_mode only.
+        am.validate_checkpoint(model_path, obs_dim=obs_dim, action_dim=action_dim,
+                               env_mode=env_mode, strict_env_mode=False)
+        model = sb3.PPO.load(str(model_path), env=vec)
+        model.ent_coef = ent_coef
+        print(f"Warm-started from {model_path}  (ent_coef={ent_coef})")
+    else:
+        model = sb3.PPO(
+            "MlpPolicy", vec, verbose=0,
+            learning_rate=3e-4, n_steps=1024, batch_size=64, n_epochs=5,
+            gamma=0.99, gae_lambda=0.95, clip_range=0.1, ent_coef=ent_coef,
+            target_kl=0.03, policy_kwargs={"log_std_init": -1.5},
+        )
+    ckpt_cb = CheckpointCallback(
+        save_freq=max(1, 200_000 // n_envs),
+        save_path=str(out / "checkpoints"),
+        name_prefix="model",
+        save_vecnormalize=True,
+        verbose=0,
+    )
+    callbacks = CallbackList([
+        MultiProgressCallback(guard_wall=guard_wall, guard_at=guard_at,
+                              guard_min=guard_min),
+        ckpt_cb])
+    if guard_wall:
+        print(f"[guard] auto-stop if {guard_wall} < {guard_min*100:.0f}% at "
+              f"the first eval ≥ {guard_at} steps")
+
+    print(f"Training MULTI-WALL imitation on {len(ref_paths)} pairs: "
+          f"{steps} steps, {n_envs} envs → {out}")
+    for rp, (_ref, wall, _p) in zip(ref_paths, eval_pairs):
+        print(f"  pair: {wall.wall_id:<20s} ← {rp}")
+    model.learn(total_timesteps=steps, callback=callbacks, progress_bar=False)
+    model.save(str(out / "model.zip"))
+    vec.save(str(out / "vecnormalize.pkl"))
+    print(f"Saved {out/'model.zip'}")
+
+    per, agg = eval_frame0_multi(model, eval_pairs, icfg,
+                                 vec_normalize=model.get_vec_normalize_env(),
+                                 n_episodes=40)
+    print("★ FINAL")
+    _print_eval("[  FINAL]", per, agg)
+
+    ckpt_meta = am.build_meta(
+        artifact_type="checkpoint", wall=None, obs_dim=obs_dim, action_dim=action_dim,
+        env_mode=env_mode, parent=str(model_path) if model_path else None,
+        parent_eval=am.parent_eval_of(model_path),
+        extra={"run_id": run_id, "refs": ref_paths, "multi_wall": True,
+               "eval": {"aggregate_frame0_success": agg["success"],
+                        "per_wall": {k: v["success"] for k, v in per.items()},
+                        "n_episodes_per_wall": 40}},
     )
     am.write_checkpoint_meta(out / "model.zip", ckpt_meta)
 
@@ -1871,11 +2297,39 @@ def main() -> None:
                     help="frame-0 evaluation of a trained model (needs --model "
                          "+ --ref, optionally --vecnorm); the headline metric")
     ap.add_argument("--eval-episodes", type=int, default=40)
+    ap.add_argument("--stop-flat-after", type=int, default=0,
+                    help="single-wall AUTOMATED STOP: halt if the ★ chain eval reads "
+                         "0%% for --stop-flat-evals consecutive evals at/after this "
+                         "many steps (0 = disabled).")
+    ap.add_argument("--stop-flat-evals", type=int, default=2,
+                    help="consecutive 0%% chain evals (past --stop-flat-after) that "
+                         "trigger the flat-0 stop (default 2).")
+    ap.add_argument("--stop-flat-min-stance", type=float, default=0.0,
+                    help="an eval counts as flat only if mean furthest stance is "
+                         "below this (spares a run still composing 1→2→3→4). "
+                         "0 = key on success alone (default).")
     ap.add_argument("--model", type=str, default=None, help="model.zip for --record")
     ap.add_argument("--vecnorm", type=str, default=None, help="vecnormalize.pkl for --record")
     ap.add_argument("--wall-json", type=str, default=None,
                     help="exact wall JSON (for CMA-ES refs on a non-default wall); "
                          "auto-detected as <ref>.wall.json if present")
+    ap.add_argument("--refs", type=str, default=None,
+                    help="MULTI-WALL: comma-separated reference .npz paths, one "
+                         "policy trained on all pairs (each ref resolves its OWN "
+                         "wall via sibling <ref>.wall.json). Overrides --ref for "
+                         "--train and --eval; per-wall + aggregate results reported.")
+    ap.add_argument("--wall-jsons", type=str, default=None,
+                    help="MULTI-WALL: comma-separated wall JSONs matching --refs "
+                         "positionally (default: auto-detect each ref's sibling).")
+    ap.add_argument("--guard-wall", type=str, default=None,
+                    help="MULTI-WALL auto-stop: wall_id of the known-good wall. At "
+                         "the first eval ≥ --guard-at steps, if its per-wall success "
+                         "< --guard-min the run HALTS (multi-wall co-training is "
+                         "harming the known-good case — the interference signal).")
+    ap.add_argument("--guard-at", type=int, default=2_000_000,
+                    help="step count at which the --guard-wall check fires (default 2M).")
+    ap.add_argument("--guard-min", type=float, default=0.5,
+                    help="min per-wall success for --guard-wall to pass (default 0.5).")
     ap.add_argument("--steps", type=int, default=60000)
     ap.add_argument("--n-envs", type=int, default=4)
     ap.add_argument("--run-id", type=str, default="imitation/smoke")
@@ -2197,6 +2651,11 @@ def main() -> None:
         ref.save(args.ref, wall=wall, env_mode="author")
         print(f"Authored move {move['move_k']} → {args.ref}  {diag}")
 
+    # Multi-wall: a comma-separated list of refs, each resolving its own wall.
+    ref_paths = [s.strip() for s in args.refs.split(",")] if args.refs else None
+    wall_jsons = ([s.strip() or None for s in args.wall_jsons.split(",")]
+                  if args.wall_jsons else None)
+
     # Auto-detect the sibling wall JSON a CMA-ES reference saves next to itself.
     wall_json = args.wall_json
     if wall_json is None:
@@ -2210,7 +2669,40 @@ def main() -> None:
         collect_landings(args.model, args.ref, focus_stance=args.milestone_focus_stance,
                          out_path=args.landing_bank, n_landings=args.n_landings,
                          vecnorm=args.vecnorm, wall_json=wall_json, icfg=icfg)
-    if args.eval:
+    if args.eval and ref_paths:
+        # Multi-wall per-wall frame-0 eval.
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+        pairs = load_pairs(ref_paths, wall_jsons)
+        model = PPO.load(args.model)
+        # Auto-enable phase_obs off the first pair (all pairs share obs dim).
+        _r0, _w0, _p0 = pairs[0]
+        icfg = _maybe_enable_phase_obs(model, _r0, _w0, _p0, icfg)
+        _dims_env = ImitationEnv(_r0, _w0, _p0, icfg)
+        # Multi-wall checkpoint: no single wall_hash — validate dims + env_mode.
+        am.validate_checkpoint(args.model,
+                               obs_dim=int(_dims_env.observation_space.shape[0]),
+                               action_dim=int(_dims_env.action_space.shape[0]),
+                               env_mode=_imitate_env_mode(icfg))
+        _dims_env.close()
+        vn = None
+        if args.vecnorm and Path(args.vecnorm).exists():
+            vn = VecNormalize.load(
+                args.vecnorm,
+                DummyVecEnv([lambda: MultiRefImitationEnv(pairs, icfg)]))
+            vn.training = False
+        per, agg = eval_frame0_multi(model, pairs, icfg, vec_normalize=vn,
+                                     n_episodes=args.eval_episodes)
+        label = "CHAIN(bottom→top)" if agg.get("mode") == "chain" else "FRAME-0"
+        print(f"★ MULTI-WALL {label} success  AGG {agg['success']*100:.1f}%  "
+              f"({agg['n_succ']}/{agg['n_episodes']} eps)")
+        for wid, r in per.items():
+            print(f"    {wid:<20s} {r['success']*100:5.1f}%  "
+                  f"({r['n_succ']}/{r['n_episodes']} eps, mean len {r['mean_len']:.0f}, "
+                  f"furthest stance {r['mean_furthest_stance']:.1f}, "
+                  f"com_y {r['mean_com_y']:.3f} m, net rise {r['mean_net_rise']:+.3f} m; "
+                  f"exact-id {r['success_exact']*100:.0f}%)")
+    elif args.eval:
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
         ref = Reference.load(args.ref)
@@ -2237,6 +2729,8 @@ def main() -> None:
               f"mean furthest stance {res['mean_furthest_stance']:.1f}, "
               f"com_y {res['mean_com_y']:.3f} m, "
               f"net com rise {res['mean_net_rise']:+.3f} m)")
+        print(f"    [diagnostic] exact-hold-id success: {res['success_exact']*100:.1f}%  "
+              f"({res['n_exact']}/{res['n_episodes']} eps)")
     if args.record:
         record_video(args.model, args.ref, args.record, vecnorm=args.vecnorm,
                      wall_json=wall_json, r_min=args.r_min_end,
@@ -2244,9 +2738,16 @@ def main() -> None:
                      cam_distance=args.cam_distance, base_icfg=icfg)
     if args.smoke:
         smoke(args.ref, icfg, wall_json)
-    if args.train:
+    if args.train and ref_paths:
+        train_multi(ref_paths, steps=args.steps, n_envs=args.n_envs, run_id=args.run_id,
+                    icfg=icfg, wall_jsons=wall_jsons, load_run=args.load,
+                    ent_coef=args.ent_coef, guard_wall=args.guard_wall,
+                    guard_at=args.guard_at, guard_min=args.guard_min)
+    elif args.train:
         train(args.ref, steps=args.steps, n_envs=args.n_envs, run_id=args.run_id,
-              icfg=icfg, wall_json=wall_json, load_run=args.load, ent_coef=args.ent_coef)
+              icfg=icfg, wall_json=wall_json, load_run=args.load, ent_coef=args.ent_coef,
+              stop_flat_after=args.stop_flat_after, stop_flat_evals=args.stop_flat_evals,
+              stop_flat_min_stance=args.stop_flat_min_stance)
 
 
 if __name__ == "__main__":
