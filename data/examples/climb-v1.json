@@ -1,0 +1,79 @@
+{
+  "wall_id": "climb-v1",
+  "name": "Climb Route V1 — 4 feet, 5 hands, tall vertical",
+  "grid": { "cols": 8, "rows": 18, "cell_size_cm": 20 },
+  "holds": [
+    {
+      "hold_id": "h_001",
+      "grid_x": 2, "grid_y": 1,
+      "hold_type": "foothold", "orientation_deg": 0,
+      "size": "medium", "color": "#a855f7",
+      "is_start": false, "is_finish": false,
+      "max_force_n": 1200
+    },
+    {
+      "hold_id": "h_002",
+      "grid_x": 5, "grid_y": 1,
+      "hold_type": "foothold", "orientation_deg": 0,
+      "size": "medium", "color": "#a855f7",
+      "is_start": false, "is_finish": false,
+      "max_force_n": 1200
+    },
+    {
+      "hold_id": "h_003",
+      "grid_x": 2, "grid_y": 4,
+      "hold_type": "jug", "orientation_deg": 0,
+      "size": "large", "color": "#22c55e",
+      "is_start": true, "is_finish": false,
+      "max_force_n": 2000
+    },
+    {
+      "hold_id": "h_004",
+      "grid_x": 5, "grid_y": 4,
+      "hold_type": "jug", "orientation_deg": 0,
+      "size": "large", "color": "#22c55e",
+      "is_start": true, "is_finish": false,
+      "max_force_n": 2000
+    },
+    {
+      "hold_id": "h_005",
+      "grid_x": 3, "grid_y": 6,
+      "hold_type": "foothold", "orientation_deg": 0,
+      "size": "medium", "color": "#a855f7",
+      "is_start": false, "is_finish": false,
+      "max_force_n": 1200
+    },
+    {
+      "hold_id": "h_006",
+      "grid_x": 4, "grid_y": 6,
+      "hold_type": "foothold", "orientation_deg": 0,
+      "size": "medium", "color": "#a855f7",
+      "is_start": false, "is_finish": false,
+      "max_force_n": 1200
+    },
+    {
+      "hold_id": "h_007",
+      "grid_x": 2, "grid_y": 9,
+      "hold_type": "jug", "orientation_deg": 0,
+      "size": "large", "color": "#22c55e",
+      "is_start": false, "is_finish": false,
+      "max_force_n": 2000
+    },
+    {
+      "hold_id": "h_008",
+      "grid_x": 5, "grid_y": 9,
+      "hold_type": "jug", "orientation_deg": 0,
+      "size": "large", "color": "#22c55e",
+      "is_start": false, "is_finish": false,
+      "max_force_n": 2000
+    },
+    {
+      "hold_id": "h_009",
+      "grid_x": 3, "grid_y": 14,
+      "hold_type": "jug", "orientation_deg": 0,
+      "size": "large", "color": "#ef4444",
+      "is_start": false, "is_finish": true,
+      "max_force_n": 2000
+    }
+  ]
+}

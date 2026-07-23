@@ -1,0 +1,14 @@
+
+=== wall 1/1: batch-s300.json ===
+  first-move probe: RH→h_040 (k=17, reach_d0=0.081)  gap=0.082m  landed=True  tight=False
+  first-move probe: RH→h_020 (k=8, reach_d0=0.107)  gap=0.028m  landed=True  tight=True
+  first-move probe: LH→h_045 (k=22, reach_d0=0.12)  gap=0.075m  landed=True  tight=False
+  first-move probe: LH→h_023 (k=11, reach_d0=0.128)  gap=1.516m  landed=False  tight=False
+  → selected first move RH→h_020 (k=8, probe gap 0.028m)
+  step 0: RH->h_020  gap=0.015m  gain=+0.092m  hold=True  tries=2  passed=True
+    probe LF->h_001: gap=0.024 gain=+0.048 hold=True pass=True
+  step 1: LF->h_001  gap=0.024m  gain=+0.048m  hold=True  tries=1  passed=True
+    probe RF->h_006: gap=0.071 gain=+0.012 hold=True pass=False
+    probe RF->h_007: gap=0.075 gain=+0.031 hold=True pass=False
+    probe RF->h_002: gap=0.080 gain=-0.003 hold=False pass=False
+    probe LH->h_028: gap=0.674 gain=-0.258 hold=False pass=False

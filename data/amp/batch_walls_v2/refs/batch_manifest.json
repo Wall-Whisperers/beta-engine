@@ -1,0 +1,182 @@
+{
+  "generated": "2026-07-14T16:02:41",
+  "wall_dir": "data/amp/batch_walls_v2",
+  "out_dir": "data/amp/batch_walls_v2/refs",
+  "config": {
+    "per_wall_timeout": 8100.0,
+    "max_moves": 8,
+    "move_retries": 4,
+    "max_evals": 320,
+    "foot_max_evals": 460,
+    "resume": true,
+    "chain_attempt_timeout": 2700.0,
+    "chain_reseeds": 3
+  },
+  "walls": [
+    {
+      "wall": "data/amp/batch_walls_v2/batch-s10270.json",
+      "wall_id": "batch-s10270",
+      "cell_size_cm": 5.0,
+      "n_holds": 109,
+      "n_moves": 6,
+      "moves": [
+        {
+          "step": 0,
+          "mover": "RH",
+          "target": "h_023",
+          "gap": 0.01,
+          "gain": 0.076,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 1,
+          "mover": "LH",
+          "target": "h_040",
+          "gap": 0.027,
+          "gain": 0.528,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 2,
+          "mover": "RH",
+          "target": "h_027",
+          "gap": 0.033,
+          "gain": 0.117,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 3,
+          "mover": "RF",
+          "target": "h_018",
+          "gap": 0.014,
+          "gain": 0.229,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 4,
+          "mover": "LH",
+          "target": "h_044",
+          "gap": 0.05,
+          "gain": 0.138,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 5,
+          "mover": "RF",
+          "target": "fd_026",
+          "gap": 0.003,
+          "gain": 0.103,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        }
+      ],
+      "net_pelvis_rise": -0.073,
+      "holdable_fraction": 1.0,
+      "abort_reason": "no gate-passing move from step 5; chain complete or stuck",
+      "limbs_moved": [
+        "LH",
+        "RF",
+        "RH"
+      ],
+      "all_gates_pass": false,
+      "success": true,
+      "n_chain_attempts": 3,
+      "ref": "data/amp/batch_walls_v2/refs/ref_batch-s10270.npz",
+      "seconds": 7244.4
+    },
+    {
+      "wall": "data/amp/batch_walls_v2/batch-s11267.json",
+      "wall_id": "batch-s11267",
+      "cell_size_cm": 5.0,
+      "n_holds": 130,
+      "n_moves": 5,
+      "moves": [
+        {
+          "step": 0,
+          "mover": "RH",
+          "target": "h_027",
+          "gap": 0.026,
+          "gain": 0.081,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 1,
+          "mover": "RH",
+          "target": "h_051",
+          "gap": 0.024,
+          "gain": 0.136,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 2,
+          "mover": "RF",
+          "target": "h_018",
+          "gap": 0.007,
+          "gain": 0.066,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 3,
+          "mover": "LF",
+          "target": "fd_044",
+          "gap": 0.003,
+          "gain": 0.081,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 4,
+          "mover": "RH",
+          "target": "h_035",
+          "gap": 0.014,
+          "gain": 0.148,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        }
+      ],
+      "net_pelvis_rise": 0.016,
+      "holdable_fraction": 1.0,
+      "abort_reason": "no gate-passing move from step 4; chain complete or stuck",
+      "limbs_moved": [
+        "LF",
+        "RF",
+        "RH"
+      ],
+      "all_gates_pass": false,
+      "success": true,
+      "n_chain_attempts": 3,
+      "ref": "data/amp/batch_walls_v2/refs/ref_batch-s11267.npz",
+      "seconds": 8133.9
+    }
+  ]
+}

@@ -104,14 +104,14 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
     Tree layout — DOF count in parens:
 
         pelvis (free, 6)
-        ├── chest (spine_lean, 1)
+        ├── chest (spine_lean + spine_lat + spine_twist, 3)
         │   ├── head
         │   ├── L shoulder (3) → upper_arm → elbow (1) → forearm → wrist (1) → hand
         │   └── R shoulder (3) → upper_arm → elbow (1) → forearm → wrist (1) → hand
         ├── L thigh (hip 3) → shin (knee 1) → foot (ankle 1)
         └── R thigh (hip 3) → shin (knee 1) → foot (ankle 1)
 
-    Total non-free DOF: 1 + 5×2 + 5×2 = 21, plus 6 free = 27.
+    Total non-free DOF: 3 + 5×2 + 5×2 = 23, plus 6 free = 29.
 
     Collision groups:
         contype=1, conaffinity=1 — torso/limbs
@@ -163,8 +163,12 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
         <site name="site_com" pos="0 0 0" size="0.02" rgba="1 1 0 0.4"/>
 
         <body name="chest" pos="0 0 {0.12:.4f}">
-            <joint name="spine_lean" type="hinge" axis="1 0 0"
+            <joint name="spine_lean" type="hinge" axis="1 0 0" class="j_spine"
                    range="{R('spine_lean')}" {P('spine_lean')}/>
+            <joint name="spine_lat" type="hinge" axis="0 1 0" class="j_spine"
+                   range="{R('spine_lat')}" {P('spine_lat')}/>
+            <joint name="spine_twist" type="hinge" axis="0 0 1" class="j_spine"
+                   range="{R('spine_twist')}" {P('spine_twist')}/>
             <geom name="g_chest" type="ellipsoid"
                   size="{sw*0.9:.4f} 0.115 {s.spine/2:.4f}"
                   pos="0 0 {s.spine/2:.4f}"
@@ -181,20 +185,22 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
             </body>
 
             <!-- LEFT ARM -->
-            <body name="l_upperarm" pos="{-sw:.4f} 0 {s.spine - 0.05:.4f}">
-                <joint name="l_shoulder_az"   type="hinge" axis="0 1 0"
+            <body name="l_upperarm" pos="{-sw:.4f} 0 {s.spine - 0.12:.4f}">
+                <joint name="l_shoulder_az"   type="hinge" axis="0 1 0" class="j_shoulder"
                        range="{R('shoulder_az')}"   {P('shoulder_az')}/>
-                <joint name="l_shoulder_el"   type="hinge" axis="1 0 0"
+                <joint name="l_shoulder_el"   type="hinge" axis="1 0 0" class="j_shoulder"
                        range="{R('shoulder_el')}"   {P('shoulder_el')}/>
-                <joint name="l_shoulder_roll" type="hinge" axis="0 0 1"
+                <joint name="l_shoulder_roll" type="hinge" axis="0 0 1" class="j_shoulder"
                        range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
+                <geom name="g_l_shoulder" type="sphere" size="0.080" pos="0 0 0"
+                      mass="0.0" rgba="{skin}" contype="0" conaffinity="0"/>
                 {capsule("g_l_upperarm", s.upper_arm, 0.051, m.upper_arm, skin)}
                 <body name="l_forearm" pos="0 0 {-s.upper_arm:.4f}">
-                    <joint name="l_elbow" type="hinge" axis="1 0 0"
+                    <joint name="l_elbow" type="hinge" axis="1 0 0" class="j_elbow"
                            range="{R('elbow')}" {P('elbow')}/>
                     {capsule("g_l_forearm", s.forearm, 0.046, m.forearm, skin)}
                     <body name="l_hand" pos="0 0 {-s.forearm:.4f}">
-                        <joint name="l_wrist" type="hinge" axis="1 0 0"
+                        <joint name="l_wrist" type="hinge" axis="1 0 0" class="j_wrist"
                                range="{R('wrist')}" {P('wrist')}/>
                         <geom name="g_l_hand" type="ellipsoid"
                               size="{hand_half[0]:.4f} {hand_half[1]:.4f} {hand_half[2]:.4f}"
@@ -210,21 +216,29 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
                 </body>
             </body>
 
-            <!-- RIGHT ARM -->
-            <body name="r_upperarm" pos="{sw:.4f} 0 {s.spine - 0.05:.4f}">
-                <joint name="r_shoulder_az"   type="hinge" axis="0 1 0"
+            <!-- RIGHT ARM. The body is mirrored across the sagittal (x=0)
+                 plane, so the Y-axis (az) and Z-axis (roll) hinges are
+                 negated relative to the left arm. Without this, a positive
+                 shoulder_az adducts the right arm across the chest instead of
+                 abducting it outward (the "bends the wrong way" bug). X-axis
+                 flexion joints (el, elbow, wrist) stay un-negated — flexion is
+                 mirror-symmetric in the same rotational sense. -->
+            <body name="r_upperarm" pos="{sw:.4f} 0 {s.spine - 0.12:.4f}">
+                <joint name="r_shoulder_az"   type="hinge" axis="0 -1 0" class="j_shoulder"
                        range="{R('shoulder_az')}"   {P('shoulder_az')}/>
-                <joint name="r_shoulder_el"   type="hinge" axis="1 0 0"
+                <joint name="r_shoulder_el"   type="hinge" axis="1 0 0" class="j_shoulder"
                        range="{R('shoulder_el')}"   {P('shoulder_el')}/>
-                <joint name="r_shoulder_roll" type="hinge" axis="0 0 1"
+                <joint name="r_shoulder_roll" type="hinge" axis="0 0 -1" class="j_shoulder"
                        range="{R('shoulder_roll')}" {P('shoulder_roll')}/>
+                <geom name="g_r_shoulder" type="sphere" size="0.080" pos="0 0 0"
+                      mass="0.0" rgba="{skin}" contype="0" conaffinity="0"/>
                 {capsule("g_r_upperarm", s.upper_arm, 0.051, m.upper_arm, skin)}
                 <body name="r_forearm" pos="0 0 {-s.upper_arm:.4f}">
-                    <joint name="r_elbow" type="hinge" axis="1 0 0"
+                    <joint name="r_elbow" type="hinge" axis="1 0 0" class="j_elbow"
                            range="{R('elbow')}" {P('elbow')}/>
                     {capsule("g_r_forearm", s.forearm, 0.046, m.forearm, skin)}
                     <body name="r_hand" pos="0 0 {-s.forearm:.4f}">
-                        <joint name="r_wrist" type="hinge" axis="1 0 0"
+                        <joint name="r_wrist" type="hinge" axis="1 0 0" class="j_wrist"
                                range="{R('wrist')}" {P('wrist')}/>
                         <geom name="g_r_hand" type="ellipsoid"
                               size="{hand_half[0]:.4f} {hand_half[1]:.4f} {hand_half[2]:.4f}"
@@ -241,60 +255,66 @@ def _build_climber_xml(profile: ClimberProfile, start_pos_m: tuple[float, float,
             </body>
         </body>
 
-        <!-- LEFT LEG -->
+        <!-- LEFT LEG. hip_flex axis is -X (not +X): the climber faces the wall
+             at -Y, so anatomical hip flexion must swing the knee toward the
+             wall (-Y) for high steps. With +X the leg could only flex 20°
+             forward vs 140° backward, so the welds contorted the knee to reach
+             footholds (the "knee bends backward" bug). Foot tip sites point -Y
+             (toes toward the wall), not +Y. -->
         <body name="l_thigh" pos="{-pw:.4f} 0 {-0.06:.4f}">
-            <joint name="l_hip_flex"   type="hinge" axis="1 0 0"
+            <joint name="l_hip_flex"   type="hinge" axis="-1 0 0" class="j_hip"
                    range="{R('hip_flex')}"   {P('hip_flex')}/>
-            <joint name="l_hip_abduct" type="hinge" axis="0 1 0"
+            <joint name="l_hip_abduct" type="hinge" axis="0 1 0" class="j_hip"
                    range="{R('hip_abduct')}" {P('hip_abduct')}/>
-            <joint name="l_hip_rot"    type="hinge" axis="0 0 1"
+            <joint name="l_hip_rot"    type="hinge" axis="0 0 1" class="j_hip"
                    range="{R('hip_rot')}"    {P('hip_rot')}/>
             {capsule("g_l_thigh", s.thigh, 0.086, m.thigh, cloth)}
             <body name="l_shin" pos="0 0 {-s.thigh:.4f}">
-                <joint name="l_knee" type="hinge" axis="1 0 0"
+                <joint name="l_knee" type="hinge" axis="1 0 0" class="j_knee"
                        range="{R('knee')}" {P('knee')}/>
                 {capsule("g_l_shin", s.shin, 0.056, m.shin, skin)}
                 <body name="l_foot" pos="0 0 {-s.shin - foot_half[2]:.4f}">
-                    <joint name="l_ankle" type="hinge" axis="1 0 0"
+                    <joint name="l_ankle" type="hinge" axis="1 0 0" class="j_ankle"
                            range="{R('ankle')}" {P('ankle')}/>
                     <geom name="g_l_foot" type="ellipsoid"
                           size="{foot_half[0]:.4f} {foot_half[1]:.4f} {foot_half[2]:.4f}"
                           mass="{m.foot:.3f}" rgba="0.10 0.10 0.10 1"
                           friction="{foot_fric}"/>
                     <site name="{LIMB_TIP_SITE['LF']}"
-                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
+                          pos="0 {-foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
                           size="0.015" rgba="0 1 0 0.6"/>
                     <body name="{LIMB_TIP_BODY['LF']}"
-                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
+                          pos="0 {-foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
                 </body>
             </body>
         </body>
 
-        <!-- RIGHT LEG -->
+        <!-- RIGHT LEG. Y-axis (abduct) and Z-axis (rot) hinges negated vs the
+             left leg for the same mirror reason as the right arm. -->
         <body name="r_thigh" pos="{pw:.4f} 0 {-0.06:.4f}">
-            <joint name="r_hip_flex"   type="hinge" axis="1 0 0"
+            <joint name="r_hip_flex"   type="hinge" axis="-1 0 0" class="j_hip"
                    range="{R('hip_flex')}"   {P('hip_flex')}/>
-            <joint name="r_hip_abduct" type="hinge" axis="0 1 0"
+            <joint name="r_hip_abduct" type="hinge" axis="0 -1 0" class="j_hip"
                    range="{R('hip_abduct')}" {P('hip_abduct')}/>
-            <joint name="r_hip_rot"    type="hinge" axis="0 0 1"
+            <joint name="r_hip_rot"    type="hinge" axis="0 0 -1" class="j_hip"
                    range="{R('hip_rot')}"    {P('hip_rot')}/>
             {capsule("g_r_thigh", s.thigh, 0.086, m.thigh, cloth)}
             <body name="r_shin" pos="0 0 {-s.thigh:.4f}">
-                <joint name="r_knee" type="hinge" axis="1 0 0"
+                <joint name="r_knee" type="hinge" axis="1 0 0" class="j_knee"
                        range="{R('knee')}" {P('knee')}/>
                 {capsule("g_r_shin", s.shin, 0.056, m.shin, skin)}
                 <body name="r_foot" pos="0 0 {-s.shin - foot_half[2]:.4f}">
-                    <joint name="r_ankle" type="hinge" axis="1 0 0"
+                    <joint name="r_ankle" type="hinge" axis="1 0 0" class="j_ankle"
                            range="{R('ankle')}" {P('ankle')}/>
                     <geom name="g_r_foot" type="ellipsoid"
                           size="{foot_half[0]:.4f} {foot_half[1]:.4f} {foot_half[2]:.4f}"
                           mass="{m.foot:.3f}" rgba="0.10 0.10 0.10 1"
                           friction="{foot_fric}"/>
                     <site name="{LIMB_TIP_SITE['RF']}"
-                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
+                          pos="0 {-foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"
                           size="0.015" rgba="0 1 0 0.6"/>
                     <body name="{LIMB_TIP_BODY['RF']}"
-                          pos="0 {foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
+                          pos="0 {-foot_half[1]*0.6:.4f} {-foot_half[2]:.4f}"/>
                 </body>
             </body>
         </body>
@@ -464,6 +484,87 @@ def _build_wall_xml(wall: Wall) -> tuple[str, list[dict]]:
     return wall_xml, hold_meta
 
 
+# ─── Kickboard ────────────────────────────────────────────────────────────
+def _build_kickboard_xml(
+    wall: Wall,
+) -> tuple[str, list[dict]]:
+    """Emit a near-vertical kickboard plate below/in front of the main wall.
+
+    Returns (xml, foothold_meta). Each foothold is synthesized as a real hold
+    (contype=2 cylinder) so the env's grip machinery treats it identically to
+    a wall hold. IDs are prefixed ``kb_`` and ``hold_type`` is set to
+    ``foothold`` so hands cannot use them.
+    """
+    width = cfg.KICKBOARD_WIDTH_M
+    height = cfg.KICKBOARD_HEIGHT_M
+    thickness = cfg.KICKBOARD_THICKNESS_M
+    angle = math.radians(cfg.KICKBOARD_ANGLE_DEG)
+
+    # Position the kickboard centred at x=0, sitting on the floor in front of
+    # the main wall surface. We push it forward in +Y so the plate's front
+    # face is slightly in front of the main wall's lowest hold protrude depth.
+    plate_cx = 0.0
+    # Main wall bottom sits at z=0; kickboard rises from z=0 to height.
+    plate_cz = height / 2.0
+    # In front of the main wall: a small positive Y so the upper edge of the
+    # kickboard sits clear of the main plate's near face.
+    plate_cy = 0.35
+
+    # Slight backward tilt (top toward main wall) so feet press into it.
+    plate_axisangle = f"1 0 0 {-angle:.5f}"
+    plate_half = (width / 2.0, thickness / 2.0, height / 2.0)
+
+    xml_parts = [
+        f'<body name="kickboard" pos="{plate_cx:.5f} {plate_cy:.5f} {plate_cz:.5f}" '
+        f'axisangle="{plate_axisangle}">',
+        f'<geom name="g_kickboard" type="box" '
+        f'size="{plate_half[0]:.4f} {plate_half[1]:.4f} {plate_half[2]:.4f}" '
+        f'rgba="0.40 0.30 0.22 1" friction="1.0 0.005 0.001" '
+        f'contype="1" conaffinity="1"/>',
+    ]
+
+    foothold_meta: list[dict] = []
+    cyl_axisangle = "1 0 0 -1.5708"
+    cos_a = math.cos(-angle)
+    sin_a = math.sin(-angle)
+    nx, ny, nz = 0.0, cos_a, -sin_a
+    for hid_suffix, lx, lz in cfg.KICKBOARD_FOOTHOLDS:
+        local_x = lx
+        local_z_plane = lz - height / 2.0  # plate-local z (plate origin at centre)
+        local_y_out = plate_half[1] + cfg.HOLD_PROTRUDE_M / 2.0
+        radius = cfg.HOLD_RADIUS_BY_SIZE_M["large"]
+        xml_parts.append(
+            f'<geom name="hold_kb_{hid_suffix}" type="cylinder" '
+            f'pos="{local_x:.4f} {local_y_out:.4f} {local_z_plane:.4f}" '
+            f'size="{radius:.4f} {cfg.HOLD_PROTRUDE_M/2:.4f}" '
+            f'axisangle="{cyl_axisangle}" '
+            f'rgba="0.85 0.65 0.20 1.0" '
+            f'friction="1.4 0.01 0.005" contype="2" conaffinity="2"/>'
+        )
+        # World position of the hold tip.
+        local_y_tip = local_y_out + cfg.HOLD_PROTRUDE_M / 2.0
+        world_x = plate_cx + local_x
+        world_y = plate_cy + local_y_tip * cos_a + local_z_plane * sin_a
+        world_z = plate_cz - local_y_tip * sin_a + local_z_plane * cos_a
+        hold_id = f"kb_{hid_suffix}"
+        foothold_meta.append({
+            "hold_id": hold_id,
+            "world_pos": (world_x, world_y, world_z),
+            "wall_normal": (nx, ny, nz),
+            "geom_name": f"hold_kb_{hid_suffix}",
+            "friction": 1.4,
+            "positivity": 1.0,
+            "max_force_n": None,
+            "is_start": False,
+            "is_finish": False,
+            "hold_type": "foothold",
+            "color": "#d8a020",
+            "is_foothold_only": True,
+        })
+    xml_parts.append("</body>")
+    return "\n".join(xml_parts), foothold_meta
+
+
 # ─── Mocap targets + equality constraints ─────────────────────────────────
 def _build_mocap_targets() -> str:
     """One mocap body per limb. Mocap bodies are kinematic — physics
@@ -528,7 +629,9 @@ def _build_actuators() -> str:
     target angle (radians); the actuator servos the joint to that
     angle with a stiff PD plus the joint's passive stiffness/damping."""
     joints = [
-        ("spine_lean", "spine"),
+        ("spine_lean",  "spine"),
+        ("spine_lat",   "spine"),
+        ("spine_twist", "spine"),
         ("l_shoulder_az",   "shoulder"),
         ("l_shoulder_el",   "shoulder"),
         ("l_shoulder_roll", "shoulder"),
@@ -553,16 +656,49 @@ def _build_actuators() -> str:
     parts = []
     for joint, group in joints:
         cap = cfg.TORQUE_CAP_NM[group]
+        kp, kv = cfg.ACTUATOR_GAINS_BY_GROUP.get(
+            group, (cfg.ACTUATOR_KP, cfg.ACTUATOR_KV),
+        )
         parts.append(
             f'<position name="act_{joint}" joint="{joint}" '
-            f'kp="{cfg.ACTUATOR_KP}" kv="{cfg.ACTUATOR_KV}" '
+            f'kp="{kp}" kv="{kv}" '
             f'forcerange="{-cap} {cap}"/>'
         )
     return "\n".join(parts)
 
 
+# ─── Per-joint armature lookup ────────────────────────────────────────────
+_JOINT_GROUP = {
+    "spine_lean":    "spine",
+    "spine_lat":     "spine",
+    "spine_twist":   "spine",
+    "l_shoulder_az": "shoulder", "r_shoulder_az": "shoulder",
+    "l_shoulder_el": "shoulder", "r_shoulder_el": "shoulder",
+    "l_shoulder_roll": "shoulder", "r_shoulder_roll": "shoulder",
+    "l_elbow": "elbow", "r_elbow": "elbow",
+    "l_wrist": "wrist", "r_wrist": "wrist",
+    "l_hip_flex": "hip", "r_hip_flex": "hip",
+    "l_hip_abduct": "hip", "r_hip_abduct": "hip",
+    "l_hip_rot": "hip", "r_hip_rot": "hip",
+    "l_knee": "knee", "r_knee": "knee",
+    "l_ankle": "ankle", "r_ankle": "ankle",
+}
+
+
+def _armature_for_joint(joint_name: str) -> float:
+    group = _JOINT_GROUP.get(joint_name)
+    if group is None:
+        return 0.01
+    return cfg.JOINT_ARMATURE_BY_GROUP.get(group, 0.01)
+
+
 # ─── Top-level builder ────────────────────────────────────────────────────
-def build_mjcf_xml(wall: Wall, profile: ClimberProfile | None = None) -> tuple[str, list[dict]]:
+def build_mjcf_xml(
+    wall: Wall,
+    profile: ClimberProfile | None = None,
+    *,
+    include_kickboard: bool = False,
+) -> tuple[str, list[dict]]:
     """Return (xml_string, hold_meta) for the given wall + climber.
 
     The caller passes the result to `mujoco.MjModel.from_xml_string`.
@@ -579,6 +715,10 @@ def build_mjcf_xml(wall: Wall, profile: ClimberProfile | None = None) -> tuple[s
 
     climber_xml = _build_climber_xml(profile, start_pos)
     wall_xml, hold_meta = _build_wall_xml(wall)
+    kickboard_xml = ""
+    if include_kickboard:
+        kickboard_xml, kb_meta = _build_kickboard_xml(wall)
+        hold_meta = hold_meta + kb_meta
     mocap_xml = _build_mocap_targets()
     eq_xml = _build_equalities_v2()
     act_xml = _build_actuators()
@@ -610,7 +750,21 @@ def build_mjcf_xml(wall: Wall, profile: ClimberProfile | None = None) -> tuple[s
 
   <default>
     <joint armature="0.01" damping="0.5"/>
-    <geom condim="3" margin="0.001"/>
+    <!-- Per-group joint armature. See cfg.JOINT_ARMATURE_BY_GROUP for why
+         the load-bearing joints (hip, spine) get an order of magnitude
+         more reflected inertia than the wrists/ankles. -->
+    <default class="j_shoulder"><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['shoulder']}"/></default>
+    <default class="j_elbow"   ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['elbow']}"/></default>
+    <default class="j_wrist"   ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['wrist']}"/></default>
+    <default class="j_spine"   ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['spine']}"/></default>
+    <default class="j_hip"     ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['hip']}"/></default>
+    <default class="j_knee"    ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['knee']}"/></default>
+    <default class="j_ankle"   ><joint armature="{cfg.JOINT_ARMATURE_BY_GROUP['ankle']}"/></default>
+    <!-- Margin bumped from 0.001 → 0.005. A 1 mm margin is too thin for
+         fast-moving body parts to engage contact against the wall plate
+         before they penetrate; 5 mm gives the constraint solver enough
+         warning to push the head/torso back out. -->
+    <geom condim="3" margin="0.005"/>
   </default>
 
   <worldbody>
@@ -618,6 +772,7 @@ def build_mjcf_xml(wall: Wall, profile: ClimberProfile | None = None) -> tuple[s
     <light name="side" pos="-3 -2 4" dir="0.5 0.3 -0.7" diffuse="0.4 0.4 0.4"/>
     {floor_xml}
     {wall_xml}
+    {kickboard_xml}
     {mocap_xml}
     {climber_xml}
   </worldbody>

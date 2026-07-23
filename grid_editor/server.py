@@ -287,79 +287,10 @@ def solver_solve() -> Any:
     })
 
 
-@app.get("/physics")
-def physics_page() -> Any:
-    return send_from_directory(STATIC_DIR, "physics.html")
-
-
 @app.post("/api/physics/simulate")
 def physics_simulate() -> Any:
-    """Run A* then animate the solution through the physics engine.
-
-    Returns a JSON object with:
-      - solved (bool)
-      - frames: list of base64-encoded PNGs, one per pose
-      - moves: list of move-description strings
-      - n_moves, expanded, stable
-    """
-    body = request.get_json(silent=True) or {}
-    wall_id = body.get("wall_id")
-    if not wall_id:
-        return jsonify({"error": "wall_id required"}), 400
-
-    try:
-        path = _wall_path(str(wall_id))
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    if not path.exists():
-        return jsonify({"error": "wall not found"}), 404
-
-    height_cm   = float(body.get("height_cm",   175.0))
-    wingspan_cm = float(body.get("wingspan_cm", 175.0))
-    mass_kg     = float(body.get("mass_kg",      70.0))
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        from solver.wall import load_wall
-        from solver.body import BodyModel
-        from solver.astar import solve_astar
-        from physics.world import ClimbWorld
-        from physics.body import ClimberProfile
-        from physics.render import render_key_frames
-
-    wall   = load_wall(path)
-    bmodel = BodyModel(height_cm=height_cm, wingspan_cm=wingspan_cm)
-    result = solve_astar(wall, bmodel)
-
-    if result is None:
-        return jsonify({"wall_id": wall_id, "solved": False, "moves": [], "frames": []})
-
-    profile = ClimberProfile(
-        body=bmodel,
-        mass_kg=mass_kg,
-    )
-    world = ClimbWorld(wall, profile)
-
-    start = result.poses[0]
-    world.seed_pose(lh=start.LH, rh=start.RH, lf=start.LF, rf=start.RF)
-
-    frames_b64 = [
-        base64.b64encode(png).decode()
-        for png in render_key_frames(world, result.moves)
-    ]
-
-    stable = world.is_stable()
-    moves  = result.text_steps()
-
-    return jsonify({
-        "wall_id":  wall_id,
-        "solved":   True,
-        "moves":    moves,
-        "n_moves":  len(result.moves),
-        "expanded": result.expanded,
-        "stable":   stable,
-        "frames":   frames_b64,
-    })
+    """Deprecated: the 2D physics package is retired. Returns 410 Gone."""
+    return jsonify({"error": "2D physics has been retired; use sim3d."}), 410
 
 
 @app.get("/api/runs")

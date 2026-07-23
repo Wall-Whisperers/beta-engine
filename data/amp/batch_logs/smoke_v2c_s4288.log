@@ -1,0 +1,40 @@
+
+=== wall 1/1: batch-s4288.json ===
+  first-move probe: LH→h_011 (k=3, reach_d0=0.059)  gap=0.024m  landed=True  tight=True
+  first-move probe: LH→h_015 (k=5, reach_d0=0.11)  gap=0.011m  landed=True  tight=True
+  first-move probe: RH→h_036 (k=18, reach_d0=0.11)  gap=0.054m  landed=True  tight=False
+  first-move probe: LH→h_031 (k=15, reach_d0=0.142)  gap=1.204m  landed=False  tight=False
+  → selected first move LH→h_015 (k=5, probe gap 0.011m)
+  step 0: LH->h_015  gap=0.003m  gain=+0.105m  hold=True  tries=1  passed=True
+    probe RH->h_020: gap=0.197 gain=+0.106 hold=False pass=False
+    probe RH->h_016: gap=0.077 gain=+0.077 hold=True pass=False
+    probe RH->h_051: gap=0.074 gain=+0.177 hold=True pass=False
+    probe RF->fd_006: gap=0.081 gain=+0.047 hold=False pass=False
+    probe RF->fd_004: gap=0.001 gain=+0.067 hold=True pass=True
+  step 1: RF->fd_004  gap=0.001m  gain=+0.067m  hold=True  tries=1  passed=True
+    stand after fd_004: com_gain=+0.073m anchors=4 fell=False
+    probe RH->h_051: gap=0.008 gain=+0.242 hold=True pass=True
+  step 2: RH->h_051  gap=0.008m  gain=+0.242m  hold=True  tries=1  passed=True
+    probe LF->fd_003: gap=0.001 gain=+0.060 hold=True pass=True
+  step 3: LF->fd_003  gap=0.001m  gain=+0.060m  hold=True  tries=1  passed=True
+    stand after fd_003: com_gain=+0.034m anchors=4 fell=False
+    probe RF->fd_006: gap=0.008 gain=+0.066 hold=True pass=True
+  step 4: RF->fd_006  gap=0.008m  gain=+0.066m  hold=True  tries=1  passed=True
+    stand after fd_006: com_gain=+0.026m anchors=4 fell=False
+    probe LF->fd_005: gap=0.020 gain=+0.042 hold=True pass=True
+  step 5: LF->fd_005  gap=0.020m  gain=+0.042m  hold=True  tries=1  passed=True
+    stand after fd_005: com_gain=+0.008m anchors=4 fell=False
+    probe LH->h_019: gap=0.691 gain=-0.276 hold=False pass=False
+    probe LH->h_023: gap=0.792 gain=-0.242 hold=False pass=False
+    probe LH->h_027: gap=0.779 gain=-0.189 hold=False pass=False
+    probe RH->h_020: gap=0.230 gain=-0.096 hold=False pass=False
+    probe RH->h_019: gap=0.356 gain=+0.035 hold=False pass=False
+    probe RH->h_028: gap=0.511 gain=-0.116 hold=False pass=False
+    probe RF->fd_008: gap=0.023 gain=+0.038 hold=True pass=False
+    probe RF->fd_012: gap=0.080 gain=+0.108 hold=False pass=False
+    probe RF->h_006: gap=0.096 gain=+0.075 hold=False pass=False
+    probe LF->fd_007: gap=0.052 gain=+0.009 hold=True pass=False
+  → OK (6 moves, gates_pass=True, net_rise=0.173, 2756.5s)
+
+=== BATCH DONE: 1/1 refs pass ALL gates (1/1 authored ≥1 move) ===
+manifest: data/amp/batch_smoke_v2/refs/batch_manifest.json

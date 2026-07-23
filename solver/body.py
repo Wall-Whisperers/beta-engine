@@ -1,6 +1,6 @@
 """2D body model + closed-form IK for a stick-figure climber.
 
-The model is the 5-point figure described in CLAUDE.md / planning-gabe.md:
+The model is a 5-point stick figure:
 
     - 1 Center Of Mass (COM, treated as the climber's pelvis/torso anchor)
     - 4 end-effectors (left/right hand, left/right foot)

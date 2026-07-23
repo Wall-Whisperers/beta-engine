@@ -1,0 +1,20 @@
+
+=== wall 1/1: batch-s1297.json ===
+  first-move probe: LH→h_048 (k=10, reach_d0=0.069)  gap=0.050m  landed=True  tight=True
+  first-move probe: RH→h_023 (k=12, reach_d0=0.093)  gap=0.070m  landed=True  tight=False
+  first-move probe: RH→h_019 (k=9, reach_d0=0.105)  gap=0.069m  landed=True  tight=False
+  first-move probe: LH→h_012 (k=4, reach_d0=0.108)  gap=0.044m  landed=True  tight=True
+  → selected first move LH→h_012 (k=4, probe gap 0.044m)
+  step 0: LH->h_012  gap=0.009m  gain=+0.103m  hold=True  tries=1  passed=True
+    probe RH->h_011: gap=0.006 gain=+0.127 hold=True pass=True
+  step 1: RH->h_011  gap=0.006m  gain=+0.127m  hold=True  tries=1  passed=True
+    probe RF->fd_012: gap=0.080 gain=+0.044 hold=False pass=False
+    probe RF->fd_011: gap=0.093 gain=+0.109 hold=False pass=False
+    probe RF->fd_014: gap=0.081 gain=+0.146 hold=False pass=False
+    probe LF->fd_011: gap=0.080 gain=+0.043 hold=False pass=False
+    probe LF->fd_012: gap=0.080 gain=+0.055 hold=False pass=False
+    probe LF->fd_013: gap=0.081 gain=+0.135 hold=False pass=False
+  → OK (2 moves, gates_pass=False, net_rise=-0.011, 2726.8s)
+
+=== BATCH DONE: 0/1 refs pass ALL gates (1/1 authored ≥1 move) ===
+manifest: data/amp/batch_smoke_v2/refs/batch_manifest.json

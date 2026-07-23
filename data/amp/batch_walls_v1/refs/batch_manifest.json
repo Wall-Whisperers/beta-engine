@@ -1,0 +1,276 @@
+{
+  "generated": "2026-07-11T06:52:26",
+  "wall_dir": "data/amp/batch_walls_v1",
+  "out_dir": "data/amp/batch_walls_v1/refs",
+  "config": {
+    "per_wall_timeout": 1800.0,
+    "max_moves": 8,
+    "move_retries": 3,
+    "max_evals": 320,
+    "foot_max_evals": 460,
+    "resume": true
+  },
+  "walls": [
+    {
+      "wall": "data/amp/batch_walls_v1/batch-s1297.json",
+      "wall_id": "batch-s1297",
+      "cell_size_cm": 5.0,
+      "n_holds": 123,
+      "n_moves": 4,
+      "moves": [
+        {
+          "step": 0,
+          "mover": "RH",
+          "target": "h_041",
+          "gap": 0.042,
+          "gain": 0.111,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 1,
+          "mover": "LF",
+          "target": "fd_043",
+          "gap": 0.005,
+          "gain": 0.059,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 2,
+          "mover": "LF",
+          "target": "fd_045",
+          "gap": 0.008,
+          "gain": 0.043,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 3,
+          "mover": "RF",
+          "target": "fd_044",
+          "gap": 0.025,
+          "gain": 0.057,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        }
+      ],
+      "net_pelvis_rise": 0.035,
+      "holdable_fraction": 1.0,
+      "abort_reason": "no gate-passing move from step 3; chain complete or stuck",
+      "all_gates_pass": true,
+      "success": true,
+      "ref": "data/amp/batch_walls_v1/refs/ref_batch-s1297.npz",
+      "seconds": 1860.8
+    },
+    {
+      "wall": "data/amp/batch_walls_v1/batch-s300.json",
+      "wall_id": "batch-s300",
+      "cell_size_cm": 5.0,
+      "n_holds": 139,
+      "n_moves": 4,
+      "moves": [
+        {
+          "step": 0,
+          "mover": "RH",
+          "target": "h_020",
+          "gap": 0.016,
+          "gain": 0.083,
+          "holdable": true,
+          "tries": 2,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 1,
+          "mover": "RF",
+          "target": "h_007",
+          "gap": 0.017,
+          "gain": 0.058,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 2,
+          "mover": "LF",
+          "target": "h_002",
+          "gap": 0.022,
+          "gain": 0.051,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 3,
+          "mover": "RH",
+          "target": "h_024",
+          "gap": 0.03,
+          "gain": 0.128,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        }
+      ],
+      "net_pelvis_rise": 0.025,
+      "holdable_fraction": 0.993,
+      "abort_reason": "no gate-passing move from step 3; chain complete or stuck",
+      "all_gates_pass": true,
+      "success": true,
+      "ref": "data/amp/batch_walls_v1/refs/ref_batch-s300.npz",
+      "seconds": 1849.2
+    },
+    {
+      "wall": "data/amp/batch_walls_v1/batch-s3291.json",
+      "wall_id": "batch-s3291",
+      "cell_size_cm": 5.0,
+      "n_holds": 119,
+      "n_moves": 3,
+      "moves": [
+        {
+          "step": 0,
+          "mover": "RH",
+          "target": "h_034",
+          "gap": 0.01,
+          "gain": 0.092,
+          "holdable": true,
+          "tries": 2,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 1,
+          "mover": "LF",
+          "target": "h_051",
+          "gap": 0.023,
+          "gain": 0.043,
+          "holdable": true,
+          "tries": 4,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 2,
+          "mover": "RF",
+          "target": "h_018",
+          "gap": 0.047,
+          "gain": 0.043,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        }
+      ],
+      "net_pelvis_rise": -0.025,
+      "holdable_fraction": 1.0,
+      "abort_reason": "no gate-passing move from step 2; chain complete or stuck",
+      "all_gates_pass": false,
+      "success": true,
+      "ref": "data/amp/batch_walls_v1/refs/ref_batch-s3291.npz",
+      "seconds": 1823.6
+    },
+    {
+      "wall": "data/amp/batch_walls_v1/batch-s4288.json",
+      "wall_id": "batch-s4288",
+      "cell_size_cm": 5.0,
+      "n_holds": 121,
+      "n_moves": 4,
+      "moves": [
+        {
+          "step": 0,
+          "mover": "LH",
+          "target": "h_050",
+          "gap": 0.008,
+          "gain": 0.101,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 1,
+          "mover": "RH",
+          "target": "h_017",
+          "gap": 0.026,
+          "gain": 0.211,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 2,
+          "mover": "RF",
+          "target": "fd_006",
+          "gap": 0.034,
+          "gain": 0.085,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        },
+        {
+          "step": 3,
+          "mover": "LF",
+          "target": "fd_001",
+          "gap": 0.024,
+          "gain": 0.16,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        }
+      ],
+      "net_pelvis_rise": 0.036,
+      "holdable_fraction": 1.0,
+      "abort_reason": "no gate-passing move from step 3; chain complete or stuck",
+      "all_gates_pass": true,
+      "success": true,
+      "ref": "data/amp/batch_walls_v1/refs/ref_batch-s4288.npz",
+      "seconds": 1855.3
+    },
+    {
+      "wall": "data/amp/batch_walls_v1/batch-s5285.json",
+      "wall_id": "batch-s5285",
+      "cell_size_cm": 5.0,
+      "n_holds": 123,
+      "n_moves": 1,
+      "moves": [
+        {
+          "step": 0,
+          "mover": "LH",
+          "target": "h_005",
+          "gap": 0.008,
+          "gain": 0.141,
+          "holdable": true,
+          "tries": 1,
+          "passed": true,
+          "reason": "ok"
+        }
+      ],
+      "net_pelvis_rise": -0.025,
+      "holdable_fraction": 1.0,
+      "abort_reason": "no gate-passing move from step 0; chain complete or stuck",
+      "all_gates_pass": false,
+      "success": true,
+      "ref": "data/amp/batch_walls_v1/refs/ref_batch-s5285.npz",
+      "seconds": 1565.9
+    }
+  ],
+  "summary": {
+    "n_walls": 5,
+    "n_success": 5,
+    "n_all_gates_pass": 3
+  }
+}

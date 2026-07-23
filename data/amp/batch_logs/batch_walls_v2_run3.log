@@ -1,0 +1,197 @@
+
+=== wall 1/10: batch-s10270.json ===
+  first-move probe: RH→h_019 (k=9, reach_d0=0.047)  gap=0.024m  landed=True  tight=True
+  first-move probe: RH→h_027 (k=13, reach_d0=0.079)  gap=0.032m  landed=True  tight=True
+  first-move probe: RH→h_023 (k=11, reach_d0=0.085)  gap=0.014m  landed=True  tight=True
+  first-move probe: RH→h_031 (k=15, reach_d0=0.085)  gap=0.032m  landed=True  tight=True
+  → selected first move RH→h_023 (k=11, probe gap 0.014m)
+  step 0: RH->h_023  gap=0.018m  gain=+0.075m  hold=True  tries=1  passed=True
+    probe LH->h_044: gap=0.042 gain=+0.669 hold=True pass=True
+  step 1: LH->h_044  gap=0.042m  gain=+0.669m  hold=True  tries=1  passed=True
+    probe RH->h_027: gap=0.072 gain=+0.096 hold=True pass=False
+    probe RH->h_031: gap=0.243 gain=+0.139 hold=False pass=False
+    probe RH->h_035: gap=0.342 gain=+0.103 hold=False pass=False
+    probe RF->fd_021: gap=0.082 gain=+0.098 hold=False pass=False
+    probe RF->h_018: gap=0.059 gain=+0.262 hold=True pass=True
+  step 2: RF->h_018  gap=0.059m  gain=+0.262m  hold=True  tries=1  passed=True
+    stand after h_018: com_gain=+0.041m anchors=4 fell=False
+    probe RH->h_027: gap=0.104 gain=+0.087 hold=False pass=False
+    probe RH->h_031: gap=0.217 gain=+0.112 hold=False pass=False
+    probe RH->h_035: gap=0.313 gain=+0.139 hold=False pass=False
+    probe LF->fd_019: gap=0.079 gain=-0.001 hold=True pass=False
+    probe LF->h_014: gap=0.128 gain=-0.028 hold=False pass=False
+    probe LF->fd_020: gap=0.153 gain=-0.024 hold=False pass=False
+    probe RF->fd_027: gap=0.002 gain=+0.069 hold=True pass=True
+  step 3: RF->fd_027  gap=0.002m  gain=+0.069m  hold=True  tries=1  passed=True
+    stand after fd_027: com_gain=+0.042m anchors=4 fell=False
+    probe RH->h_027: gap=0.122 gain=+0.112 hold=False pass=False
+    probe RH->h_031: gap=0.220 gain=+0.131 hold=False pass=False
+    probe RH->h_035: gap=0.339 gain=+0.123 hold=False pass=False
+    probe LF->fd_019: gap=0.111 gain=-0.030 hold=False pass=False
+    probe LF->h_014: gap=0.125 gain=-0.031 hold=False pass=False
+    probe LF->fd_020: gap=0.161 gain=-0.030 hold=False pass=False
+    reseed best RH->h_027: gap=0.110 pass=False tries=5
+  step 0: RH->h_023  gap=0.010m  gain=+0.073m  hold=True  tries=1  passed=True
+    probe LH->h_044: gap=0.037 gain=+0.696 hold=True pass=True
+  step 1: LH->h_044  gap=0.037m  gain=+0.696m  hold=True  tries=1  passed=True
+    probe RH->h_031: gap=0.116 gain=+0.184 hold=False pass=False
+    probe RH->h_032: gap=0.206 gain=+0.106 hold=False pass=False
+    probe RH->h_027: gap=0.020 gain=+0.123 hold=True pass=True
+  step 2: RH->h_027  gap=0.020m  gain=+0.123m  hold=True  tries=1  passed=True
+    probe RF->h_014: gap=0.097 gain=-0.013 hold=False pass=False
+    probe RF->h_013: gap=0.102 gain=-0.012 hold=False pass=False
+    probe RF->fd_019: gap=0.124 gain=-0.031 hold=False pass=False
+    probe LF->h_014: gap=0.080 gain=-0.005 hold=False pass=False
+    probe LF->fd_019: gap=0.080 gain=-0.007 hold=False pass=False
+    probe LF->fd_020: gap=0.081 gain=+0.045 hold=False pass=False
+    probe RH->h_031: gap=0.119 gain=+0.060 hold=False pass=False
+    probe RH->h_032: gap=0.219 gain=-0.042 hold=False pass=False
+    probe RH->h_035: gap=0.277 gain=+0.068 hold=False pass=False
+    reseed best LF->h_014: gap=0.075 pass=False tries=5
+  step 0: RH->h_023  gap=0.010m  gain=+0.076m  hold=True  tries=1  passed=True
+    probe LH->h_044: gap=0.079 gain=+0.662 hold=True pass=False
+    probe LH->h_040: gap=0.027 gain=+0.528 hold=True pass=True
+  step 1: LH->h_040  gap=0.027m  gain=+0.528m  hold=True  tries=1  passed=True
+    probe RH->h_027: gap=0.033 gain=+0.117 hold=True pass=True
+  step 2: RH->h_027  gap=0.033m  gain=+0.117m  hold=True  tries=1  passed=True
+    probe RF->h_018: gap=0.014 gain=+0.229 hold=True pass=True
+  step 3: RF->h_018  gap=0.014m  gain=+0.229m  hold=True  tries=1  passed=True
+    stand after h_018: com_gain=+0.057m anchors=4 fell=False
+    probe LF->fd_019: gap=0.082 gain=-0.005 hold=False pass=False
+    probe LF->h_014: gap=0.080 gain=-0.003 hold=False pass=False
+    probe LF->h_013: gap=0.091 gain=-0.012 hold=False pass=False
+    probe RH->h_031: gap=0.134 gain=+0.060 hold=False pass=False
+    probe RH->h_035: gap=0.323 gain=+0.040 hold=False pass=False
+    probe RH->h_032: gap=0.379 gain=+0.008 hold=False pass=False
+    probe LH->h_044: gap=0.050 gain=+0.138 hold=True pass=True
+  step 4: LH->h_044  gap=0.050m  gain=+0.138m  hold=True  tries=1  passed=True
+    probe LF->fd_019: gap=0.087 gain=+0.002 hold=False pass=False
+    probe LF->fd_020: gap=0.134 gain=+0.002 hold=False pass=False
+    probe LF->h_014: gap=0.120 gain=+0.001 hold=False pass=False
+    probe RF->fd_026: gap=0.003 gain=+0.103 hold=True pass=True
+  step 5: RF->fd_026  gap=0.003m  gain=+0.103m  hold=True  tries=1  passed=True
+    stand after fd_026: com_gain=+0.025m anchors=4 fell=False
+    probe LF->fd_019: gap=0.099 gain=+0.006 hold=False pass=False
+    probe LF->fd_020: gap=0.136 gain=+0.012 hold=False pass=False
+    probe LF->h_014: gap=0.131 gain=-0.004 hold=False pass=False
+    probe RH->h_031: gap=0.283 gain=+0.034 hold=False pass=False
+    probe RH->h_032: gap=0.328 gain=+0.035 hold=False pass=False
+    probe RH->h_035: gap=0.473 gain=+0.030 hold=False pass=False
+    probe RF->h_022: gap=0.057 gain=-0.007 hold=True pass=False
+    probe RF->h_052: gap=0.078 gain=-0.007 hold=True pass=False
+    probe RF->fd_029: gap=0.083 gain=+0.088 hold=False pass=False
+    reseed best RF->h_022: gap=0.057 pass=False tries=3
+  → OK (6 moves, gates_pass=False, net_rise=-0.073, attempts=3, 7244.4s)
+
+=== wall 2/10: batch-s11267.json ===
+  first-move probe: RH→h_027 (k=15, reach_d0=0.083)  gap=0.038m  landed=True  tight=True
+  first-move probe: RH→h_039 (k=22, reach_d0=0.103)  gap=0.065m  landed=True  tight=False
+  first-move probe: RH→h_015 (k=9, reach_d0=0.126)  gap=0.045m  landed=True  tight=True
+  first-move probe: RH→h_020 (k=11, reach_d0=0.128)  gap=0.089m  landed=True  tight=False
+  → selected first move RH→h_027 (k=15, probe gap 0.038m)
+  step 0: RH->h_027  gap=0.044m  gain=+0.102m  hold=True  tries=1  passed=True
+    probe LH->h_036: gap=0.174 gain=+0.068 hold=False pass=False
+    probe LH->h_035: gap=0.667 gain=-0.157 hold=False pass=False
+    probe LH->h_043: gap=0.498 gain=+0.065 hold=False pass=False
+    probe LF->fd_044: gap=0.081 gain=+0.015 hold=False pass=False
+    probe LF->h_017: gap=0.082 gain=-0.004 hold=False pass=False
+    probe LF->fd_045: gap=0.090 gain=+0.049 hold=False pass=False
+    probe RF->h_018: gap=0.080 gain=+0.022 hold=False pass=False
+    probe RF->fd_044: gap=0.021 gain=+0.053 hold=True pass=True
+  step 1: RF->fd_044  gap=0.021m  gain=+0.053m  hold=True  tries=1  passed=True
+    stand after fd_044: com_gain=+0.010m anchors=4 fell=False
+    probe RH->h_039: gap=0.076 gain=+0.374 hold=True pass=False
+    probe RH->h_031: gap=0.135 gain=+0.156 hold=False pass=False
+    probe RH->h_051: gap=0.180 gain=+0.080 hold=False pass=False
+    probe LH->h_032: gap=0.065 gain=+0.037 hold=True pass=False
+    probe LH->h_051: gap=0.647 gain=-0.169 hold=False pass=False
+    probe LH->h_036: gap=0.442 gain=+0.191 hold=False pass=False
+    probe LF->h_017: gap=0.081 gain=+0.003 hold=False pass=False
+    probe LF->fd_045: gap=0.081 gain=+0.054 hold=False pass=False
+    probe LF->fd_047: gap=0.128 gain=+0.062 hold=False pass=False
+    probe RF->fd_046: gap=0.039 gain=+0.035 hold=True pass=False
+    probe RF->fd_048: gap=0.082 gain=+0.041 hold=False pass=False
+    probe RF->fd_049: gap=0.081 gain=+0.114 hold=False pass=False
+    reseed best LH->h_032: gap=0.020 pass=True tries=3
+  step 2: LH->h_032  gap=0.020m  gain=+0.070m  hold=True  tries=3  passed=True
+    probe LF->h_017: gap=0.081 gain=+0.016 hold=False pass=False
+    probe LF->fd_045: gap=0.083 gain=+0.062 hold=False pass=False
+    probe LF->fd_046: gap=0.080 gain=+0.093 hold=False pass=False
+  step 0: RH->h_027  gap=0.035m  gain=+0.078m  hold=True  tries=1  passed=True
+    probe LH->h_040: gap=0.180 gain=+0.255 hold=False pass=False
+    probe LH->h_036: gap=0.079 gain=+0.169 hold=True pass=False
+    probe LH->h_031: gap=0.056 gain=+0.048 hold=True pass=False
+    probe LF->h_017: gap=0.080 gain=+0.002 hold=False pass=False
+    probe LF->fd_044: gap=0.081 gain=+0.023 hold=False pass=False
+    probe LF->fd_046: gap=0.114 gain=+0.029 hold=False pass=False
+    probe RF->fd_044: gap=0.050 gain=+0.023 hold=True pass=False
+    probe RF->fd_046: gap=0.081 gain=+0.039 hold=False pass=False
+    probe RF->h_018: gap=0.042 gain=+0.032 hold=True pass=False
+    probe RH->h_035: gap=0.162 gain=+0.132 hold=False pass=False
+    probe RH->h_051: gap=0.045 gain=+0.120 hold=True pass=True
+  step 1: RH->h_051  gap=0.045m  gain=+0.120m  hold=True  tries=1  passed=True
+    probe LF->h_017: gap=0.081 gain=+0.003 hold=False pass=False
+    probe LF->fd_044: gap=0.080 gain=+0.030 hold=False pass=False
+  step 0: RH->h_027  gap=0.024m  gain=+0.085m  hold=True  tries=1  passed=True
+    probe LH->h_036: gap=0.091 gain=+0.162 hold=False pass=False
+    probe LH->h_031: gap=0.060 gain=+0.049 hold=True pass=False
+    probe LH->h_051: gap=0.204 gain=+0.057 hold=False pass=False
+    probe LF->h_017: gap=0.080 gain=+0.018 hold=False pass=False
+    probe LF->fd_044: gap=0.081 gain=+0.018 hold=False pass=False
+    probe LF->fd_045: gap=0.100 gain=+0.028 hold=False pass=False
+    probe RF->h_018: gap=0.081 gain=+0.004 hold=False pass=False
+    probe RF->fd_044: gap=0.046 gain=+0.028 hold=True pass=False
+    probe RF->h_017: gap=0.080 gain=+0.016 hold=False pass=False
+    probe RH->h_035: gap=0.199 gain=+0.086 hold=False pass=False
+    probe RH->h_051: gap=0.031 gain=+0.133 hold=True pass=True
+  step 1: RH->h_051  gap=0.031m  gain=+0.133m  hold=True  tries=1  passed=True
+    probe LF->h_017: gap=0.081 gain=+0.030 hold=False pass=False
+    probe LF->fd_045: gap=0.080 gain=+0.054 hold=False pass=False
+    probe LF->fd_044: gap=0.080 gain=+0.030 hold=False pass=False
+    probe RF->fd_044: gap=0.055 gain=+0.021 hold=True pass=False
+  → OK (5 moves, gates_pass=False, net_rise=0.016, attempts=3, 8133.9s)
+
+=== wall 3/10: batch-s1297.json ===
+  first-move probe: LH→h_048 (k=10, reach_d0=0.066)  gap=0.043m  landed=True  tight=True
+  first-move probe: RH→h_011 (k=5, reach_d0=0.089)  gap=0.020m  landed=True  tight=True
+  first-move probe: RH→h_023 (k=12, reach_d0=0.093)  gap=0.058m  landed=True  tight=False
+  first-move probe: RH→h_019 (k=9, reach_d0=0.097)  gap=0.025m  landed=True  tight=True
+  → selected first move RH→h_011 (k=5, probe gap 0.020m)
+  step 0: RH->h_011  gap=0.004m  gain=+0.085m  hold=True  tries=1  passed=True
+    probe LH->h_028: gap=0.016 gain=+0.525 hold=True pass=True
+  step 1: LH->h_028  gap=0.016m  gain=+0.525m  hold=True  tries=1  passed=True
+    probe RH->h_048: gap=0.190 gain=+0.169 hold=False pass=False
+    probe RH->h_015: gap=0.195 gain=+0.083 hold=False pass=False
+    probe RH->h_020: gap=0.283 gain=+0.099 hold=False pass=False
+    probe RF->fd_025: gap=0.081 gain=+0.015 hold=False pass=False
+    probe RF->fd_027: gap=0.108 gain=+0.032 hold=False pass=False
+    probe RF->fd_026: gap=0.131 gain=-0.021 hold=False pass=False
+    probe LF->fd_029: gap=0.080 gain=+0.092 hold=False pass=False
+    probe LF->fd_026: gap=0.080 gain=+0.038 hold=False pass=False
+    probe LF->fd_027: gap=0.080 gain=+0.057 hold=False pass=False
+    probe LH->h_039: gap=0.053 gain=+0.484 hold=True pass=False
+    probe LH->h_036: gap=0.030 gain=+0.309 hold=True pass=True
+  step 2: LH->h_036  gap=0.030m  gain=+0.309m  hold=True  tries=1  passed=True
+    probe RH->h_015: gap=0.126 gain=+0.050 hold=False pass=False
+    probe RH->h_020: gap=0.268 gain=+0.171 hold=False pass=False
+  step 0: RH->h_011  gap=0.011m  gain=+0.087m  hold=True  tries=1  passed=True
+    probe LH->h_020: gap=0.012 gain=+0.209 hold=True pass=True
+  step 1: LH->h_020  gap=0.012m  gain=+0.209m  hold=True  tries=1  passed=True
+    probe RH->h_015: gap=0.162 gain=+0.096 hold=False pass=False
+    probe RH->h_048: gap=0.293 gain=+0.177 hold=False pass=False
+    probe RH->h_019: gap=0.191 gain=+0.120 hold=False pass=False
+    probe RF->fd_026: gap=0.120 gain=-0.033 hold=False pass=False
+    probe RF->fd_025: gap=0.138 gain=-0.054 hold=False pass=False
+  step 0: RH->h_011  gap=0.007m  gain=+0.082m  hold=True  tries=1  passed=True
+    probe LH->h_048: gap=0.074 gain=+0.194 hold=True pass=False
+    probe LH->h_020: gap=0.108 gain=+0.133 hold=False pass=False
+    probe LH->h_019: gap=0.081 gain=+0.152 hold=False pass=False
+    probe RF->fd_026: gap=0.085 gain=-0.010 hold=False pass=False
+    probe RF->fd_028: gap=0.144 gain=-0.000 hold=False pass=False
+    probe RF->fd_025: gap=0.080 gain=+0.016 hold=False pass=False
+    probe LF->fd_025: gap=0.049 gain=+0.024 hold=True pass=False
+    probe LF->fd_027: gap=0.081 gain=+0.043 hold=False pass=False
+    probe LF->fd_026: gap=0.080 gain=+0.019 hold=False pass=False
+    probe RH->h_019: gap=0.240 gain=+0.085 hold=False pass=False
+    probe RH->h_027: gap=0.530 gain=+0.080 hold=False pass=False
+    probe RH->h_020: gap=0.361 gain=+0.088 hold=False pass=False

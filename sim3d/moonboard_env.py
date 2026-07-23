@@ -68,7 +68,12 @@ class MoonboardClimbing3DEnv(gym.Env):
             raise ValueError("MoonboardClimbing3DEnv requires at least one problem")
         self.problems = list(problems)
         self.profile = profile or ClimberProfile()
-        self.cfg_env = replace(config or EnvConfig(), official_route_only=True)
+        # MoonBoard climbs always include the kickboard for canonical
+        # foot starts; route-only contacts are enforced.
+        base_cfg = config or EnvConfig()
+        self.cfg_env = replace(
+            base_cfg, official_route_only=True, include_kickboard=True,
+        )
         self.vertical_projection = vertical_projection
         self.render_mode = render_mode
         self._rng = None
