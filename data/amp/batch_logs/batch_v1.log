@@ -1,0 +1,54 @@
+
+=== wall 1/5: batch-s1297.json ===
+  first-move probe: RH→h_041 (k=20, reach_d0=0.127)  gap=0.048m  landed=True  tight=True
+  first-move probe: LH→h_027 (k=12, reach_d0=0.149)  gap=0.390m  landed=False  tight=False
+  first-move probe: RH→h_045 (k=23, reach_d0=0.155)  gap=0.800m  landed=False  tight=False
+  first-move probe: LH→h_051 (k=18, reach_d0=0.16)  gap=0.072m  landed=True  tight=False
+  → selected first move RH→h_041 (k=20, probe gap 0.048m)
+  step 0: RH->h_041  gap=0.023m  gain=+0.113m  hold=True  tries=1  passed=True
+  step 1: LF->fd_043  gap=0.026m  gain=+0.045m  hold=True  tries=1  passed=True
+  → OK (2 moves, gates_pass=False, net_rise=0.04, 3248.4s)
+
+=== wall 2/5: batch-s300.json ===
+  first-move probe: RH→h_040 (k=17, reach_d0=0.081)  gap=0.081m  landed=True  tight=False
+  first-move probe: RH→h_020 (k=8, reach_d0=0.107)  gap=0.059m  landed=True  tight=False
+  first-move probe: LH→h_045 (k=22, reach_d0=0.12)  gap=0.146m  landed=False  tight=False
+  first-move probe: LH→h_023 (k=11, reach_d0=0.128)  gap=1.005m  landed=False  tight=False
+  → selected first move RH→h_020 (k=8, probe gap 0.059m)
+  step 0: RH->h_020  gap=0.014m  gain=+0.091m  hold=True  tries=1  passed=True
+  step 1: LF->h_001  gap=0.030m  gain=+0.040m  hold=True  tries=2  passed=True
+  step 2: RF->h_002  gap=0.031m  gain=+0.047m  hold=True  tries=1  passed=True
+  → FAIL (0 moves, gates_pass=False, net_rise=None, 3300.0s)
+
+=== wall 3/5: batch-s3291.json ===
+  first-move probe: RH→h_028 (k=9, reach_d0=0.1)  gap=0.850m  landed=False  tight=False
+  first-move probe: RH→h_034 (k=11, reach_d0=0.103)  gap=0.079m  landed=True  tight=False
+  first-move probe: LH→h_045 (k=19, reach_d0=0.123)  gap=0.881m  landed=False  tight=False
+  first-move probe: RH→h_024 (k=7, reach_d0=0.13)  gap=1.027m  landed=False  tight=False
+  → selected first move RH→h_034 (k=11, probe gap 0.079m)
+  seed move RH->h_034 rejected (gain +0.077 < 0.08); cycle-walking from seed stance
+  step 0: RF->h_019  gap=0.031m  gain=+0.042m  hold=True  tries=1  passed=True
+  → FAIL (0 moves, gates_pass=False, net_rise=None, 3300.0s)
+
+=== wall 4/5: batch-s4288.json ===
+  first-move probe: LH→h_050 (k=4, reach_d0=0.105)  gap=0.039m  landed=True  tight=True
+  first-move probe: LH→h_052 (k=1, reach_d0=0.12)  gap=0.134m  landed=False  tight=False
+  first-move probe: LH→h_014 (k=6, reach_d0=0.141)  gap=0.271m  landed=False  tight=False
+  first-move probe: LH→h_021 (k=9, reach_d0=0.144)  gap=0.213m  landed=False  tight=False
+  → selected first move LH→h_050 (k=4, probe gap 0.039m)
+  step 0: LH->h_050  gap=0.026m  gain=+0.088m  hold=True  tries=1  passed=True
+  step 1: RH->h_017  gap=0.042m  gain=+0.209m  hold=True  tries=1  passed=True
+  step 2: RF->fd_003  gap=0.015m  gain=+0.056m  hold=True  tries=1  passed=True
+  → FAIL (0 moves, gates_pass=False, net_rise=None, 3300.0s)
+
+=== wall 5/5: batch-s5285.json ===
+  first-move probe: RH→h_040 (k=16, reach_d0=0.126)  gap=1.052m  landed=False  tight=False
+  first-move probe: LH→h_005 (k=2, reach_d0=0.164)  gap=0.057m  landed=True  tight=False
+  first-move probe: RH→h_053 (k=6, reach_d0=0.185)  gap=0.814m  landed=False  tight=False
+  first-move probe: RH→h_044 (k=18, reach_d0=0.193)  gap=0.060m  landed=True  tight=False
+  → selected first move LH→h_005 (k=2, probe gap 0.057m)
+  step 0: LH->h_005  gap=0.030m  gain=+0.136m  hold=True  tries=1  passed=True
+  → FAIL (0 moves, gates_pass=False, net_rise=None, 3300.0s)
+
+=== BATCH DONE: 0/5 refs pass ALL gates (1/5 authored ≥1 move) ===
+manifest: data/amp/batch_walls_v1/refs/batch_manifest.json

@@ -1,0 +1,8 @@
+=== BATCH COMPLETE ===
+=== BATCH DONE: 3/5 refs pass ALL gates (5/5 authored ≥1 move) ===
+batch-s1297 | moves=4 gates=True net=0.035 1860.8s
+batch-s300 | moves=4 gates=True net=0.025 1849.2s
+batch-s3291 | moves=3 gates=False net=-0.025 1823.6s
+batch-s4288 | moves=4 gates=True net=0.036 1855.3s
+batch-s5285 | moves=1 gates=False net=-0.025 1565.9s
+SUMMARY {'n_walls': 5, 'n_success': 5, 'n_all_gates_pass': 3}
